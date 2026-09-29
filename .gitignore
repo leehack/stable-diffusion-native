@@ -1,0 +1,9 @@
+.DS_Store
+build/
+dist/
+__pycache__/
+*.log
+
+# Keep output directories but not generated native payloads.
+bin/*
+!bin/.gitkeep

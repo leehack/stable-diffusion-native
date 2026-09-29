@@ -1,0 +1,78 @@
+name: Native Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, such as v0.1.0 or v0.1.0-2
+        required: true
+      prerelease:
+        description: Mark the GitHub release as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: macos-arm64, runs_on: macos-latest }
+          - { target: macos-x64, runs_on: macos-latest }
+          - { target: ios-arm64, runs_on: macos-latest }
+          - { target: ios-arm64-sim, runs_on: macos-latest }
+          - { target: android-arm64, runs_on: ubuntu-latest }
+          - { target: linux-x64, runs_on: ubuntu-latest }
+          - { target: linux-arm64, runs_on: ubuntu-24.04-arm }
+          - { target: windows-x64, runs_on: windows-2022 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build
+        run: python3 tools/build.py build --target ${{ matrix.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - name: Validate exports and dependencies
+        run: python3 tools/validate_artifacts.py ${{ matrix.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: bin/${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+      - name: Stage payloads
+        run: |
+          for dir in artifacts/bin-*; do
+            mkdir -p "bin/${dir#artifacts/bin-}"
+            cp -R "$dir"/. "bin/${dir#artifacts/bin-}/"
+          done
+      - name: Package
+        run: python3 tools/package_release.py --tag "${{ inputs.tag }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            dist/*.tar.gz
+            dist/manifest.json
+            dist/SHA256SUMS

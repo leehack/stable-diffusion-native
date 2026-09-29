@@ -1,0 +1,40 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
+
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: macos-arm64, runs_on: macos-latest }
+          - { target: ios-arm64, runs_on: macos-latest }
+          - { target: android-arm64, runs_on: ubuntu-latest }
+          - { target: linux-x64, runs_on: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build
+        run: python3 tools/build.py build --target ${{ matrix.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - name: Validate exports and dependencies
+        run: python3 tools/validate_artifacts.py ${{ matrix.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
