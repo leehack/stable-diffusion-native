@@ -33,12 +33,19 @@ packages such as `llamadart`.
 | `ios-arm64-sim` | `libstable-diffusion.dylib` | Metal, CPU | macOS |
 | `android-arm64` | `libstable-diffusion.so` | CPU | any, with the NDK |
 | `linux-x64` | `libstable-diffusion.so` | CPU | Linux x64 |
+| `linux-x64-vulkan` | `libstable-diffusion.so` | Vulkan, CPU | Linux x64 |
 | `linux-arm64` | `libstable-diffusion.so` | CPU | Linux arm64 |
+| `linux-arm64-vulkan` | `libstable-diffusion.so` | Vulkan, CPU | Linux arm64 |
 | `windows-x64` | `stable-diffusion.dll` | CPU | Windows x64 |
+| `windows-x64-vulkan` | `stable-diffusion.dll` | Vulkan, CPU | Windows x64 |
 
 Minimums: macOS 13.3, iOS 16.4, Android API 28. The Android build requires
 Armv8.2 dot-product and fp16 support (Cortex-A55/A75 or newer); consumers
 should check for `asimddp` before loading it.
+
+Vulkan variants link the Vulkan loader (`libvulkan.so.1`, `vulkan-1.dll`) and
+fail to load without it; consumers fall back to the CPU variant. CI checks them
+on Mesa lavapipe only, so GPU performance still needs hardware runs.
 
 Android GPU backends are not shipped. On tested devices, Vulkan crashed in
 the Adreno 750 driver's shader compiler and on a null `vkGetBufferDeviceAddress`
@@ -51,10 +58,12 @@ git submodule update --init --recursive
 python3 tools/build.py list
 python3 tools/build.py build --target macos-arm64
 python3 tools/validate_artifacts.py
+python3 tools/smoke_test.py macos-arm64 --expect-device MTL
 python3 tools/package_release.py --tag v0.1.0
 ```
 
-Android builds need the NDK (`ANDROID_NDK_HOME`, or the newest NDK under
+Linux Vulkan builds need `libvulkan-dev`, `glslc` and `spirv-headers`; Windows
+Vulkan builds need the LunarG Vulkan SDK. Android builds need the NDK (`ANDROID_NDK_HOME`, or the newest NDK under
 `ANDROID_HOME`). `build --target all-host` builds every target the current host
 supports.
 

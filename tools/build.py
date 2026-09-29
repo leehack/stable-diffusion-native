@@ -75,6 +75,16 @@ def _apple(name: str, sdk: str, arch: str, min_version: str) -> Target:
     )
 
 
+def _desktop(name: str, os_name: str, library: str, arch: str) -> list[Target]:
+    # The Vulkan variant links the Vulkan loader and fails to load without it,
+    # so consumers need the CPU variant as a fallback.
+    return [
+        Target(name, os_name, library, ("cpu",), host=os_name, host_arch=arch),
+        Target(f"{name}-vulkan", os_name, library, ("vulkan", "cpu"),
+               ("-DSD_VULKAN=ON",), host=os_name, host_arch=arch),
+    ]
+
+
 TARGETS: dict[str, Target] = {
     t.name: t
     for t in [
@@ -93,12 +103,9 @@ TARGETS: dict[str, Target] = {
                 f"-DGGML_CPU_ARM_ARCH={ANDROID_ARM64_CPU_ARCH}",
             ),
         ),
-        Target("linux-x64", "linux", "libstable-diffusion.so", ("cpu",),
-               host="linux", host_arch="x86_64"),
-        Target("linux-arm64", "linux", "libstable-diffusion.so", ("cpu",),
-               host="linux", host_arch="aarch64"),
-        Target("windows-x64", "windows", "stable-diffusion.dll", ("cpu",),
-               host="windows", host_arch="amd64"),
+        *_desktop("linux-x64", "linux", "libstable-diffusion.so", "x86_64"),
+        *_desktop("linux-arm64", "linux", "libstable-diffusion.so", "aarch64"),
+        *_desktop("windows-x64", "windows", "stable-diffusion.dll", "amd64"),
     ]
 }
 
@@ -241,7 +248,7 @@ def main() -> None:
 
     if args.command == "list":
         for target in TARGETS.values():
-            print(f"{target.name:16} {target.library:28} {','.join(target.accelerators)}")
+            print(f"{target.name:20} {target.library:28} {','.join(target.accelerators)}")
         return
 
     host = {"Darwin": "darwin", "Linux": "linux", "Windows": "windows"}[platform.system()]
