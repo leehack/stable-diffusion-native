@@ -161,7 +161,9 @@ def configure_args(target: Target, work_dir: Path) -> list[str]:
     if target.os == "android":
         toolchain = android_ndk() / "build" / "cmake" / "android.toolchain.cmake"
         args.append(f"-DCMAKE_TOOLCHAIN_FILE={toolchain}")
-    if shutil.which("ninja"):
+    # On Windows, Ninja picks up whatever compiler is on PATH (MinGW on CI
+    # runners); the default Visual Studio generator guarantees MSVC.
+    if shutil.which("ninja") and target.os != "windows":
         args += ["-G", "Ninja"]
     flags = " ".join(export_linker_flags(target, work_dir))
     if flags:

@@ -51,10 +51,13 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
       - name: Load and list devices
-        # Linux Vulkan runs on Mesa lavapipe (software); functional check only.
+        # Linux Vulkan runs on Mesa lavapipe (software): functional check only.
         if: matrix.smoke
         shell: bash
         run: python tools/smoke_test.py ${{ matrix.target }} ${{ matrix.smoke }}
+        env:
+          # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
+          GGML_VK_VISIBLE_DEVICES: "0"
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}
