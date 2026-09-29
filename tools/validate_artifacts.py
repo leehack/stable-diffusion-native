@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from build import BIN_ROOT, HEADER, TARGETS, Target, llvm_tool
+from build import ANDROID_PAGE_SIZE, BIN_ROOT, HEADER, TARGETS, Target, llvm_tool
 from sd_api import api_symbols
 
 APPLE_DEPENDENCIES = re.compile(
@@ -57,6 +57,15 @@ def dependencies(target: Target, library: Path) -> list[str]:
     return re.findall(r"Shared library: \[([^\]]+)\]", "\n".join(lines))
 
 
+def load_alignments(target: Target, library: Path) -> list[int]:
+    headers = output([llvm_tool(target, "llvm-readelf"), "-lW", str(library)])
+    return [
+        int(line.split()[-1], 16)
+        for line in headers.splitlines()
+        if line.strip().startswith("LOAD")
+    ]
+
+
 def validate(target: Target) -> list[str]:
     root = BIN_ROOT / target.name
     library = root / "lib" / target.library
@@ -84,6 +93,14 @@ def validate(target: Target) -> list[str]:
         problems.append(
             f"{len(leaked)} non-API exports, e.g. {', '.join(leaked[:10])}"
         )
+
+    if target.os == "android":
+        small = [a for a in load_alignments(target, library) if a < ANDROID_PAGE_SIZE]
+        if small:
+            problems.append(
+                f"LOAD segments aligned to {', '.join(hex(a) for a in small)}; "
+                f"Android needs {hex(ANDROID_PAGE_SIZE)} for 16 KB pages"
+            )
 
     for dep in dependencies(target, library):
         if target.os in ("macos", "ios"):

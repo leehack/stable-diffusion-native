@@ -31,6 +31,7 @@ ANDROID_PLATFORM = "android-28"
 # Armv8.2 dot-product and fp16 arithmetic: every arm64 SoC shipped with
 # Cortex-A55/A75 or newer. Consumers must probe `asimddp` before loading.
 ANDROID_ARM64_CPU_ARCH = "armv8.2-a+dotprod+fp16"
+ANDROID_PAGE_SIZE = 16384
 
 COMMON_CMAKE_ARGS = [
     "-DCMAKE_BUILD_TYPE=Release",
@@ -100,6 +101,9 @@ TARGETS: dict[str, Target] = {
             (
                 "-DANDROID_ABI=arm64-v8a",
                 f"-DANDROID_PLATFORM={ANDROID_PLATFORM}",
+                # Google Play requires 16 KB page alignment for apps targeting
+                # API 35+; NDKs before r28 default to 4 KB.
+                "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                 f"-DGGML_CPU_ARM_ARCH={ANDROID_ARM64_CPU_ARCH}",
             ),
         ),
@@ -151,7 +155,10 @@ def export_linker_flags(target: Target, work_dir: Path) -> list[str]:
         path = work_dir / "exports.map"
         body = "".join(f"    {s};\n" for s in symbols)
         path.write_text(f"{{\n  global:\n{body}  local:\n    *;\n}};\n")
-        return [f"-Wl,--version-script={path}"]
+        flags = [f"-Wl,--version-script={path}"]
+        if target.os == "android":
+            flags.append(f"-Wl,-z,max-page-size={ANDROID_PAGE_SIZE}")
+        return flags
     # Windows exports only SD_API (dllexport) declarations already.
     return []
 
