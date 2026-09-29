@@ -25,16 +25,32 @@ jobs:
           - { target: macos-arm64, runs_on: macos-latest }
           - { target: ios-arm64, runs_on: macos-latest }
           - { target: android-arm64, runs_on: ubuntu-latest }
-          - { target: linux-x64, runs_on: ubuntu-latest }
+          - { target: linux-x64, runs_on: ubuntu-latest, smoke: "--expect-device CPU" }
+          - { target: linux-x64-vulkan, runs_on: ubuntu-latest, smoke: "--expect-device Vulkan" }
+          - { target: windows-x64, runs_on: windows-2022, smoke: "--expect-device CPU" }
+          - { target: windows-x64-vulkan, runs_on: windows-2022, smoke: "--expect-device CPU" }
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          target: ${{ matrix.target }}
       - name: Build
-        run: python3 tools/build.py build --target ${{ matrix.target }}
+        shell: bash
+        run: python tools/build.py build --target ${{ matrix.target }}
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
       - name: Validate exports and dependencies
-        run: python3 tools/validate_artifacts.py ${{ matrix.target }}
+        shell: bash
+        run: python tools/validate_artifacts.py ${{ matrix.target }}
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - name: Load and list devices
+        # Linux Vulkan runs on Mesa lavapipe (software): functional check only.
+        if: matrix.smoke
+        shell: bash
+        run: python tools/smoke_test.py ${{ matrix.target }} ${{ matrix.smoke }}
+        env:
+          # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
+          GGML_VK_VISIBLE_DEVICES: "0"

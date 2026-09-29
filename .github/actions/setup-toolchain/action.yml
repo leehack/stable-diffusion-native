@@ -1,0 +1,27 @@
+name: Set up build toolchain
+description: Installs Python and, for Vulkan targets, the Vulkan build dependencies.
+inputs:
+  target:
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install Linux Vulkan dependencies
+      if: runner.os == 'Linux' && endsWith(inputs.target, '-vulkan')
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libvulkan-dev glslc spirv-headers mesa-vulkan-drivers ninja-build
+    - name: Install Vulkan SDK
+      if: runner.os == 'Windows' && endsWith(inputs.target, '-vulkan')
+      shell: pwsh
+      run: |
+        $ver = "1.4.313.2"
+        curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
+        & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+        Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$ver"
+        Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$ver\Bin"

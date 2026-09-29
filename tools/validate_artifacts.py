@@ -86,11 +86,12 @@ def validate(target: Target) -> list[str]:
         )
 
     for dep in dependencies(target, library):
-        allowed = (
-            APPLE_DEPENDENCIES.match(dep)
-            if target.os in ("macos", "ios")
-            else dep in ELF_DEPENDENCIES[target.os]
-        )
+        if target.os in ("macos", "ios"):
+            allowed = APPLE_DEPENDENCIES.match(dep)
+        else:
+            allowed = dep in ELF_DEPENDENCIES[target.os] or (
+                "vulkan" in target.accelerators and dep == "libvulkan.so.1"
+            )
         if not allowed:
             problems.append(f"unexpected dependency {dep}")
     return problems
