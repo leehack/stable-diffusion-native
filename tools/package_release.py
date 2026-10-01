@@ -4,6 +4,8 @@
 Writes `dist/stable-diffusion-native-runtime-<target>-<tag>.tar.gz` (stripped
 runtime, header, licenses, build info), a matching `-symbols` archive with the
 unstripped library for crash symbolication, `manifest.json` and `SHA256SUMS`.
+`--apple-xcframework` also writes the SwiftPM XCFramework zip; its `sha256` is
+the `binaryTarget` checksum.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import sys
 import tarfile
 from pathlib import Path
 
+import apple_xcframework
 from build import BIN_ROOT, REPO_ROOT, TARGETS, UPSTREAM_DIR, upstream_commit
 
 PACKAGE = "stable-diffusion-native"
@@ -53,6 +56,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--dist", type=Path, default=REPO_ROOT / "dist")
+    parser.add_argument("--apple-xcframework", action="store_true",
+                        help="Also package the Apple slices as a SwiftPM XCFramework.")
     args = parser.parse_args()
     if not TAG_PATTERN.match(args.tag):
         print(f"error: tag {args.tag!r} must look like v0.1.0 or v0.1.0-2", file=sys.stderr)
@@ -94,6 +99,21 @@ def main() -> None:
     if not artifacts:
         print("error: nothing to package under bin/", file=sys.stderr)
         sys.exit(1)
+
+    if args.apple_xcframework:
+        xcframework = apple_xcframework.build_xcframework(args.tag, args.dist)
+        artifacts.append({
+            "target": "apple",
+            "kind": "xcframework",
+            "file": xcframework.name,
+            "sha256": sha256(xcframework),
+            "size": xcframework.stat().st_size,
+            "library": f"{apple_xcframework.FRAMEWORK}.framework",
+            "accelerators": ["metal", "cpu"],
+            "slices": [s.identifier for s in apple_xcframework.SLICES],
+            "minimumOS": {"ios": apple_xcframework.APPLE_IOS_MIN,
+                          "macos": apple_xcframework.APPLE_MACOS_MIN},
+        })
 
     manifest = {
         "schemaVersion": 1,

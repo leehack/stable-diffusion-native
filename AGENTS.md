@@ -23,6 +23,10 @@ python3 tools/validate_artifacts.py <target>
   the `SD_API` symbols in `stable-diffusion.h` and links only allowlisted
   system libraries. Never widen the export list to fix a consumer; a leaked
   ggml symbol can collide with llama.cpp's ggml in the same process.
+- The Apple XCFramework must pass `apple_xcframework.py validate` and
+  `consumer`. Its Info.plist minimum OS is read from each binary's
+  `LC_BUILD_VERSION`; never hard-code it, since a mismatch fails App Store
+  upload.
 - A new target or backend needs device evidence before release, recorded in
   the PR.
 
@@ -34,6 +38,7 @@ python3 tools/validate_artifacts.py <target>
 
 ## Handoff to `llamadart`
 
-After a release, update the `llamadart` runtime pin and archive checksums, and
-regenerate its bindings from the released `stable-diffusion.h`, in the same
-`llamadart` PR.
+After a release, update the `llamadart` runtime pin and archive checksums, the
+Apple companion `Package.swift` tag and XCFramework checksum, and regenerate
+its bindings from the released `stable-diffusion.h`, in the same `llamadart`
+PR.

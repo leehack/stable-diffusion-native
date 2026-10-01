@@ -93,6 +93,8 @@ TARGETS: dict[str, Target] = {
         _apple("macos-x64", "macosx", "x86_64", APPLE_MACOS_MIN),
         _apple("ios-arm64", "iphoneos", "arm64", APPLE_IOS_MIN),
         _apple("ios-arm64-sim", "iphonesimulator", "arm64", APPLE_IOS_MIN),
+        # Xcode builds generic and Intel-host simulator destinations for x86_64.
+        _apple("ios-x64-sim", "iphonesimulator", "x86_64", APPLE_IOS_MIN),
         Target(
             "android-arm64",
             "android",

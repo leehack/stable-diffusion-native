@@ -26,6 +26,7 @@ jobs:
           - { target: macos-x64, runs_on: macos-latest }
           - { target: ios-arm64, runs_on: macos-latest }
           - { target: ios-arm64-sim, runs_on: macos-latest }
+          - { target: ios-x64-sim, runs_on: macos-latest }
           - { target: android-arm64, runs_on: ubuntu-latest }
           - { target: linux-x64, runs_on: ubuntu-latest, smoke: "--expect-device CPU" }
           - { target: linux-x64-vulkan, runs_on: ubuntu-latest, smoke: "--expect-device Vulkan" }
@@ -66,11 +67,15 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    # The SwiftPM XCFramework needs xcodebuild.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
           pattern: bin-*
@@ -82,7 +87,11 @@ jobs:
             cp -R "$dir"/. "bin/${dir#artifacts/bin-}/"
           done
       - name: Package
-        run: python3 tools/package_release.py --tag "${{ inputs.tag }}"
+        run: python3 tools/package_release.py --tag "${{ inputs.tag }}" --apple-xcframework
+      - name: Link the XCFramework into a SwiftPM consumer
+        run: >-
+          python3 tools/apple_xcframework.py consumer
+          "dist/stable-diffusion-native-apple-xcframework-${{ inputs.tag }}.zip"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
@@ -90,5 +99,6 @@ jobs:
           prerelease: ${{ inputs.prerelease }}
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/manifest.json
             dist/SHA256SUMS
