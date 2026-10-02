@@ -17,8 +17,8 @@ elsewhere.
 - Export only that API. stable-diffusion.cpp embeds its own patched ggml;
   hiding it lets the library share a process with another ggml, such as
   llama.cpp's.
-- Publish runtime archives, unstripped symbol archives, `manifest.json` and
-  `SHA256SUMS`.
+- Publish runtime archives, unstripped symbol archives, an Apple SwiftPM
+  XCFramework, `manifest.json` and `SHA256SUMS`.
 
 The Dart API, model presets and download/cache logic stay in downstream
 packages such as `llamadart`.
@@ -31,6 +31,7 @@ packages such as `llamadart`.
 | `macos-x64` | `libstable-diffusion.dylib` | Metal, CPU | macOS |
 | `ios-arm64` | `libstable-diffusion.dylib` | Metal, CPU | macOS |
 | `ios-arm64-sim` | `libstable-diffusion.dylib` | Metal, CPU | macOS |
+| `ios-x64-sim` | `libstable-diffusion.dylib` | Metal, CPU | macOS |
 | `android-arm64` | `libstable-diffusion.so` | CPU | any, with the NDK |
 | `linux-x64` | `libstable-diffusion.so` | CPU | Linux x64 |
 | `linux-x64-vulkan` | `libstable-diffusion.so` | Vulkan, CPU | Linux x64 |
@@ -74,6 +75,35 @@ Outputs:
 - `bin/<target>/include/stable-diffusion.h` and `build-info.json`.
 - `dist/`: release archives, `manifest.json`, `SHA256SUMS`.
 
+## Apple XCFramework
+
+`package_release.py --apple-xcframework` also wraps the Apple targets in
+`stable_diffusion.xcframework` for a Swift Package Manager `binaryTarget`:
+
+| Slice | Targets | Minimum |
+| --- | --- | --- |
+| `ios-arm64` | `ios-arm64` | iOS 16.4 |
+| `ios-arm64_x86_64-simulator` | `ios-arm64-sim`, `ios-x64-sim` | iOS 16.4 |
+| `macos-arm64_x86_64` | `macos-arm64`, `macos-x64` | macOS 13.3 |
+
+Each framework exports only the `SD_API` symbols and has a `stable_diffusion`
+module map. Its Info.plist minimum OS (`MinimumOSVersion` on iOS,
+`LSMinimumSystemVersion` on macOS) is read from the binary's
+`LC_BUILD_VERSION`, so App Store validation sees matching values. The
+frameworks are unsigned; Xcode signs them when it embeds them. The zip is
+reproducible from the same slices, and its `sha256` in `manifest.json` is the
+SwiftPM checksum (`swift package compute-checksum`).
+
+```bash
+python3 tools/apple_xcframework.py build --tag v0.2.0 --dist dist
+python3 tools/apple_xcframework.py validate dist/stable-diffusion-native-apple-xcframework-v0.2.0.zip
+python3 tools/apple_xcframework.py consumer dist/stable-diffusion-native-apple-xcframework-v0.2.0.zip
+```
+
+`consumer` links the zip into `tests/swiftpm_consumer` the way the `llamadart`
+Flutter companion does (a dynamic library that re-exports the framework), runs
+the macOS probe and builds the iOS device and simulator slices.
+
 ## Release
 
 Run the `Native Build & Release` workflow with a tag such as `v0.1.0`. Tags are
@@ -84,6 +114,7 @@ Archive names:
 
 - `stable-diffusion-native-runtime-<target>-<tag>.tar.gz`
 - `stable-diffusion-native-symbols-<target>-<tag>.tar.gz`
+- `stable-diffusion-native-apple-xcframework-<tag>.zip`
 
 ## License
 

@@ -23,7 +23,10 @@ jobs:
       matrix:
         include:
           - { target: macos-arm64, runs_on: macos-latest }
+          - { target: macos-x64, runs_on: macos-latest }
           - { target: ios-arm64, runs_on: macos-latest }
+          - { target: ios-arm64-sim, runs_on: macos-latest }
+          - { target: ios-x64-sim, runs_on: macos-latest }
           - { target: android-arm64, runs_on: ubuntu-latest }
           - { target: linux-x64, runs_on: ubuntu-latest, smoke: "--expect-device CPU" }
           - { target: linux-x64-vulkan, runs_on: ubuntu-latest, smoke: "--expect-device Vulkan" }
@@ -54,3 +57,34 @@ jobs:
         env:
           # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
           GGML_VK_VISIBLE_DEVICES: "0"
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: bin-${{ matrix.target }}
+          path: bin/${{ matrix.target }}
+          if-no-files-found: error
+
+  apple-xcframework:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+      - name: Stage payloads
+        run: |
+          for dir in artifacts/bin-*; do
+            mkdir -p "bin/${dir#artifacts/bin-}"
+            cp -R "$dir"/. "bin/${dir#artifacts/bin-}/"
+          done
+      - name: Build and validate the XCFramework
+        run: python3 tools/apple_xcframework.py build --tag v0.0.0 --dist dist
+      - name: Link the XCFramework into a SwiftPM consumer
+        run: python3 tools/apple_xcframework.py consumer dist/stable-diffusion-native-apple-xcframework-v0.0.0.zip

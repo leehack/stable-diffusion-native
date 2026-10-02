@@ -17,13 +17,15 @@ from pathlib import Path
 from build import ANDROID_PAGE_SIZE, BIN_ROOT, HEADER, TARGETS, Target, llvm_tool
 from sd_api import api_symbols
 
-APPLE_DEPENDENCIES = re.compile(
-    r"^(@rpath/libstable-diffusion\.dylib"
-    r"|/usr/lib/libSystem\.B\.dylib"
+APPLE_SYSTEM_DEPENDENCIES = (
+    r"/usr/lib/libSystem\.B\.dylib"
     r"|/usr/lib/libc\+\+\.1\.dylib"
     r"|/usr/lib/libobjc\.A\.dylib"
     r"|/System/Library/Frameworks/"
-    r"(Accelerate|CoreFoundation|Foundation|Metal|MetalKit)\.framework/.+)$"
+    r"(Accelerate|CoreFoundation|Foundation|Metal|MetalKit)\.framework/.+"
+)
+APPLE_DEPENDENCIES = re.compile(
+    rf"^(@rpath/libstable-diffusion\.dylib|{APPLE_SYSTEM_DEPENDENCIES})$"
 )
 ELF_DEPENDENCIES = {
     "android": {"libc.so", "libm.so", "libdl.so", "liblog.so"},

@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
+import apple_xcframework  # noqa: E402
 from build import TARGETS  # noqa: E402
 from package_release import TAG_PATTERN  # noqa: E402
 from sd_api import api_symbols  # noqa: E402
@@ -51,6 +52,40 @@ class TargetsTest(unittest.TestCase):
         for target in TARGETS.values():
             if target.os in ("linux", "windows"):
                 self.assertTrue(target.host_arch, target.name)
+
+
+class AppleXcframeworkTest(unittest.TestCase):
+    def test_every_apple_target_lands_in_one_slice(self):
+        packaged = [t for s in apple_xcframework.SLICES for t in s.targets]
+        apple = [t.name for t in TARGETS.values() if t.os in ("ios", "macos")]
+        self.assertCountEqual(packaged, apple)
+
+    def test_bundle_version_drops_the_rebuild_counter(self):
+        self.assertEqual(apple_xcframework.bundle_version("v0.2.0"), "0.2.0")
+        self.assertEqual(apple_xcframework.bundle_version("v0.2.0-3"), "0.2.0")
+
+    def test_info_plist_names_the_framework_and_its_minimum_os(self):
+        ios, simulator, macos = apple_xcframework.SLICES
+        plist = apple_xcframework.info_plist(ios, "0.2.0", "16.4")
+        self.assertEqual(plist["CFBundleExecutable"], "stable_diffusion")
+        self.assertEqual(plist["CFBundlePackageType"], "FMWK")
+        self.assertEqual(plist["MinimumOSVersion"], "16.4")
+        self.assertEqual(plist["CFBundleSupportedPlatforms"], ["iPhoneOS"])
+        self.assertEqual(
+            apple_xcframework.info_plist(simulator, "0.2.0", "16.4")
+            ["CFBundleSupportedPlatforms"],
+            ["iPhoneSimulator"],
+        )
+        macos_plist = apple_xcframework.info_plist(macos, "0.2.0", "13.3")
+        self.assertEqual(macos_plist["LSMinimumSystemVersion"], "13.3")
+        self.assertNotIn("MinimumOSVersion", macos_plist)
+
+    def test_framework_binaries_use_rpath_install_names(self):
+        ios, _, macos = apple_xcframework.SLICES
+        self.assertEqual(ios.install_name,
+                         "@rpath/stable_diffusion.framework/stable_diffusion")
+        self.assertEqual(macos.install_name,
+                         "@rpath/stable_diffusion.framework/Versions/A/stable_diffusion")
 
 
 if __name__ == "__main__":

@@ -7,3 +7,8 @@ __pycache__/
 # Keep output directories but not generated native payloads.
 bin/*
 !bin/.gitkeep
+
+# SwiftPM consumer check inputs and outputs.
+tests/swiftpm_consumer/stable_diffusion.zip
+tests/swiftpm_consumer/.build/
+tests/swiftpm_consumer/.swiftpm/
