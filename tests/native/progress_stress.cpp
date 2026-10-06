@@ -1,4 +1,4 @@
-// Native side of tests/dart/progress_stress.dart, linked with
+// Native side of the tests/dart harnesses, linked with
 // src/sd_dart_wrapper.cpp: a stand-in for upstream's progress reporting, and
 // the two designs the wrapper replaces, kept as controls.
 
@@ -25,6 +25,18 @@ struct LockedRoute {
 LockedRoute& locked_route() {
     static LockedRoute* route = new LockedRoute;
     return *route;
+}
+
+void report(int step, int steps, float time) {
+    if (upstream_callback != nullptr) {
+        upstream_callback(step, steps, time, upstream_data);
+    }
+}
+
+void sleep_microseconds(int microseconds) {
+    if (microseconds > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
+    }
 }
 
 void forward_locked(int step, int steps, float time, void*) {
@@ -69,14 +81,35 @@ STRESS_API long stress_report_progress(int milliseconds, int gap_microseconds) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
     long reports   = 0;
     while (std::chrono::steady_clock::now() < end) {
-        if (upstream_callback != nullptr) {
-            const int step = static_cast<int>(reports & 0x3fffffff);
-            upstream_callback(step, step + 1, static_cast<float>(step % 1024), upstream_data);
-        }
+        const int step = static_cast<int>(reports & 0x3fffffff);
+        report(step, step + 1, static_cast<float>(step % 1024));
         reports++;
-        if (gap_microseconds > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(gap_microseconds));
-        }
+        sleep_microseconds(gap_microseconds);
     }
     return reports;
+}
+
+// Plays generate_image() for a batch, reporting what upstream reports: every
+// image is sampled before any is decoded, each as 0/steps then k/steps after
+// step k, so one image's last report is followed at once by the next image's
+// first. A tiled decode then reports 0/tiles, k/tiles after tile k, and
+// tiles/tiles once more.
+STRESS_API void stress_generate_images(int images, int steps, int step_microseconds, int tiles,
+                                       int tile_microseconds) {
+    for (int image = 0; image < images; image++) {
+        report(0, steps, 0.0f);
+        for (int step = 1; step <= steps; step++) {
+            sleep_microseconds(step_microseconds);
+            report(step, steps, step_microseconds / 1e6f);
+        }
+    }
+    for (int image = 0; tiles > 0 && image < images; image++) {
+        report(0, tiles, 0.0f);
+        for (int tile = 1; tile <= tiles; tile++) {
+            sleep_microseconds(tile_microseconds);
+            report(tile, tiles, tile_microseconds / 1e6f);
+        }
+        report(tiles, tiles, tile_microseconds / 1e6f);
+    }
+    sleep_microseconds(step_microseconds);
 }

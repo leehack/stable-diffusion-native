@@ -47,22 +47,24 @@ def run_progress_probe(library: str, mode: str, work_dir: str) -> None:
 
     Runs in a child process so that the parent sees exactly what the runtime
     printed to stdout. Writes what the recorder held before and after to
-    `progress.json`.
+    `progress.json`: the latest sequence, then each report.
     """
     lib = ctypes.CDLL(library)
     lib.sd_dart_progress_enable.argtypes = []
     lib.sd_dart_progress_enable.restype = None
-    lib.sd_dart_progress_read.argtypes = [ctypes.POINTER(Progress)]
-    lib.sd_dart_progress_read.restype = None
+    lib.sd_dart_progress_read.argtypes = [ctypes.c_uint64, ctypes.POINTER(Progress),
+                                          ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64)]
+    lib.sd_dart_progress_read.restype = ctypes.c_size_t
     lib.str_to_sd_type.argtypes = [ctypes.c_char_p]
     lib.convert.restype = ctypes.c_bool
     lib.convert.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
                             ctypes.c_int, ctypes.c_char_p, ctypes.c_bool]
 
-    def read() -> list[int]:
-        progress = Progress(sequence=1, step=1, steps=1, time=1.0)
-        lib.sd_dart_progress_read(ctypes.byref(progress))
-        return [progress.sequence, progress.step, progress.steps]
+    def read() -> list[list[int]]:
+        reports = (Progress * (2 * PROGRESS_TENSORS))()
+        latest = ctypes.c_uint64(1)
+        count = lib.sd_dart_progress_read(0, reports, len(reports), ctypes.byref(latest))
+        return [[latest.value], *([r.sequence, r.step, r.steps] for r in reports[:count])]
 
     if mode == "recorded":
         lib.sd_dart_progress_enable()
@@ -97,9 +99,11 @@ def check_progress_recording(library: Path) -> list[str]:
         # probe would notice one, and records nothing.
         if printed_bar != (mode == "upstream"):
             problems.append(f"progress probe {mode} printed {child.stdout!r}")
-        expected = ([PROGRESS_TENSORS, PROGRESS_TENSORS, PROGRESS_TENSORS]
-                    if mode == "recorded" else [0, 0, 0])
-        if result["before"] != [0, 0, 0] or result["after"] != expected:
+        expected = [[0]]
+        if mode == "recorded":
+            expected = [[PROGRESS_TENSORS], *([step, step, PROGRESS_TENSORS]
+                                              for step in range(1, PROGRESS_TENSORS + 1))]
+        if result["before"] != [[0]] or result["after"] != expected:
             problems.append(f"progress probe {mode} read {result['before']} before "
                             f"and {result['after']} after, expected {expected}")
     return problems

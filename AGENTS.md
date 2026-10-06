@@ -17,6 +17,9 @@ Guidance for coding agents working in `stable-diffusion-native`.
   would call, and never waits for such a thread: a Dart callback there aborts
   or deadlocks VM shutdown. Record state natively and let the caller poll.
   Wrapper state has no destructor; threads still use it while `exit()` runs.
+- Whatever a caller polls must keep its history. Consumers derive state from
+  the order of progress reports, such as which image of a batch is being
+  sampled, so a "latest value" export loses what happened between two polls.
 
 ## Commands
 

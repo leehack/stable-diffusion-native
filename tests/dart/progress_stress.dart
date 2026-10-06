@@ -1,7 +1,7 @@
 // Regression harness for progress reporting while the Dart VM shuts down.
 //
 // Usage: dart progress_stress.dart <library> <design> <owner> <reportMs>
-//            <gapUs> <dieAfterMs> <allocatingIsolates>
+//            <gapUs> <dieAfterMs> <allocatingIsolates> [lossless]
 //
 // A worker isolate blocks in a native call that reports progress, as
 // generate_image() does. Other isolates allocate, so the isolate group keeps
@@ -16,7 +16,10 @@
 // How the owner consumes progress:
 //
 //   design poll    sd_dart_progress_enable() and a timer that reads
-//                  sd_dart_progress_read(); no Dart callback exists
+//                  sd_dart_progress_read(); no Dart callback exists. Every
+//                  report read must be the one its sequence names, in
+//                  order, and reports may be missing only when more were
+//                  recorded than the library keeps; with `lossless`, never
 //   design raw     control: a NativeCallable.listener installed with
 //                  sd_set_progress_callback()
 //   design locked  control: the listener behind a forwarder that locks
@@ -61,9 +64,19 @@ NativeFinalizer? keptFinalizer;
 NativeCallable<ProgressNative>? keptCallback;
 Timer? keptTimer;
 
-int progressSeen = 0;
+// The number of recent reports sd_dart_wrapper.h promises to keep.
+const int reportsKept = 4095;
+const int batchSize = 256;
 
-void consumeProgress(String libraryPath, String design) {
+int progressSeen = 0;
+int progressMissed = 0;
+
+void fail(int code, String message) {
+  stderr.writeln('stress: $message');
+  exit(code);
+}
+
+void consumeProgress(String libraryPath, String design, bool lossless) {
   final library = DynamicLibrary.open(libraryPath);
   if (design == 'poll') {
     library.lookupFunction<Void Function(), void Function()>(
@@ -71,34 +84,51 @@ void consumeProgress(String libraryPath, String design) {
     )();
     final read = library
         .lookupFunction<
-          Void Function(Pointer<Progress>),
-          void Function(Pointer<Progress>)
+          Size Function(Uint64, Pointer<Progress>, Size, Pointer<Uint64>),
+          int Function(int, Pointer<Progress>, int, Pointer<Uint64>)
         >('sd_dart_progress_read', isLeaf: true);
-    final progress = DynamicLibrary.process()
+    final malloc = DynamicLibrary.process()
         .lookupFunction<
-          Pointer<Progress> Function(IntPtr),
-          Pointer<Progress> Function(int)
-        >('malloc')(sizeOf<Progress>());
-    var lastSequence = 0;
+          Pointer<Void> Function(IntPtr),
+          Pointer<Void> Function(int)
+        >('malloc');
+    final reports = malloc(batchSize * sizeOf<Progress>()).cast<Progress>();
+    final latest = malloc(sizeOf<Uint64>()).cast<Uint64>();
+    var after = 0;
     keptTimer = Timer.periodic(const Duration(milliseconds: 1), (_) {
-      for (var i = 0; i < 64; i++) {
-        read(progress);
-        final report = progress.ref;
-        final whole =
-            report.sequence == 0 ||
-            (report.steps == report.step + 1 &&
-                report.time == report.step % 1024);
-        if (!whole || report.sequence < lastSequence) {
-          stderr.writeln(
-            'stress: inconsistent report ${report.sequence} '
-            '${report.step} ${report.steps} ${report.time} after $lastSequence',
-          );
-          exit(4);
+      for (var call = 0; call < 64; call++) {
+        final count = read(after, reports, batchSize, latest);
+        for (var i = 0; i < count; i++) {
+          final report = reports[i];
+          // The worker is the only reporter: its report n has sequence n + 1.
+          final step = (report.sequence - 1) & 0x3fffffff;
+          if (report.sequence != reports[0].sequence + i ||
+              report.step != step ||
+              report.steps != step + 1 ||
+              report.time != step % 1024) {
+            fail(
+              4,
+              'report ${report.sequence} is ${report.step} ${report.steps} '
+              '${report.time}, at $i of a read after $after',
+            );
+          }
         }
-        if (report.sequence > lastSequence) {
-          progressSeen++;
+        if (count > 0) {
+          final missed = reports[0].sequence - after - 1;
+          if (missed > 0 && (lossless || latest.value - after <= reportsKept)) {
+            fail(
+              6,
+              '$missed reports after $after are missing with ${latest.value} '
+              'recorded',
+            );
+          }
+          progressMissed += missed;
+          progressSeen += count;
+          after = reports[count - 1].sequence;
         }
-        lastSequence = report.sequence;
+        if (after >= latest.value) {
+          break;
+        }
       }
     });
     return;
@@ -130,11 +160,11 @@ void consumeProgress(String libraryPath, String design) {
   }
 }
 
-void owner((SendPort, String, String) arguments) {
-  final (ready, libraryPath, design) = arguments;
-  consumeProgress(libraryPath, design);
+void owner((SendPort, String, String, bool) arguments) {
+  final (ready, libraryPath, design, lossless) = arguments;
+  consumeProgress(libraryPath, design, lossless);
   final commands = ReceivePort();
-  commands.listen((_) => ready.send(progressSeen));
+  commands.listen((_) => ready.send((progressSeen, progressMissed)));
   ready.send(commands.sendPort);
 }
 
@@ -168,18 +198,20 @@ Future<void> main(List<String> arguments) async {
   final gapUs = int.parse(arguments[4]);
   final dieAfter = Duration(milliseconds: int.parse(arguments[5]));
   final allocatingIsolates = int.parse(arguments[6]);
+  final lossless = arguments.length > 7 && arguments[7] == 'lossless';
 
   final messages = ReceivePort();
   final inbox = StreamIterator<Object?>(messages);
   Isolate? ownerIsolate;
   SendPort? ownerCommands;
   if (ownerLayout == 'main') {
-    consumeProgress(libraryPath, design);
+    consumeProgress(libraryPath, design, lossless);
   } else {
     ownerIsolate = await Isolate.spawn(owner, (
       messages.sendPort,
       libraryPath,
       design,
+      lossless,
     ));
     await inbox.moveNext();
     ownerCommands = inbox.current as SendPort;
@@ -196,19 +228,17 @@ Future<void> main(List<String> arguments) async {
   await inbox.moveNext();
 
   await Future<void>.delayed(dieAfter);
-  var seen = progressSeen;
+  var (seen, missed) = (progressSeen, progressMissed);
   if (ownerCommands != null) {
     ownerCommands.send(null);
     await inbox.moveNext();
     if (inbox.current == 'reported') {
-      stderr.writeln('stress: the native call returned before the owner died');
-      exit(3);
+      fail(3, 'the native call returned before the owner died');
     }
-    seen = inbox.current as int;
+    (seen, missed) = inbox.current as (int, int);
   }
   if (seen == 0) {
-    stderr.writeln('stress: the owner saw no progress');
-    exit(5);
+    fail(5, 'the owner saw no progress');
   }
   if (ownerLayout == 'killed') {
     final exited = ReceivePort();
@@ -216,6 +246,6 @@ Future<void> main(List<String> arguments) async {
     ownerIsolate.kill(priority: Isolate.immediate);
     await exited.first;
   }
-  stderr.writeln('stress: dying after $seen progress updates');
+  stderr.writeln('stress: dying after $seen reports read, $missed missed');
   throw StateError('stress: unhandled error');
 }
