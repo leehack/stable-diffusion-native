@@ -146,6 +146,109 @@ do {
 dies while a native call is reporting progress, and one that polls a batch of
 images; see its docstring.
 
+### Exit teardown
+
+```c
+sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
+bool sd_dart_generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params,
+                            sd_image_t** images_out, int* num_images_out);
+void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
+void sd_dart_exit_free(void* object);
+
+bool sd_dart_exit_track(void* object, void (*free_fn)(void*), int32_t stage);
+bool sd_dart_exit_untrack(void* object);
+int32_t sd_dart_exit_tracked_count(void);
+void sd_dart_exit_call_begin(void);
+void sd_dart_exit_call_end(void);
+void sd_dart_exit_set_wait_ms(int32_t wait_ms);
+void sd_dart_exit_teardown(void);
+```
+
+ggml-metal aborts in its static destructor
+(`GGML_ASSERT([rsets->data count] == 0)`) when a process exits while a Metal
+buffer is still allocated. A caller in a managed runtime cannot always free
+its contexts first: a Flutter macOS quit calls `exit()` without shutting the
+Dart isolates down, a hot restart drops them without running finalizers, and
+an isolate that is killed during `new_sd_ctx` never sees the context that
+call returns. So the library keeps a registry of live objects and, on Apple
+platforms, frees what is left of it during `exit()`, before the first of its
+statics is destroyed.
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_new_sd_ctx` | `new_sd_ctx` that tracks the context before it returns. |
+| `sd_dart_generate_image` | `generate_image` as a call in flight: teardown cancels it and waits for it. |
+| `sd_dart_cancel_generation` | `sd_cancel_generation` for a tracked context, from any thread. Does nothing for a context that is not tracked, including one already freed. Never blocks. |
+| `sd_dart_exit_free` | Untracks an object and frees it with the function it was tracked with (`free_sd_ctx` for a context). Does nothing when it is not tracked, so it also works as a Dart `NativeFinalizer`. |
+| `sd_dart_exit_track`, `_untrack` | For C and C++ callers: track any other object, such as an `upscaler_ctx_t`, with its free function and a stage, or stop tracking it. |
+| `sd_dart_exit_tracked_count` | Number of tracked objects. |
+| `sd_dart_exit_call_begin`, `_end` | For C and C++ callers: mark a call in flight around an upstream function that has no wrapper. |
+| `sd_dart_exit_set_wait_ms` | How long teardown waits for calls in flight; 2000 ms by default. |
+| `sd_dart_exit_teardown` | Runs teardown now, for native hosts on platforms where it does not run by itself. Follow it directly with `exit()`. |
+
+A Dart caller replaces `new_sd_ctx`, `generate_image`, `sd_cancel_generation`
+and `free_sd_ctx` with the first four and binds nothing else: the remaining
+functions are for native hosts, and a Dart program that calls
+`sd_dart_exit_teardown` and returns from `main` waits forever for its blocked
+isolates.
+
+What is guaranteed:
+
+- **Tracking begins and ends in native code.** A context is tracked before
+  the call that creates it returns and untracked inside the call that frees
+  it, so an isolate that is killed in between leaves nothing untracked and
+  nothing is freed twice.
+- **No free under a running call.** Teardown asks every tracked context to
+  cancel its generation, repeating the request until the calls in flight
+  have ended, and frees only then. If one is still running after the wait,
+  it frees nothing at all rather than what happens to be idle.
+- **A bounded exit.** The wait ends after `wait_ms`, plus 250 ms for a thread
+  that has just left a call to finish the short calls that follow it. With
+  nothing tracked and no load in flight, teardown returns at once.
+- **Nothing returns into freed memory.** Once teardown has begun, a thread
+  that ends its outermost call in flight, or reaches the registry outside
+  one, never returns to its caller.
+- **Order.** Objects are freed by stage, an object before what it uses, and
+  latest first within a stage. On Apple platforms that happens before any
+  static of the library is destroyed, whenever the static was created: the
+  library defines `__cxa_atexit` for its own image, hidden and not exported,
+  and registers every static destructor behind a call to teardown.
+  `validate_artifacts.py` and `apple_xcframework.py validate` fail a slice
+  that imports the system function instead.
+- **Callers that do not use it are unaffected.** A context from `new_sd_ctx`
+  is not tracked, and exiting with one alive behaves as before, the Metal
+  abort included. Another ggml in the process, such as libllamadart's with
+  its own copy of this registry, is not touched either.
+
+What is not:
+
+- **A load cannot be cancelled.** Teardown waits for one like for any call,
+  and a load that outlasts `wait_ms` leaves everything allocated, so Metal
+  aborts as before.
+- **A sampling step cannot be interrupted.** stable-diffusion.cpp honors a
+  cancellation between steps. A step that outlasts `wait_ms` has the same
+  result as a load that does.
+- **Upstream calls on a tracked context are not waited for.** A raw
+  `generate_image`, `generate_video` or `adetail_image` on a context from
+  `sd_dart_new_sd_ctx` is a use after free at exit. Native callers bracket
+  such a call with `sd_dart_exit_call_begin` and `_end`; Dart callers cannot,
+  because a killed isolate never reaches the end.
+- **Platforms other than Apple's.** The abort is ggml-metal's, so elsewhere
+  teardown runs only when a native host calls it. CI checks on Linux that a
+  context left alive at exit is harmless on the CPU, and reports what the
+  Vulkan backend does on Mesa lavapipe; no hardware Vulkan driver was tried.
+- **Threads that teardown blocked stay blocked.** A static destructor or
+  `atexit` handler of another library that joins one hangs the exit.
+
+`tests/test_exit_teardown.py` runs the registry against stand-ins for
+upstream, also under AddressSanitizer and ThreadSanitizer.
+`tests/test_exit_teardown_runtime.py` runs it against a built macOS runtime
+and a real `sd_ctx_t`, on Metal and on the CPU: the test writes a 12 MB
+PixArt model itself, so CI needs no download. Where no Metal residency set is
+live, as on GitHub's macOS runners, an untracked context exits cleanly and the
+Metal abort is not exercised; there the test shows each free through the
+allocator instead.
+
 ## Build
 
 ```bash

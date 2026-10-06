@@ -17,6 +17,14 @@ Guidance for coding agents working in `stable-diffusion-native`.
   would call, and never waits for such a thread: a Dart callback there aborts
   or deadlocks VM shutdown. Record state natively and let the caller poll.
   Wrapper state has no destructor; threads still use it while `exit()` runs.
+  The one wait is exit teardown's, which is bounded and frees nothing when it
+  runs out.
+- Whatever a Dart caller does to a tracked object begins and ends in one
+  native call: tracking in the call that creates it, untracking in the call
+  that frees it, and a call in flight around anything that can outlast the
+  250 ms settle time. An isolate can be killed between any two native calls.
+  Give such an upstream function an `sd_dart_` wrapper before `llamadart`
+  calls it on a tracked context.
 - Whatever a caller polls must keep its history. Consumers derive state from
   the order of progress reports, such as which image of a batch is being
   sampled, so a "latest value" export loses what happened between two polls.
@@ -33,11 +41,20 @@ python3 tools/validate_artifacts.py <target>
 - `tests/test_progress_stress.py` needs a Dart SDK on `PATH` and skips without
   one; CI runs it with 25 runs per configuration. Run it after any change to
   `src/`.
+- `tests/test_exit_teardown_runtime.py` needs the built macOS runtime and
+  skips without it. After a change to `src/sd_dart_exit.cpp` or an upstream
+  bump, run it against the release build and again with
+  `SD_EXIT_TEARDOWN_SANITIZER=address`, on a Mac where its control reports the
+  Metal abort: GitHub's runners do not reach it.
 - Every shipped library must pass `validate_artifacts.py`: it exports exactly
   the `SD_API` symbols in `stable-diffusion.h` and `src/sd_dart_wrapper.h`, and
   links only allowlisted system libraries. Never export an upstream-internal
   or ggml symbol to fix a consumer; a leaked ggml symbol can collide with
   llama.cpp's ggml in the same process.
+- An Apple library must not import `__cxa_atexit`: exit teardown depends on
+  the hidden definition in `src/sd_dart_exit.cpp` receiving every static
+  destructor of the image. Keep that definition hidden; libllamadart has its
+  own.
 - The Apple XCFramework must pass `apple_xcframework.py validate` and
   `consumer`. Its Info.plist minimum OS is read from each binary's
   `LC_BUILD_VERSION`; never hard-code it, since a mismatch fails App Store

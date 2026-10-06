@@ -64,6 +64,126 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
                                     size_t capacity,
                                     uint64_t* latest);
 
+// Exit teardown
+//
+// The library keeps a registry of live native objects and frees what is left
+// of it when the process exits without freeing them itself, as a Flutter quit
+// or hot restart does. ggml-metal aborts in its static destructor while any
+// Metal buffer is still allocated, so teardown has to run before that
+// destructor. On Apple platforms it runs during exit(), before the first
+// static of this library is destroyed. Elsewhere, where that abort does not
+// exist, it runs only when sd_dart_exit_teardown() is called.
+//
+// Objects are tracked by sd_dart_new_sd_ctx(), before it returns, and by
+// sd_dart_exit_track().
+//
+// Teardown asks every tracked context to cancel its generation, waits a
+// bounded time for the calls in flight and then frees the tracked objects in
+// sd_dart_exit_stage order, latest tracked first within a stage. If a call is
+// still in flight when the wait ends, it frees nothing. With nothing tracked
+// and no sd_dart_new_sd_ctx() in flight, it does not wait.
+//
+// A call in flight is the time a thread spends inside sd_dart_new_sd_ctx(),
+// sd_dart_generate_image() or sd_dart_exit_free(), or between
+// sd_dart_exit_call_begin() and sd_dart_exit_call_end().
+//
+// Once teardown has begun, the objects a thread holds may be freed as soon as
+// it has no call in flight. From then on, the end of a thread's outermost call
+// in flight never returns to its caller. Neither does a function documented
+// as "blocks after teardown" when it is called outside a call in flight;
+// inside one it works as before, since teardown is waiting for that call. The
+// thread that runs teardown is exempt: there, such a function returns without
+// tracking, untracking or freeing anything. A thread blocked this way stays
+// blocked until the process is gone, so a static destructor or atexit handler
+// of another library that joins such a thread hangs the exit.
+//
+// A native call that is not a call in flight is not waited for. Teardown only
+// allows a thread 250 ms after its last call in flight to finish what follows
+// it, which covers short calls such as sd_get_model_version_name() after a
+// load. A longer call on a tracked context that is not a call in flight, such
+// as generate_image() or generate_video(), is a use after free at exit, also
+// where exiting with the context alive was harmless. Contexts created by
+// new_sd_ctx() are not tracked, and exiting with one alive behaves as it did
+// before this registry existed.
+
+// Order in which exit teardown frees tracked objects: every object of a lower
+// stage before any object of a higher one, so an object goes before the
+// objects it uses.
+enum sd_dart_exit_stage {
+    // State that uses a context.
+    SD_DART_EXIT_STAGE_CONTEXT_USER = 0,
+    // sd_ctx_t and the other contexts of stable-diffusion.h.
+    SD_DART_EXIT_STAGE_CONTEXT = 1,
+    // What a context uses.
+    SD_DART_EXIT_STAGE_RESOURCE = 2,
+};
+
+// Tracks `object` so that exit teardown frees it with `free_fn`, which
+// teardown calls on the thread that runs exit(): pass a native function, never
+// a callback into a managed runtime. Tracking an address again replaces its
+// entry. Returns false for a null argument or an unknown stage. Blocks after
+// teardown.
+//
+// For C and C++ callers. From Dart an object has to be tracked by the native
+// call that creates it: an isolate that is killed during that call never
+// reaches a later call that would track it.
+SD_API bool sd_dart_exit_track(void* object, void (*free_fn)(void*), int32_t stage);
+
+// Stops tracking `object` without freeing it. Returns whether it was tracked.
+// Blocks after teardown.
+SD_API bool sd_dart_exit_untrack(void* object);
+
+// Stops tracking `object` and frees it with the function it was tracked with:
+// free_sd_ctx() for a context from sd_dart_new_sd_ctx(). Does nothing when
+// `object` is not tracked, so each tracked object is freed once, whether by
+// this call or by teardown. Usable as a Dart NativeFinalizer callback. Blocks
+// after teardown.
+SD_API void sd_dart_exit_free(void* object);
+
+// Number of tracked objects.
+SD_API int32_t sd_dart_exit_tracked_count(void);
+
+// Mark the start and end of a call in flight on the calling thread, for C and
+// C++ callers of native functions that have no sd_dart_ wrapper. They nest.
+// Each begin needs one end on the same thread: a thread that never reaches end
+// keeps teardown from freeing anything. Do not call them from Dart, where an
+// isolate that is killed during the native call in between never reaches end.
+// begin blocks after teardown.
+SD_API void sd_dart_exit_call_begin(void);
+SD_API void sd_dart_exit_call_end(void);
+
+// Sets how long teardown waits for calls in flight. Negative values are
+// treated as zero. The default is 2000 ms.
+SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms);
+
+// Runs exit teardown now; later runs do nothing. Afterwards tracked objects
+// are unusable and other threads that reach the functions above stay blocked,
+// so call it only as the last step before the process exits and follow it
+// directly with exit() or _exit() on the same thread. It is meant for native
+// hosts. Do not bind it from Dart: a Dart program that returns from main
+// after it waits forever for its blocked isolates.
+SD_API void sd_dart_exit_teardown(void);
+
+// new_sd_ctx() that tracks the context in the CONTEXT stage before it
+// returns. Free the context with sd_dart_exit_free(). A load cannot be
+// cancelled: teardown waits for it like for any call in flight. Blocks after
+// teardown.
+SD_API sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
+
+// generate_image() as a call in flight. Takes and returns what generate_image()
+// does. Teardown cancels it with SD_CANCEL_ALL, which stable-diffusion.cpp
+// honors between sampling steps. Blocks after teardown.
+SD_API bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
+                                   const sd_img_gen_params_t* sd_img_gen_params,
+                                   sd_image_t** images_out,
+                                   int* num_images_out);
+
+// sd_cancel_generation() for a tracked context, callable from any thread while
+// another one generates. Does nothing when `sd_ctx` is not tracked: one that
+// sd_dart_exit_free() or teardown already freed, or one from new_sd_ctx().
+// Never blocks, also after teardown.
+SD_API void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
+
 #ifdef __cplusplus
 }
 #endif

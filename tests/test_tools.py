@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +11,7 @@ import apple_xcframework  # noqa: E402
 from build import HEADERS, TARGETS, WRAPPER_HEADER  # noqa: E402
 from package_release import TAG_PATTERN  # noqa: E402
 from sd_api import api_symbols  # noqa: E402
+from validate_artifacts import APPLE_STATIC_DESTRUCTOR_IMPORT, imports_symbol  # noqa: E402
 
 HEADER = """
 #if __GNUC__ >= 4
@@ -47,11 +50,62 @@ class ApiSymbolsTest(unittest.TestCase):
                 ["generate_image", "new_sd_ctx", "sample_method_to_str", "sd_dart_added"],
             )
 
-    def test_wrapper_header_adds_only_the_progress_exports(self):
+    def test_wrapper_header_adds_only_the_progress_and_exit_teardown_exports(self):
         self.assertEqual(
             api_symbols(WRAPPER_HEADER),
-            ["sd_dart_progress_enable", "sd_dart_progress_read"],
+            [
+                "sd_dart_cancel_generation",
+                "sd_dart_exit_call_begin",
+                "sd_dart_exit_call_end",
+                "sd_dart_exit_free",
+                "sd_dart_exit_set_wait_ms",
+                "sd_dart_exit_teardown",
+                "sd_dart_exit_track",
+                "sd_dart_exit_tracked_count",
+                "sd_dart_exit_untrack",
+                "sd_dart_generate_image",
+                "sd_dart_new_sd_ctx",
+                "sd_dart_progress_enable",
+                "sd_dart_progress_read",
+            ],
         )
+
+
+STATIC_WITH_DESTRUCTOR = """
+struct Static { ~Static(); };
+Static::~Static() {}
+Static instance;
+"""
+OWN_REGISTRATION = """
+extern "C" __attribute__((visibility("hidden"))) int __cxa_atexit(void (*)(void*), void*, void*) {
+    return 0;
+}
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin", "reads Mach-O imports with nm")
+class StaticDestructorImportTest(unittest.TestCase):
+    def build(self, directory: str, name: str, source: str, *archs: str) -> Path:
+        path = Path(directory) / f"{name}.cpp"
+        path.write_text(source)
+        library = Path(directory) / f"lib{name}.dylib"
+        flags = [flag for arch in archs for flag in ("-arch", arch)]
+        subprocess.run([shutil.which("c++"), "-std=c++17", "-shared", *flags, str(path),
+                        "-o", str(library)], check=True)
+        return library
+
+    def test_tells_the_system_registration_from_the_library_s_own(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self.build(tmp, "system", STATIC_WITH_DESTRUCTOR)
+            own = self.build(tmp, "own", STATIC_WITH_DESTRUCTOR + OWN_REGISTRATION)
+            self.assertTrue(imports_symbol(system, APPLE_STATIC_DESTRUCTOR_IMPORT))
+            self.assertFalse(imports_symbol(own, APPLE_STATIC_DESTRUCTOR_IMPORT))
+
+    def test_reads_the_named_architecture_of_a_universal_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self.build(tmp, "system", STATIC_WITH_DESTRUCTOR, "arm64", "x86_64")
+            for arch in ("arm64", "x86_64"):
+                self.assertTrue(imports_symbol(system, APPLE_STATIC_DESTRUCTOR_IMPORT, arch))
 
 
 class ReleaseTagTest(unittest.TestCase):

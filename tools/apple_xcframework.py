@@ -38,7 +38,11 @@ from build import (
     TARGETS,
 )
 from sd_api import api_symbols
-from validate_artifacts import APPLE_SYSTEM_DEPENDENCIES
+from validate_artifacts import (
+    APPLE_STATIC_DESTRUCTOR_IMPORT,
+    APPLE_SYSTEM_DEPENDENCIES,
+    imports_symbol,
+)
 
 FRAMEWORK = "stable_diffusion"
 XCFRAMEWORK = f"{FRAMEWORK}.xcframework"
@@ -305,6 +309,9 @@ def validate_slice(slice_: Slice, root: Path, entry: dict, expected_symbols: set
         for dep in (line.split(" (")[0].strip() for line in lines):
             if dep != slice_.install_name and not SYSTEM_DEPENDENCY.match(dep):
                 problems.append(f"{where} {arch}: unexpected dependency {dep}")
+        if imports_symbol(binary, APPLE_STATIC_DESTRUCTOR_IMPORT, arch):
+            problems.append(f"{where} {arch}: imports {APPLE_STATIC_DESTRUCTOR_IMPORT}; "
+                            "static destructors bypass exit teardown")
         names = output(["nm", "-gUj", "-arch", arch, str(binary)]).split()
         exported = {n[1:] if n.startswith("_") else n for n in names}
         if exported != expected_symbols:

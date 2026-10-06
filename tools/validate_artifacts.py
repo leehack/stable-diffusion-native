@@ -3,7 +3,8 @@
 
 Checks that each library exports exactly the `SD_API` symbols of the shipped
 headers (so no ggml symbol leaks) and, except on Windows, links only against
-allowlisted system libraries.
+allowlisted system libraries. An Apple library must also register its static
+destructors through its own `__cxa_atexit`.
 """
 
 from __future__ import annotations
@@ -29,6 +30,11 @@ APPLE_SYSTEM_DEPENDENCIES = (
 APPLE_DEPENDENCIES = re.compile(
     rf"^(@rpath/libstable-diffusion\.dylib|{APPLE_SYSTEM_DEPENDENCIES})$"
 )
+# `src/sd_dart_exit.cpp` defines `__cxa_atexit`, so that every static destructor
+# of an Apple library runs exit teardown first. A library that imports the
+# system function registers its destructors past that definition, and exit
+# teardown then runs after the statics it needs are gone.
+APPLE_STATIC_DESTRUCTOR_IMPORT = "___cxa_atexit"
 ELF_DEPENDENCIES = {
     "android": {"libc.so", "libm.so", "libdl.so", "liblog.so"},
     "linux": {
@@ -85,6 +91,12 @@ def exported_symbols(target: Target, library: Path) -> set[str]:
     return {line.split()[-1] for line in lines.splitlines() if line.strip()}
 
 
+def imports_symbol(library: Path, symbol: str, arch: str | None = None) -> bool:
+    """Whether a Mach-O file imports `symbol`; a universal file needs `arch`."""
+    select = ["-arch", arch] if arch else []
+    return symbol in output(["nm", "-uj", *select, str(library)]).split()
+
+
 def dependencies(target: Target, library: Path) -> list[str]:
     if target.os in ("macos", "ios"):
         lines = output(["otool", "-L", str(library)]).splitlines()[1:]
@@ -127,6 +139,11 @@ def validate(target: Target) -> list[str]:
     if leaked:
         problems.append(
             f"{len(leaked)} non-API exports, e.g. {', '.join(leaked[:10])}"
+        )
+
+    if target.os in ("macos", "ios") and imports_symbol(library, APPLE_STATIC_DESTRUCTOR_IMPORT):
+        problems.append(
+            f"imports {APPLE_STATIC_DESTRUCTOR_IMPORT}: static destructors bypass exit teardown"
         )
 
     if target.os == "android":
