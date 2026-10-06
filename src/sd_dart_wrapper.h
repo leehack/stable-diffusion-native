@@ -80,12 +80,28 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // Teardown asks every tracked context to cancel its generation, waits a
 // bounded time for the calls in flight and then frees the tracked objects in
 // sd_dart_exit_stage order, latest tracked first within a stage. If a call is
-// still in flight when the wait ends, it frees nothing. With nothing tracked
-// and no sd_dart_new_sd_ctx() in flight, it does not wait.
+// still in flight when the wait ends, it frees nothing. With no call in
+// flight it does not wait. Neither does it when nothing is tracked and no
+// call in flight is creating or freeing a tracked object: sd_dart_new_sd_ctx()
+// and sd_dart_exit_free() are waited for whatever the registry holds.
 //
 // A call in flight is the time a thread spends inside sd_dart_new_sd_ctx(),
 // sd_dart_generate_image() or sd_dart_exit_free(), or between
 // sd_dart_exit_call_begin() and sd_dart_exit_call_end().
+//
+// The wait ends when the calls do, and it has two bounds:
+// - 15 s while a load or a generation is in flight, that is
+//   sd_dart_new_sd_ctx() or sd_dart_generate_image(). stable-diffusion.cpp
+//   reads a cancellation only between the phases of a generation: before a
+//   sampling step and before the decode of each image. A load, the text
+//   encoder, a sampling step and the VAE decode of an image each run to their
+//   end, and the decode alone takes seconds: with SD-Turbo on an M4 Max,
+//   4.1 s for 768 x 768 pixels and 7.4 s for 1024 x 1024. So a process that
+//   quits during a large generation can take that much longer to exit.
+// - 2 s otherwise: for sd_dart_exit_free() and for calls marked with
+//   sd_dart_exit_call_begin().
+// A phase that outlasts its bound leaves everything allocated, and the
+// process exits as it would have without this registry.
 //
 // Once teardown has begun, the objects a thread holds may be freed as soon as
 // it has no call in flight. From then on, the end of a thread's outermost call
@@ -152,9 +168,11 @@ SD_API int32_t sd_dart_exit_tracked_count(void);
 SD_API void sd_dart_exit_call_begin(void);
 SD_API void sd_dart_exit_call_end(void);
 
-// Sets how long teardown waits for calls in flight. Negative values are
-// treated as zero. The default is 2000 ms.
-SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms);
+// Sets how long teardown waits for calls in flight: `work_wait_ms` while a
+// load or a generation is among them, `wait_ms` otherwise. Negative values are
+// treated as zero. The defaults are 2000 and 15000. A host that would rather
+// abort in ggml-metal than exit late passes one value for both.
+SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms);
 
 // Runs exit teardown now; later runs do nothing. Afterwards tracked objects
 // are unusable and other threads that reach the functions above stay blocked,
@@ -166,13 +184,14 @@ SD_API void sd_dart_exit_teardown(void);
 
 // new_sd_ctx() that tracks the context in the CONTEXT stage before it
 // returns. Free the context with sd_dart_exit_free(). A load cannot be
-// cancelled: teardown waits for it like for any call in flight. Blocks after
+// cancelled: teardown waits for it, with the longer bound. Blocks after
 // teardown.
 SD_API sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 
 // generate_image() as a call in flight. Takes and returns what generate_image()
 // does. Teardown cancels it with SD_CANCEL_ALL, which stable-diffusion.cpp
-// honors between sampling steps. Blocks after teardown.
+// honors before a sampling step and before the decode of each image, and
+// waits for it with the longer bound. Blocks after teardown.
 SD_API bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                                    const sd_img_gen_params_t* sd_img_gen_params,
                                    sd_image_t** images_out,

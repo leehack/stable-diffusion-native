@@ -104,6 +104,10 @@ std::atomic<bool (*)(sd_ctx_t*)> run_generation{nullptr};
 std::atomic<void (*)()> hold_free{nullptr};
 std::atomic<int> contexts_freed{0};
 std::atomic<sd_ctx_t*> last_freed{nullptr};
+// Upstream calls that began after teardown had returned.
+std::atomic<bool> teardown_returned{false};
+std::atomic<int> loads_begun{0};
+std::atomic<int> calls_after_teardown{0};
 // The arguments the stand-ins were last called with.
 std::atomic<const sd_ctx_params_t*> last_load_params{nullptr};
 std::atomic<const sd_img_gen_params_t*> last_request{nullptr};
@@ -259,7 +263,7 @@ int test_repeat() {
 
 int test_in_flight() {
     track_out_of_stage_order();
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
 
     static std::atomic<bool> in_call{false};
     static std::atomic<bool> returned{false};
@@ -293,7 +297,7 @@ int test_in_flight() {
 // nested calls and to use the registry until that call ends.
 int test_nested() {
     track_out_of_stage_order();
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
     start_heartbeat();
     static char inner[] = "inner";
 
@@ -355,11 +359,11 @@ int test_settle() {
     return 0;
 }
 
-// A generation that never ends: teardown gives up and frees nothing, also not
-// the objects no call is using.
+// A generation that never ends: teardown gives up after the bound for loads
+// and generations and frees nothing, also not the objects no call is using.
 int test_timeout() {
     track_out_of_stage_order();
-    sd_dart_exit_set_wait_ms(1000);
+    sd_dart_exit_set_wait_ms(200, 1000);
     sd_ctx_params_t params{};
     static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
     static sd_ctx_t* idle    = sd_dart_new_sd_ctx(&params);
@@ -399,13 +403,104 @@ int test_timeout() {
     return 0;
 }
 
+// A call that is neither a load nor a generation gets the shorter bound.
+int test_timeout_plain() {
+    track_out_of_stage_order();
+    sd_dart_exit_set_wait_ms(1000, 30000);
+    static std::atomic<bool> in_call{false};
+    std::thread([] {
+        sd_dart_exit_call_begin();
+        in_call.store(true);
+        sleep_ms(600000);
+    }).detach();
+    while (!in_call.load()) {
+        sleep_ms(1);
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    const int64_t waited = elapsed_ms(started);
+    CHECK(waited >= 900);
+    CHECK(waited < 10000);
+    CHECK(recorded().empty());
+    return 0;
+}
+
+// A generation that cannot be cancelled and a load, each outlasting the
+// shorter bound: teardown waits for them with the longer one and then frees
+// everything.
+int test_long_work() {
+    track_out_of_stage_order();
+    sd_dart_exit_set_wait_ms(300, 30000);
+    sd_ctx_params_t params{};
+    static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    static std::atomic<int> working{0};
+    run_generation.store([](sd_ctx_t*) {
+        working.fetch_add(1);
+        sleep_ms(1200);
+        record("generation-finished");
+        return true;
+    });
+    std::thread([] {
+        sd_img_gen_params_t request{};
+        sd_dart_generate_image(context, &request, nullptr, nullptr);
+    }).detach();
+    while (working.load() < 1) {
+        sleep_ms(1);
+    }
+    hold_load.store([] {
+        working.fetch_add(1);
+        sleep_ms(1500);
+        record("load-finished");
+        return true;
+    });
+    std::thread([] {
+        sd_ctx_params_t late_params{};
+        sd_dart_new_sd_ctx(&late_params);
+    }).detach();
+    while (working.load() < 2) {
+        sleep_ms(1);
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    const int64_t waited = elapsed_ms(started);
+    CHECK(waited >= 1000);
+    CHECK(waited < 20000);
+    std::vector<std::string> expected = {"generation-finished", "load-finished"};
+    expected.insert(expected.end(), kStageOrder.begin(), kStageOrder.end());
+    CHECK(recorded() == expected);
+    CHECK(contexts_freed.load() == 2);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
+// With contexts tracked and nothing in flight, teardown frees them without
+// waiting, however long the bounds are.
+int test_idle_no_wait() {
+    sd_dart_exit_set_wait_ms(30000, 60000);
+    sd_ctx_params_t params{};
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    CHECK(sd_dart_new_sd_ctx(&params) != nullptr);
+    sd_img_gen_params_t request{};
+    CHECK(sd_dart_generate_image(context, &request, nullptr, nullptr));
+    // Past the time a thread gets to finish what follows its last call.
+    sleep_ms(400);
+
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    CHECK(elapsed_ms(started) < 100);
+    CHECK(contexts_freed.load() == 2);
+    return 0;
+}
+
 // A call that never ends does not hold up an exit that has nothing to free:
 // what a caller that tracks nothing gets.
 int test_idle_wait() {
     std::thread([] { sd_dart_exit_call_begin(); }).join();
     sd_ctx_params_t params{};
     sd_ctx_t* untracked = new_sd_ctx(&params);
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
     const auto started = std::chrono::steady_clock::now();
     sd_dart_exit_teardown();
     CHECK(elapsed_ms(started) < 5000);
@@ -418,13 +513,44 @@ int test_idle_wait() {
 // exits the process, does not wait for the call it is in.
 int test_own_call() {
     track_out_of_stage_order();
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
     sd_dart_exit_call_begin();
     const auto started = std::chrono::steady_clock::now();
     sd_dart_exit_teardown();
     CHECK(elapsed_ms(started) < 5000);
     CHECK(recorded() == kStageOrder);
     sd_dart_exit_call_end();
+    return 0;
+}
+
+// A generation that exits the process from one of its own callbacks is not a
+// reason for the longer bound: teardown cannot wait for the call it is in.
+int test_own_work_call() {
+    track_out_of_stage_order();
+    sd_dart_exit_set_wait_ms(300, 30000);
+    sd_ctx_params_t params{};
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    static std::atomic<bool> in_call{false};
+    std::thread([] {
+        sd_dart_exit_call_begin();
+        in_call.store(true);
+        sleep_ms(600000);
+    }).detach();
+    while (!in_call.load()) {
+        sleep_ms(1);
+    }
+    static std::atomic<int64_t> waited{-1};
+    run_generation.store([](sd_ctx_t*) {
+        const auto started = std::chrono::steady_clock::now();
+        sd_dart_exit_teardown();
+        waited.store(elapsed_ms(started));
+        return true;
+    });
+    sd_img_gen_params_t request{};
+    CHECK(sd_dart_generate_image(context, &request, nullptr, nullptr));
+    CHECK(waited.load() >= 250);
+    CHECK(waited.load() < 10000);
+    CHECK(recorded().empty());
     return 0;
 }
 
@@ -628,7 +754,7 @@ std::atomic<bool> free_started{false};
 // else meanwhile, and the freeing thread never returns.
 int test_free_in_flight() {
     track_out_of_stage_order();
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
     start_heartbeat();
     sd_ctx_params_t params{};
     static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
@@ -659,13 +785,71 @@ int test_free_in_flight() {
     return 0;
 }
 
+// The context that is being freed is the only tracked object, so nothing is
+// tracked when teardown begins. Teardown still waits for the free: it needs
+// the statics that are destroyed once teardown returns.
+int test_last_free_in_flight() {
+    sd_dart_exit_set_wait_ms(30000, 30000);
+    start_heartbeat();
+    sd_ctx_params_t params{};
+    static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    hold_free.store([] {
+        free_started.store(true);
+        CHECK(wait_for_teardown());
+        sleep_ms(50);
+        record("free-finished");
+    });
+    static std::atomic<bool> returned{false};
+    std::thread([] {
+        sd_dart_exit_free(context);
+        returned.store(true);
+    }).detach();
+    while (!free_started.load()) {
+        sleep_ms(1);
+    }
+    CHECK(sd_dart_exit_tracked_count() == 0);
+
+    teardown_requested.store(true);
+    sd_dart_exit_teardown();
+    CHECK(recorded() == std::vector<std::string>({"free-finished"}));
+    CHECK(contexts_freed.load() == 1);
+    sleep_ms(200);
+    CHECK(!returned.load());
+    return 0;
+}
+
+// A thread loads and frees in a loop while teardown runs at a moment of its
+// own. Whichever instruction the thread is at, no load and no free begins
+// once teardown has returned, and nothing stays tracked. One run tries one
+// moment, so this scenario is run many times.
+int test_load_race() {
+    std::thread([] {
+        sd_ctx_params_t params{};
+        for (;;) {
+            sd_dart_exit_free(sd_dart_new_sd_ctx(&params));
+        }
+    }).detach();
+    while (loads_begun.load() < 1000) {
+        std::this_thread::yield();
+    }
+    const auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (volatile int i = 0, spins = static_cast<int>(seed % 20000); i < spins; i = i + 1) {
+    }
+    sd_dart_exit_teardown();
+    teardown_returned.store(true);
+    sleep_ms(30);
+    CHECK(calls_after_teardown.load() == 0);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
 std::atomic<bool> load_started{false};
 
 // A load in flight when teardown begins, with nothing tracked yet: teardown
 // waits for it, the context is tracked although teardown has begun, and it is
 // freed. The loading thread never returns.
 int test_load_in_flight() {
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
     start_heartbeat();
     hold_load.store([] {
         load_started.store(true);
@@ -698,7 +882,7 @@ int test_load_in_flight() {
 // cancellation the way generate_image() clears one that precedes its start.
 int test_generate_in_flight() {
     track_out_of_stage_order();
-    sd_dart_exit_set_wait_ms(30000);
+    sd_dart_exit_set_wait_ms(30000, 30000);
     start_heartbeat();
     sd_ctx_params_t params{};
     static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
@@ -747,6 +931,8 @@ int test_generate_in_flight() {
 }  // namespace
 
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+    loads_begun.fetch_add(1);
+    calls_after_teardown.fetch_add(teardown_returned.load() ? 1 : 0);
     last_load_params.store(sd_ctx_params);
     if (bool (*hold)() = hold_load.load()) {
         hold();
@@ -756,6 +942,7 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
     CHECK(!sd_ctx->generating.load());
+    calls_after_teardown.fetch_add(teardown_returned.load() ? 1 : 0);
     if (void (*hold)() = hold_free.load()) {
         hold();
     }
@@ -801,14 +988,20 @@ int main(int argc, char** argv) {
         {"nested", test_nested},
         {"settle", test_settle},
         {"timeout", test_timeout},
+        {"timeout-plain", test_timeout_plain},
+        {"long-work", test_long_work},
+        {"idle-no-wait", test_idle_no_wait},
         {"idle-wait", test_idle_wait},
         {"own-call", test_own_call},
+        {"own-work-call", test_own_work_call},
         {"blocked", test_blocked},
         {"exit", test_exit},
         {"late-static", test_late_static},
         {"context", test_context},
         {"context-stage", test_context_stage},
         {"free-in-flight", test_free_in_flight},
+        {"last-free-in-flight", test_last_free_in_flight},
+        {"load-race", test_load_race},
         {"cancel", test_cancel},
         {"load-in-flight", test_load_in_flight},
         {"generate-in-flight", test_generate_in_flight},

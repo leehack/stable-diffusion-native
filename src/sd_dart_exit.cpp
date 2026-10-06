@@ -37,10 +37,15 @@ struct Registry {
     std::condition_variable idle;
     std::unordered_map<void*, Entry> objects;
     std::chrono::steady_clock::time_point last_call_end{};
-    uint64_t next_order    = 0;
-    int32_t calls          = 0;
-    int32_t creating_calls = 0;
-    int32_t wait_ms        = 2000;
+    uint64_t next_order = 0;
+    int32_t calls       = 0;
+    // The calls in flight that create or free a tracked object. Their object
+    // is in the registry only before or after the call, never during it.
+    int32_t object_calls = 0;
+    // The loads and generations in flight.
+    int32_t work_calls   = 0;
+    int32_t wait_ms      = 2000;
+    int32_t work_wait_ms = 15000;
     std::atomic<bool> armed{false};
     std::atomic<bool> torn_down{false};
 };
@@ -55,6 +60,18 @@ thread_local bool teardown_thread = false;
 
 // Calls in flight on this thread. The registry counts the outermost one.
 thread_local int32_t call_depth = 0;
+
+// Loads and generations in flight on this thread.
+thread_local int32_t work_depth = 0;
+
+// What a call in flight is to teardown, beyond something to wait for.
+enum CallKind : int {
+    kPlainCall = 0,
+    // Creates or frees a tracked object: waited for with nothing tracked.
+    kObjectCall = 1,
+    // A load or a generation: waited for with the longer bound.
+    kWorkCall = 2,
+};
 
 // Called with the registry locked. Returns whether the calling thread may go
 // on to use tracked objects. Once teardown has begun, teardown waits for a
@@ -124,32 +141,67 @@ bool insert(void* object, void (*free_fn)(void*), void (*cancel_fn)(void*), int3
     return true;
 }
 
+// Begins a call in flight. Called with the registry locked, by a thread that
+// admit() let through, so that teardown sees the call and what it is for in
+// the same moment as whatever else the caller changes under that lock.
+void enter_call(Registry& registry, int kind) {
+    if (call_depth++ == 0) {
+        ++registry.calls;
+    }
+    if (kind & kObjectCall) {
+        ++registry.object_calls;
+    }
+    if (kind & kWorkCall) {
+        ++registry.work_calls;
+        ++work_depth;
+    }
+}
+
+// Ends a call in flight. Called with the registry locked. Once teardown has
+// begun, it does not return from the outermost call of a thread.
+void leave_call(Registry& registry, std::unique_lock<std::mutex>& lock, int kind) {
+    if (kind & kObjectCall) {
+        --registry.object_calls;
+    }
+    if (kind & kWorkCall) {
+        --registry.work_calls;
+        --work_depth;
+    }
+    if (--call_depth > 0) {
+        return;
+    }
+    --registry.calls;
+    registry.idle.notify_all();
+    if (admit(registry, lock)) {
+        registry.last_call_end = std::chrono::steady_clock::now();
+    }
+}
+
+// A call in flight of the given kind, from one critical section to another:
+// teardown never sees the call without what it is for.
 struct Call {
-    Call() { sd_dart_exit_call_begin(); }
-    ~Call() { sd_dart_exit_call_end(); }
+    explicit Call(int kind)
+        : kind(kind) {
+        Registry& registry = state();
+        std::unique_lock<std::mutex> lock(registry.mutex);
+        counted = admit(registry, lock);
+        if (counted) {
+            enter_call(registry, kind);
+        }
+    }
+    ~Call() {
+        if (counted) {
+            Registry& registry = state();
+            std::unique_lock<std::mutex> lock(registry.mutex);
+            leave_call(registry, lock, kind);
+        }
+    }
     Call(const Call&)            = delete;
     Call& operator=(const Call&) = delete;
-};
 
-// A call in flight that tracks what it creates. Teardown waits for it even
-// when nothing is tracked yet.
-struct CreatingCall {
-    CreatingCall() {
-        sd_dart_exit_call_begin();
-        Registry& registry = state();
-        std::lock_guard<std::mutex> lock(registry.mutex);
-        ++registry.creating_calls;
-    }
-    ~CreatingCall() {
-        {
-            Registry& registry = state();
-            std::lock_guard<std::mutex> lock(registry.mutex);
-            --registry.creating_calls;
-        }
-        sd_dart_exit_call_end();
-    }
-    CreatingCall(const CreatingCall&)            = delete;
-    CreatingCall& operator=(const CreatingCall&) = delete;
+    int kind;
+    // False on the teardown thread once teardown has begun.
+    bool counted;
 };
 
 void free_context(void* object) {
@@ -224,12 +276,13 @@ void sd_dart_exit_free(void* object) {
         }
         free_fn = found->second.free_fn;
         registry.objects.erase(found);
-        if (call_depth++ == 0) {
-            ++registry.calls;
-        }
+        // In the same critical section as the erase: from here on only this
+        // call tells teardown that the object still needs the library.
+        enter_call(registry, kObjectCall);
     }
     free_fn(object);
-    sd_dart_exit_call_end();
+    std::unique_lock<std::mutex> lock(registry.mutex);
+    leave_call(registry, lock, kObjectCall);
 }
 
 int32_t sd_dart_exit_tracked_count(void) {
@@ -245,30 +298,29 @@ void sd_dart_exit_call_begin(void) {
     }
     Registry& registry = state();
     std::unique_lock<std::mutex> lock(registry.mutex);
-    if (!admit(registry, lock)) {
-        return;
+    if (admit(registry, lock)) {
+        enter_call(registry, kPlainCall);
     }
-    ++registry.calls;
-    call_depth = 1;
 }
 
 void sd_dart_exit_call_end(void) {
-    if (call_depth == 0 || --call_depth > 0) {
+    if (call_depth == 0) {
+        return;
+    }
+    if (call_depth > 1) {
+        --call_depth;
         return;
     }
     Registry& registry = state();
     std::unique_lock<std::mutex> lock(registry.mutex);
-    --registry.calls;
-    registry.idle.notify_all();
-    if (admit(registry, lock)) {
-        registry.last_call_end = std::chrono::steady_clock::now();
-    }
+    leave_call(registry, lock, kPlainCall);
 }
 
-void sd_dart_exit_set_wait_ms(int32_t wait_ms) {
+void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms) {
     Registry& registry = state();
     std::lock_guard<std::mutex> lock(registry.mutex);
-    registry.wait_ms = std::max(wait_ms, 0);
+    registry.wait_ms      = std::max(wait_ms, 0);
+    registry.work_wait_ms = std::max(work_wait_ms, 0);
 }
 
 void sd_dart_exit_teardown(void) {
@@ -280,14 +332,14 @@ void sd_dart_exit_teardown(void) {
             return;
         }
         teardown_thread = true;
-        // With nothing to free and nothing being created, a call in flight is
-        // no reason to hold up the exit.
-        if (registry.creating_calls == 0 && registry.objects.empty()) {
+        // With nothing to free and no object being created or freed, a call
+        // in flight is no reason to hold up the exit.
+        if (registry.object_calls == 0 && registry.objects.empty()) {
             return;
         }
         // A call in flight on this thread cannot end while teardown runs.
         const int32_t own_calls = call_depth > 0 ? 1 : 0;
-        const auto deadline     = std::chrono::steady_clock::now() + std::chrono::milliseconds(registry.wait_ms);
+        const auto began        = std::chrono::steady_clock::now();
         while (registry.calls != own_calls) {
             // generate_image() clears a cancellation that was requested before
             // it started, so the request is repeated until the calls end.
@@ -296,7 +348,12 @@ void sd_dart_exit_teardown(void) {
                     entry.cancel_fn(object);
                 }
             }
-            const auto now = std::chrono::steady_clock::now();
+            // A load cannot be cancelled, and a generation only between two
+            // sampling steps, so those get the longer bound for as long as
+            // one is in flight.
+            const bool working  = registry.work_calls > work_depth;
+            const auto deadline = began + std::chrono::milliseconds(working ? registry.work_wait_ms : registry.wait_ms);
+            const auto now      = std::chrono::steady_clock::now();
             if (now >= deadline) {
                 return;
             }
@@ -318,7 +375,7 @@ void sd_dart_exit_teardown(void) {
 }
 
 sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
-    CreatingCall call;
+    Call call(kObjectCall | kWorkCall);
     sd_ctx_t* context = new_sd_ctx(sd_ctx_params);
     insert(context, free_context, cancel_context, SD_DART_EXIT_STAGE_CONTEXT);
     return context;
@@ -328,7 +385,7 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                             const sd_img_gen_params_t* sd_img_gen_params,
                             sd_image_t** images_out,
                             int* num_images_out) {
-    Call call;
+    Call call(kWorkCall);
     return generate_image(sd_ctx, sd_img_gen_params, images_out, num_images_out);
 }
 

@@ -5,6 +5,7 @@ functions it wraps, so it needs the submodule's header but no built runtime.
 Each scenario runs in its own process, as teardown runs once per process.
 """
 
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -24,6 +25,11 @@ INCLUDE_DIRS = [
 ]
 COMPILER = os.environ.get("CXX") or shutil.which("c++")
 SANITIZERS = ("address", "thread")
+# Scenarios that try one moment per run, and how often the unsanitized build
+# runs them, four at a time. With the two halves of a creating call's
+# bookkeeping in separate critical sections, 2 to 5 runs in 100 failed. A
+# sanitized build runs them once; it is slower and looks for something else.
+REPEATED = {"load-race": 400}
 SANITIZER_ENV = {
     # The scenarios leave contexts and blocked threads behind on purpose.
     "ASAN_OPTIONS": "detect_leaks=0",
@@ -59,12 +65,23 @@ class ExitTeardownTest(unittest.TestCase):
             scenarios = subprocess.run([str(binary), "list"], check=True, capture_output=True,
                                        text=True).stdout.split()
             self.assertIn("generate-in-flight", scenarios)
+
+            def run(scenario: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [str(binary), scenario], capture_output=True, text=True, timeout=600,
+                    env={**os.environ, **SANITIZER_ENV})
+
             for scenario in scenarios:
                 with self.subTest(scenario=scenario):
-                    result = subprocess.run(
-                        [str(binary), scenario], capture_output=True, text=True, timeout=600,
-                        env={**os.environ, **SANITIZER_ENV})
+                    result = run(scenario)
                     self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                for scenario, runs in ({} if flags else REPEATED).items():
+                    failures = [result.stdout + result.stderr
+                                for result in pool.map(run, [scenario] * runs)
+                                if result.returncode != 0]
+                    with self.subTest(scenario=scenario, runs=runs):
+                        self.assertEqual([], failures[:3], f"{len(failures)} of {runs} runs failed")
 
     def supports(self, flag: str) -> bool:
         with tempfile.TemporaryDirectory() as directory:

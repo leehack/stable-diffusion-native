@@ -45,7 +45,8 @@ python3 tools/validate_artifacts.py <target>
   skips without it. After a change to `src/sd_dart_exit.cpp` or an upstream
   bump, run it against the release build and again with
   `SD_EXIT_TEARDOWN_SANITIZER=address`, on a Mac where its control reports the
-  Metal abort: GitHub's runners do not reach it.
+  Metal abort, with `SD_REQUIRE_METAL_GENERATION=1`: GitHub's runners reach
+  neither the abort nor a generation on Metal.
 - Every shipped library must pass `validate_artifacts.py`: it exports exactly
   the `SD_API` symbols in `stable-diffusion.h` and `src/sd_dart_wrapper.h`, and
   links only allowlisted system libraries. Never export an upstream-internal
