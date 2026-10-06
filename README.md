@@ -14,9 +14,9 @@ elsewhere.
 - Pin an upstream stable-diffusion.cpp commit as a submodule.
 - Build one shared library per platform with upstream's C API
   (`stable-diffusion.h`) as the FFI boundary.
-- Export only that API. stable-diffusion.cpp embeds its own patched ggml;
-  hiding it lets the library share a process with another ggml, such as
-  llama.cpp's.
+- Export only that API and the [wrapper API](#wrapper-api) this repository
+  adds. stable-diffusion.cpp embeds its own patched ggml; hiding it lets the
+  library share a process with another ggml, such as llama.cpp's.
 - Publish runtime archives, unstripped symbol archives, an Apple SwiftPM
   XCFramework, `manifest.json` and `SHA256SUMS`.
 
@@ -52,6 +52,44 @@ Android GPU backends are not shipped. On tested devices, Vulkan crashed in
 the Adreno 750 driver's shader compiler and on a null `vkGetBufferDeviceAddress`
 on Mali-G68, and OpenCL on Adreno 750 was slower than the CPU.
 
+## Wrapper API
+
+`src/sd_dart_wrapper.h` declares the exports this repository adds to
+upstream's. It is compiled into the same library and ships next to
+`stable-diffusion.h` in every archive and XCFramework slice.
+
+| Function | Behavior |
+| --- | --- |
+| `void sd_dart_set_progress_callback(sd_progress_cb_t callback, void* data)` | Routes progress to `callback`, replacing the current one. `NULL` discards progress. Either way the library stops printing progress bars to stdout. |
+| `void sd_dart_clear_progress_callback(void* callback)` | Discards progress from now on if `callback` is the current callback; any other value leaves the current one in place. `NULL` discards whatever is set. |
+
+Upstream's `sd_set_progress_callback` stores the callback in an unsynchronized
+global that the loading or generating thread reads on every step, so a caller
+cannot know when a replaced callback has stopped running. A Dart
+`NativeCallable` invoked after its VM has shut down aborts the process. The
+wrapper registers one forwarder with upstream and swaps the real callback
+behind a lock that is held while the callback runs:
+
+- Both functions are safe from any thread at any time, including while another
+  thread is inside `new_sd_ctx` or `generate_image`.
+- When either returns, the callback it replaced is not running on another
+  thread and is never called again. Called from inside the callback itself,
+  they return at once and that one call finishes normally. Because they wait
+  for a call in flight, the callback must not wait for a thread that is
+  calling either function.
+- `sd_dart_clear_progress_callback` takes one pointer, so it can be a Dart
+  `NativeFinalizer` callback with the callback's address as its token: the
+  isolate that owns the callback then clears it when it shuts down.
+- `sd_dart_set_progress_callback(NULL, NULL)` silences progress output without
+  a callback, for example during a model load.
+
+Use these instead of `sd_set_progress_callback`, not together with it: the
+first `sd_dart_set_progress_callback` call registers the forwarder there, and
+a later `sd_set_progress_callback` call replaces it. Make that first call
+before starting a load or generation on another thread. A callback is called
+again if it is set again after being cleared, so set it from the isolate that
+owns it.
+
 ## Build
 
 ```bash
@@ -72,7 +110,8 @@ Outputs:
 
 - `bin/<target>/lib/`: stripped runtime library.
 - `bin/<target>/symbols/`: unstripped library for crash symbolication.
-- `bin/<target>/include/stable-diffusion.h` and `build-info.json`.
+- `bin/<target>/include/`: `stable-diffusion.h` and `sd_dart_wrapper.h`.
+- `bin/<target>/build-info.json`.
 - `dist/`: release archives, `manifest.json`, `SHA256SUMS`.
 
 ## Apple XCFramework

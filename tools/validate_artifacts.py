@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Validates built runtime payloads under `bin/<target>/`.
 
-Checks that each library exports exactly the `stable-diffusion.h` API (so no
-ggml symbol leaks) and links only against allowlisted system libraries.
+Checks that each library exports exactly the `SD_API` symbols of the shipped
+headers (so no ggml symbol leaks) and links only against allowlisted system
+libraries.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from build import ANDROID_PAGE_SIZE, BIN_ROOT, HEADER, TARGETS, Target, llvm_tool
+from build import ANDROID_PAGE_SIZE, BIN_ROOT, HEADERS, TARGETS, Target, llvm_tool
 from sd_api import api_symbols
 
 APPLE_SYSTEM_DEPENDENCIES = (
@@ -72,7 +73,8 @@ def validate(target: Target) -> list[str]:
     root = BIN_ROOT / target.name
     library = root / "lib" / target.library
     problems: list[str] = []
-    for path in (library, root / "include" / HEADER.name, root / "build-info.json"):
+    headers = [root / "include" / header.name for header in HEADERS]
+    for path in (library, *headers, root / "build-info.json"):
         if not path.is_file():
             problems.append(f"missing {path.relative_to(BIN_ROOT)}")
     if problems:
@@ -85,7 +87,7 @@ def validate(target: Target) -> list[str]:
     if target.os == "windows":
         return problems
 
-    expected = set(api_symbols(HEADER))
+    expected = set(api_symbols(*HEADERS))
     exported = exported_symbols(target, library)
     missing = sorted(expected - exported)
     leaked = sorted(exported - expected)

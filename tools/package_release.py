@@ -2,7 +2,7 @@
 """Packages `bin/<target>/` payloads into release archives.
 
 Writes `dist/stable-diffusion-native-runtime-<target>-<tag>.tar.gz` (stripped
-runtime, header, licenses, build info), a matching `-symbols` archive with the
+runtime, headers, licenses, build info), a matching `-symbols` archive with the
 unstripped library for crash symbolication, `manifest.json` and `SHA256SUMS`.
 `--apple-xcframework` also writes the SwiftPM XCFramework zip; its `sha256` is
 the `binaryTarget` checksum.
@@ -20,7 +20,7 @@ import tarfile
 from pathlib import Path
 
 import apple_xcframework
-from build import BIN_ROOT, REPO_ROOT, TARGETS, UPSTREAM_DIR, upstream_commit
+from build import BIN_ROOT, HEADERS, REPO_ROOT, TARGETS, UPSTREAM_DIR, upstream_commit
 
 PACKAGE = "stable-diffusion-native"
 TAG_PATTERN = re.compile(r"^v\d+\.\d+\.\d+(-[1-9]\d*)?$")
@@ -76,7 +76,8 @@ def main() -> None:
         entries = {
             f"lib/{p.name}": p for p in sorted((root / "lib").iterdir())
         }
-        entries["include/stable-diffusion.h"] = root / "include" / "stable-diffusion.h"
+        for header in HEADERS:
+            entries[f"include/{header.name}"] = root / "include" / header.name
         entries["build-info.json"] = root / "build-info.json"
         entries.update(LICENSES)
         write_archive(runtime, entries)

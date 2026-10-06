@@ -100,11 +100,11 @@ class PackagerTests(unittest.TestCase):
             work = Path(directory)
             source = work / "libstable-diffusion.dylib"
             source.write_bytes(b"binary")
-            header = work / packager.HEADER.name
+            header = work / packager.HEADERS[0].name
             header.write_bytes(b"")
             xcframework = work / XCFRAMEWORK
             with patch.object(packager, "run"), patch.object(
-                packager, "HEADER", header
+                packager, "HEADERS", (header,)
             ), patch.object(packager, "slice_min_version", return_value="1.0"):
                 frameworks = {
                     slice_: packager.make_framework(slice_, source, xcframework, "0.0.0")
@@ -312,7 +312,7 @@ class MachOImportAuditTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "darwin", "validate_zip unpacks with ditto")
 class XcframeworkValidationTests(unittest.TestCase):
     def test_validate_reports_slices_without_a_manifest(self) -> None:
-        header = f"{XCFRAMEWORK}/{IOS}/{FRAMEWORK}/Headers/{packager.HEADER.name}"
+        header = f"{XCFRAMEWORK}/{IOS}/{FRAMEWORK}/Headers/{packager.HEADERS[0].name}"
         with tempfile.TemporaryDirectory() as directory:
             archive = write_archive(
                 directory, {IOS_MANIFEST: None, MACOS_MANIFEST: None, header: b""}

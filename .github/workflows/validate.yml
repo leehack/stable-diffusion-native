@@ -19,6 +19,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The wrapper tests compile against upstream's header.
+          submodules: true
       - run: python3 -m unittest discover -s tests -v
 
   build:

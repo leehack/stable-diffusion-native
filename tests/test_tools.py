@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import apple_xcframework  # noqa: E402
-from build import TARGETS  # noqa: E402
+from build import HEADERS, TARGETS, WRAPPER_HEADER  # noqa: E402
 from package_release import TAG_PATTERN  # noqa: E402
 from sd_api import api_symbols  # noqa: E402
 
@@ -36,6 +36,23 @@ class ApiSymbolsTest(unittest.TestCase):
                 ["generate_image", "new_sd_ctx", "sample_method_to_str"],
             )
 
+    def test_merges_the_symbols_of_several_headers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream = Path(tmp) / "stable-diffusion.h"
+            upstream.write_text(HEADER)
+            wrapper = Path(tmp) / "wrapper.h"
+            wrapper.write_text("SD_API void sd_dart_added(void* token);\n")
+            self.assertEqual(
+                api_symbols(upstream, wrapper),
+                ["generate_image", "new_sd_ctx", "sample_method_to_str", "sd_dart_added"],
+            )
+
+    def test_wrapper_header_adds_only_the_progress_routing_exports(self):
+        self.assertEqual(
+            api_symbols(WRAPPER_HEADER),
+            ["sd_dart_clear_progress_callback", "sd_dart_set_progress_callback"],
+        )
+
 
 class ReleaseTagTest(unittest.TestCase):
     def test_accepts_semver_and_positive_rebuild_counters(self):
@@ -59,6 +76,11 @@ class AppleXcframeworkTest(unittest.TestCase):
         packaged = [t for s in apple_xcframework.SLICES for t in s.targets]
         apple = [t.name for t in TARGETS.values() if t.os in ("ios", "macos")]
         self.assertCountEqual(packaged, apple)
+
+    def test_module_map_exposes_every_shipped_header(self):
+        module_map = apple_xcframework.module_map()
+        for header in HEADERS:
+            self.assertIn(f'header "{header.name}"', module_map)
 
     def test_bundle_version_drops_the_rebuild_counter(self):
         self.assertEqual(apple_xcframework.bundle_version("v0.2.0"), "0.2.0")
