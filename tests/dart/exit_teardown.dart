@@ -1,6 +1,7 @@
 // Exit teardown under a real Dart VM.
 //
 // Usage: dart exit_teardown.dart <runtime> <probe> <model> <scenario> <api>
+//            <backend>|default
 //
 // Each scenario leaves the process with a context that no Dart code frees,
 // the way a Flutter quit or hot restart does:
@@ -25,6 +26,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 typedef LoadNative = Pointer<Void> Function(Pointer<Void>);
+typedef ParamsNative = Pointer<Void> Function(Pointer<Void>, Pointer<Void>);
 typedef GenerateNative = Bool Function(
   Pointer<Void>,
   Pointer<Void>,
@@ -55,12 +57,9 @@ final class Runtime {
     this.countOut,
   );
 
-  factory Runtime(
-    String runtimePath,
-    String probePath,
-    String model,
-    bool tracked,
-  ) {
+  factory Runtime(List<String> arguments) {
+    final [runtimePath, probePath, model, _, api, backend] = arguments;
+    final tracked = api == 'tracked';
     final runtime = DynamicLibrary.open(runtimePath);
     final probe = DynamicLibrary.open(probePath);
     final malloc = DynamicLibrary.process()
@@ -68,11 +67,15 @@ final class Runtime {
           Pointer<Void> Function(IntPtr),
           Pointer<Void> Function(int)
         >('malloc');
-    final path = malloc(model.length + 1).cast<Uint8>();
-    for (var i = 0; i < model.length; i++) {
-      path[i] = model.codeUnitAt(i);
+    Pointer<Void> native(String text) {
+      final bytes = malloc(text.length + 1).cast<Uint8>();
+      for (var i = 0; i < text.length; i++) {
+        bytes[i] = text.codeUnitAt(i);
+      }
+      bytes[text.length] = 0;
+      return bytes.cast();
     }
-    path[model.length] = 0;
+
     probe.lookupFunction<Void Function(), void Function()>('probe_quiet')();
     return Runtime._(
       runtime.lookupFunction<LoadNative, Pointer<Void> Function(Pointer<Void>)>(
@@ -81,9 +84,10 @@ final class Runtime {
       runtime.lookupFunction<GenerateNative, GenerateDart>(
         tracked ? 'sd_dart_generate_image' : 'generate_image',
       ),
-      probe.lookupFunction<LoadNative, Pointer<Void> Function(Pointer<Void>)>(
-        'probe_context_params',
-      )(path.cast()),
+      probe.lookupFunction<ParamsNative, ParamsNative>('probe_context_params')(
+        native(model),
+        native(backend),
+      ),
       probe.lookupFunction<
         Pointer<Void> Function(Int),
         Pointer<Void> Function(int)
@@ -107,8 +111,9 @@ final class Runtime {
 }
 
 void worker((SendPort, List<String>) arguments) {
-  final (events, [runtimePath, probePath, model, scenario, api]) = arguments;
-  final runtime = Runtime(runtimePath, probePath, model, api == 'tracked');
+  final (events, runtimeArguments) = arguments;
+  final scenario = runtimeArguments[3];
+  final runtime = Runtime(runtimeArguments);
   events.send('loading');
   final context = runtime.loadContext();
   events.send('loaded');
@@ -124,9 +129,9 @@ void worker((SendPort, List<String>) arguments) {
 }
 
 Future<void> main(List<String> arguments) async {
-  final [runtimePath, probePath, model, scenario, api] = arguments;
+  final scenario = arguments[3];
   if (scenario == 'idle') {
-    final runtime = Runtime(runtimePath, probePath, model, api == 'tracked');
+    final runtime = Runtime(arguments);
     runtime.generateOn(runtime.loadContext());
     return;
   }

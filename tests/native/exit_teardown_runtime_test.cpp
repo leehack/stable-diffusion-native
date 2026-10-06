@@ -13,6 +13,11 @@
 // per process, and most of them leave by returning from main: on Apple
 // platforms teardown then runs during exit(). Elsewhere it does not, and only
 // `idle-untracked` applies: a context that is alive at exit must not abort.
+//
+// `generate` only loads, generates and frees, to tell whether the backend can
+// compute on this machine at all. Where it cannot, SD_EXIT_TEARDOWN_LOAD_ONLY
+// makes the scenarios that can do without a generation on that backend skip
+// it: a loaded context already holds the backend's buffers.
 
 #include "sd_dart_wrapper.h"
 
@@ -107,6 +112,7 @@ void collect_progress(int step, int, float, void*) {
 }
 
 int image_size = 64;
+bool load_only = false;
 
 // The model `make-model` writes holds its TAESD decoder itself.
 bool holds_taesd(const char* model) {
@@ -357,15 +363,22 @@ int test_idle(const char* model, const char* backend, bool tracked) {
         expect_teardown_at_exit(1);
     }
     sd_ctx_t* context = load(model, backend, tracked);
-    CHECK(generate(context, 2, tracked) == 1);
+    CHECK(load_only || generate(context, 2, tracked) == 1);
     CHECK(sd_dart_exit_tracked_count() == (tracked ? 2 : 0));
     if (tracked) {
         witness.engine.store(engine_of(context));
         expect_contexts_freed_first();
     }
     // Tells the caller that whatever follows happened during exit().
-    std::printf("generated on %s\n", backend);
+    std::printf("%s on %s\n", load_only ? "loaded" : "generated", backend);
     std::fflush(stdout);
+    return 0;
+}
+
+int test_generate(const char* model, const char* backend) {
+    sd_ctx_t* context = load(model, backend, false);
+    CHECK(generate(context, 1, false) == 1);
+    free_sd_ctx(context);
     return 0;
 }
 
@@ -373,7 +386,7 @@ int test_dispose(const char* model, const char* backend) {
     for (int i = 0; i < 3; ++i) {
         sd_ctx_t* context  = load(model, backend);
         const void* engine = engine_of(context);
-        if (i != 1) {
+        if (i != 1 && !load_only) {
             CHECK(generate(context, 1) == 1);
         }
         CHECK(sd_ctx_supports_image_generation(context));
@@ -491,7 +504,7 @@ int test_late_load(const char* model, const char* backend) {
     sd_ctx_t* first = load(model, "cpu");
     CHECK(generate(first, 1) == 1);
     sd_ctx_t* second = load(model, backend);
-    CHECK(generate(second, 1) == 1);
+    CHECK(load_only || generate(second, 1) == 1);
     // The first context is freed last, so nothing reuses its block before the
     // witness looks at it.
     witness.engine.store(engine_of(first));
@@ -515,6 +528,10 @@ int main(int argc, char** argv) {
         const char* model   = argv[2];
         const char* backend = argv[3];
         image_size          = argc == 5 ? std::atoi(argv[4]) : image_size;
+        load_only           = std::getenv("SD_EXIT_TEARDOWN_LOAD_ONLY") != nullptr;
+        if (scenario == "generate") {
+            return test_generate(model, backend);
+        }
         if (scenario == "idle") {
             return test_idle(model, backend, true);
         }

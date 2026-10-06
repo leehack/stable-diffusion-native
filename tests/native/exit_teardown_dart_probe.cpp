@@ -5,6 +5,7 @@
 #include "sd_dart_wrapper.h"
 
 #include <cstdlib>
+#include <cstring>
 
 #define PROBE_API extern "C" __attribute__((visibility("default")))
 
@@ -23,12 +24,14 @@ PROBE_API void probe_quiet(void) {
 }
 
 // Parameters for a model that holds its TAESD decoder itself, as the one
-// exit_teardown_runtime_test writes does. Never freed.
-PROBE_API sd_ctx_params_t* probe_context_params(const char* model) {
+// exit_teardown_runtime_test writes does. `default` lets the runtime pick its
+// device. Never freed.
+PROBE_API sd_ctx_params_t* probe_context_params(const char* model, const char* backend) {
     auto* params = static_cast<sd_ctx_params_t*>(malloc(sizeof(sd_ctx_params_t)));
     sd_ctx_params_init(params);
     params->model_path = model;
     params->taesd_path = model;
+    params->backend    = std::strcmp(backend, "default") == 0 ? nullptr : backend;
     params->eager_load = true;
     return params;
 }

@@ -247,7 +247,9 @@ and a real `sd_ctx_t`, on Metal and on the CPU: the test writes a 12 MB
 PixArt model itself, so CI needs no download. Where no Metal residency set is
 live, as on GitHub's macOS runners, an untracked context exits cleanly and the
 Metal abort is not exercised; there the test shows each free through the
-allocator instead.
+allocator instead. Those runners also crash in ggml-metal when their virtual
+GPU computes, so on Metal the test only loads models there and runs the
+scenarios that need a generation on the CPU.
 
 ## Build
 

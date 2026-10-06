@@ -55,6 +55,8 @@ RUNS = int(os.environ.get("SD_EXIT_TEARDOWN_RUNS", "1"))
 REAL_MODEL = os.environ.get("SD_EXIT_TEARDOWN_MODEL", "")
 REAL_MODEL_SIZE = os.environ.get("SD_EXIT_TEARDOWN_MODEL_SIZE", "256")
 SCENARIOS = ("idle", "dispose", "cancel", "generate-wait", "load-wait", "late-load")
+# What the others do on a device that cannot compute is load, and free.
+GENERATING_SCENARIOS = ("cancel", "generate-wait")
 # `default` lets the runtime pick its device, which is Metal where there is one.
 BACKENDS = ("default", "cpu")
 METAL_ABORT = "[rsets->data count] == 0"
@@ -145,6 +147,21 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
         cls.compile(SOURCE, cls.binary)
         subprocess.run([str(cls.binary), "make-model", str(cls.model)], check=True, timeout=600,
                        env={**os.environ, **SCENARIO_ENV})
+        # GitHub's macOS runners load a model on their virtual GPU but crash in
+        # ggml-metal as soon as it computes, whoever created the context.
+        cls.load_only = {
+            backend for backend in BACKENDS
+            if subprocess.run([str(cls.binary), "generate", str(cls.model), backend],
+                              capture_output=True, timeout=600,
+                              env={**os.environ, **SCENARIO_ENV}).returncode != 0}
+        if "cpu" in cls.load_only:
+            raise AssertionError("the runtime cannot generate an image on the CPU")
+        if cls.load_only:
+            message = ("the default device cannot run a generation on this machine: "
+                       "there the scenarios only load a model, and those that need a "
+                       "generation run on the CPU alone")
+            print(f"::warning title=exit teardown::{message}" if os.environ.get("GITHUB_ACTIONS")
+                  else f"note: {message}", flush=True)
 
     @classmethod
     def compile(cls, source: Path, output: Path, *flags: str) -> None:
@@ -154,12 +171,16 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
     def run_scenario(self, scenario: str, backend: str, model: Path | str | None = None,
                      size: str | None = None) -> subprocess.CompletedProcess:
         command = [str(self.binary), scenario, str(model or self.model), backend]
+        load_only = {"SD_EXIT_TEARDOWN_LOAD_ONLY": "1"} if backend in self.load_only else {}
         return subprocess.run(command + ([size] if size else []), capture_output=True, text=True,
-                              timeout=600, errors="replace", env={**os.environ, **SCENARIO_ENV})
+                              timeout=600, errors="replace",
+                              env={**os.environ, **SCENARIO_ENV, **load_only})
 
     def check_scenarios(self, model: Path | str | None = None, size: str | None = None) -> None:
         for scenario in SCENARIOS:
             for backend in BACKENDS:
+                if scenario in GENERATING_SCENARIOS and backend in self.load_only:
+                    continue
                 for run in range(RUNS):
                     with self.subTest(scenario=scenario, backend=backend, run=run):
                         result = self.run_scenario(scenario, backend, model, size)
@@ -202,10 +223,13 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
         probe = Path(self.directory.name) / "libexit_teardown_dart_probe.dylib"
         self.compile(DART_PROBE, probe, "-shared", "-fPIC")
 
+        backend = "cpu" if self.load_only else "default"
+
         def run(scenario: str, api: str) -> subprocess.CompletedProcess:
             return subprocess.run(
                 [DART, str(DART_HARNESS), str(self.library), str(probe), str(self.model),
-                 scenario, api], capture_output=True, text=True, timeout=600, errors="replace")
+                 scenario, api, backend],
+                capture_output=True, text=True, timeout=600, errors="replace")
 
         for scenario in DART_SCENARIOS:
             for attempt in range(RUNS):
@@ -216,7 +240,7 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
         # Metal residency sets are live, and nowhere else.
         aborted = [scenario for scenario in DART_SCENARIOS
                    if METAL_ABORT in run(scenario, "raw").stderr]
-        print(f"note: with new_sd_ctx and generate_image, {len(aborted)} of "
+        print(f"note: with new_sd_ctx and generate_image on {backend}, {len(aborted)} of "
               f"{len(DART_SCENARIOS)} Dart scenarios aborted in ggml-metal", flush=True)
 
     @unittest.skipUnless(LLAMADART, "set SD_EXIT_TEARDOWN_LLAMADART to a libllamadart.dylib")
