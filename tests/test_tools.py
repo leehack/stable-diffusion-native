@@ -47,10 +47,10 @@ class ApiSymbolsTest(unittest.TestCase):
                 ["generate_image", "new_sd_ctx", "sample_method_to_str", "sd_dart_added"],
             )
 
-    def test_wrapper_header_adds_only_the_progress_routing_exports(self):
+    def test_wrapper_header_adds_only_the_progress_exports(self):
         self.assertEqual(
             api_symbols(WRAPPER_HEADER),
-            ["sd_dart_clear_progress_callback", "sd_dart_set_progress_callback"],
+            ["sd_dart_progress_enable", "sd_dart_progress_read"],
         )
 
 

@@ -1,4 +1,4 @@
-"""Builds and runs `tests/native/progress_callback_test.cpp`.
+"""Builds and runs `tests/native/progress_test.cpp`.
 
 The test links `src/sd_dart_wrapper.cpp` against a stand-in for upstream, so it
 needs the submodule's header but no built runtime.
@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [
     REPO_ROOT / "src" / "sd_dart_wrapper.cpp",
-    REPO_ROOT / "tests" / "native" / "progress_callback_test.cpp",
+    REPO_ROOT / "tests" / "native" / "progress_test.cpp",
 ]
 INCLUDE_DIRS = [
     REPO_ROOT / "src",
@@ -32,7 +32,7 @@ def compile_command(output: Path, sources: list[Path], *flags: str) -> list[str]
 
 
 @unittest.skipIf(sys.platform == "win32", "uses a GCC or Clang command line")
-class ProgressCallbackTest(unittest.TestCase):
+class ProgressTest(unittest.TestCase):
     def require(self, condition: bool, reason: str) -> None:
         """Skips locally, but fails in CI, where a skip would hide the test."""
         if condition:
@@ -48,12 +48,14 @@ class ProgressCallbackTest(unittest.TestCase):
 
     def build_and_run(self, *flags: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            binary = Path(directory) / "progress_callback_test"
+            binary = Path(directory) / "progress_test"
             subprocess.run(compile_command(binary, SOURCES, *flags), check=True)
-            result = subprocess.run(
-                [str(binary)], capture_output=True, text=True, timeout=600,
-                env={**os.environ, "TSAN_OPTIONS": "halt_on_error=1"})
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            # `exit` leaves threads reporting and reading while exit() runs.
+            for arguments in ([], *[["exit"]] * 5):
+                result = subprocess.run(
+                    [str(binary), *arguments], capture_output=True, text=True, timeout=600,
+                    env={**os.environ, "TSAN_OPTIONS": "halt_on_error=1"})
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def supports(self, flag: str) -> bool:
         with tempfile.TemporaryDirectory() as directory:
@@ -65,10 +67,10 @@ class ProgressCallbackTest(unittest.TestCase):
             return built.returncode == 0 and subprocess.run(
                 [str(binary)], capture_output=True).returncode == 0
 
-    def test_routes_and_clears_progress(self) -> None:
+    def test_records_and_reads_progress(self) -> None:
         self.build_and_run()
 
-    def test_clearing_during_progress_is_free_of_data_races(self) -> None:
+    def test_reading_during_reports_is_free_of_data_races(self) -> None:
         self.require(self.supports(THREAD_SANITIZER),
                      f"{COMPILER} cannot build or run {THREAD_SANITIZER} binaries")
         self.build_and_run(THREAD_SANITIZER)

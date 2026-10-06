@@ -13,6 +13,10 @@ Guidance for coding agents working in `stable-diffusion-native`.
   `CMakeLists.txt` compiles into the same library. A wrapper export is an
   `sd_dart_*` function declared with `SD_API` in `src/sd_dart_wrapper.h`, with
   a test under `tests/` and a README entry.
+- A wrapper export never takes a callback that stable-diffusion.cpp's threads
+  would call, and never waits for such a thread: a Dart callback there aborts
+  or deadlocks VM shutdown. Record state natively and let the caller poll.
+  Wrapper state has no destructor; threads still use it while `exit()` runs.
 
 ## Commands
 
@@ -23,6 +27,9 @@ python3 tools/build.py build --target <target>
 python3 tools/validate_artifacts.py <target>
 ```
 
+- `tests/test_progress_stress.py` needs a Dart SDK on `PATH` and skips without
+  one; CI runs it with 25 runs per configuration. Run it after any change to
+  `src/`.
 - Every shipped library must pass `validate_artifacts.py`: it exports exactly
   the `SD_API` symbols in `stable-diffusion.h` and `src/sd_dart_wrapper.h`, and
   links only allowlisted system libraries. Never export an upstream-internal

@@ -8,7 +8,6 @@ func symbol(_ name: String) -> UnsafeMutableRawPointer? { dlsym(process, name) }
 
 typealias VersionFn = @convention(c) () -> UnsafePointer<CChar>
 typealias ListDevicesFn = @convention(c) (UnsafeMutablePointer<CChar>?, Int) -> Int
-typealias ClearProgressFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
 
 guard let versionSymbol = symbol("sd_version"), let listSymbol = symbol("sd_list_devices") else {
     print("error: SD_API symbols are not visible process-wide")
@@ -28,12 +27,14 @@ if !devices.contains("CPU") {
     print("error: no CPU device")
     exit(1)
 }
-guard symbol("sd_dart_set_progress_callback") != nil,
-      let clearSymbol = symbol("sd_dart_clear_progress_callback") else {
+guard symbol("sd_dart_progress_enable") != nil, symbol("sd_dart_progress_read") != nil else {
     print("error: sd_dart_wrapper.h symbols are not visible process-wide")
     exit(1)
 }
-unsafeBitCast(clearSymbol, to: ClearProgressFn.self)(nil)
+guard Companion.progressSequence() == 0 else {
+    print("error: progress was recorded before it was enabled")
+    exit(1)
+}
 if symbol("ggml_init") != nil {
     print("error: ggml symbols leak into the process")
     exit(1)

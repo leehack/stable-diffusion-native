@@ -58,37 +58,56 @@ on Mali-G68, and OpenCL on Adreno 750 was slower than the CPU.
 upstream's. It is compiled into the same library and ships next to
 `stable-diffusion.h` in every archive and XCFramework slice.
 
+```c
+typedef struct {
+    uint64_t sequence;  // reports recorded since sd_dart_progress_enable(); 0 = none
+    int32_t step;       // the arguments of upstream's progress callback
+    int32_t steps;
+    float time;
+} sd_dart_progress_t;
+
+void sd_dart_progress_enable(void);
+void sd_dart_progress_read(sd_dart_progress_t* progress);
+```
+
 | Function | Behavior |
 | --- | --- |
-| `void sd_dart_set_progress_callback(sd_progress_cb_t callback, void* data)` | Routes progress to `callback`, replacing the current one. `NULL` discards progress. Either way the library stops printing progress bars to stdout. |
-| `void sd_dart_clear_progress_callback(void* callback)` | Discards progress from now on if `callback` is the current callback; any other value leaves the current one in place. `NULL` discards whatever is set. |
+| `sd_dart_progress_enable` | Records progress in the library instead of printing progress bars to stdout, for every later call in the process, model loads included. Idempotent. |
+| `sd_dart_progress_read` | Copies the latest report into `progress`. Callable from any thread at any time, also before `sd_dart_progress_enable`. |
 
-Upstream's `sd_set_progress_callback` stores the callback in an unsynchronized
-global that the loading or generating thread reads on every step, so a caller
-cannot know when a replaced callback has stopped running. A Dart
-`NativeCallable` invoked after its VM has shut down aborts the process. The
-wrapper registers one forwarder with upstream and swaps the real callback
-behind a lock that is held while the callback runs:
+Upstream's `sd_set_progress_callback` calls back on the thread that is loading
+or generating, for as long as that call runs. A callback into a managed
+runtime cannot be made safe there. A Dart `NativeCallable` is called after
+its isolate or the VM has shut down, which aborts the process, and a wrapper
+that waits for a call in flight before dropping the callback can deadlock VM
+shutdown. So the library takes no callback: it records progress itself, and
+the caller polls.
 
-- Both functions are safe from any thread at any time, including while another
-  thread is inside `new_sd_ctx` or `generate_image`.
-- When either returns, the callback it replaced is not running on another
-  thread and is never called again. Called from inside the callback itself,
-  they return at once and that one call finishes normally. Because they wait
-  for a call in flight, the callback must not wait for a thread that is
-  calling either function.
-- `sd_dart_clear_progress_callback` takes one pointer, so it can be a Dart
-  `NativeFinalizer` callback with the callback's address as its token: the
-  isolate that owns the callback then clears it when it shuts down.
-- `sd_dart_set_progress_callback(NULL, NULL)` silences progress output without
-  a callback, for example during a model load.
+- `sd_dart_progress_read` takes no lock, makes no system call and never waits
+  for the reporting thread; the reporting thread never waits for a reader. It
+  returns one whole report, never a mix of two. It is safe as a Dart leaf
+  call.
+- Nothing has to be undone when the caller goes away, and the state is never
+  destroyed, so reporting and reading stay valid while `exit()` runs.
+- Reports are process-wide, as upstream's callback is. Two contexts working at
+  once share one sequence, and a report does not say which context made it.
+- To follow one run, read `sequence` before starting it and poll for larger
+  values. Only the latest report is kept, so a poller slower than the steps
+  skips some; read once more after the call returns to get the last one.
+- The first `sd_dart_progress_enable` call registers a recorder with
+  `sd_set_progress_callback`, which is not synchronized: make it before
+  another thread starts a load or generation. Later calls do nothing.
+- Do not call `sd_set_progress_callback` afterwards. It replaces the recorder,
+  `sequence` stops advancing, and `sd_dart_progress_enable` does not register
+  it again. A caller that wants a C callback uses upstream's function instead
+  of this API.
 
-Use these instead of `sd_set_progress_callback`, not together with it: the
-first `sd_dart_set_progress_callback` call registers the forwarder there, and
-a later `sd_set_progress_callback` call replaces it. Make that first call
-before starting a load or generation on another thread. A callback is called
-again if it is set again after being cleared, so set it from the isolate that
-owns it.
+A process whose caller died still waits for a native call that is in flight:
+the Dart VM, for one, exits only after the isolate inside `new_sd_ctx` or
+`generate_image` returns. Recording progress does not shorten that.
+
+`tests/test_progress_stress.py` runs this against a Dart VM that dies while a
+native call is reporting progress; see its docstring.
 
 ## Build
 
