@@ -45,6 +45,41 @@ jobs:
           SD_REQUIRE_DART: "1"
           SD_PROGRESS_STRESS_RUNS: "25"
 
+  exit-teardown:
+    name: exit teardown (${{ matrix.runtime }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The runtime as shipped, and one in which a use after free aborts.
+          - { runtime: release, sanitizer: "" }
+          - { runtime: address sanitizer, sanitizer: address }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          target: macos-arm64
+      - uses: dart-lang/setup-dart@v1
+        if: ${{ !matrix.sanitizer }}
+        with:
+          sdk: 3.13.5
+      - name: Build
+        if: ${{ !matrix.sanitizer }}
+        run: python3 tools/build.py build --target macos-arm64
+      - name: Free tracked contexts at exit
+        # With a sanitizer the test builds its own runtime, which the Dart VM
+        # cannot load. The model is written by the test; nothing is
+        # downloaded.
+        run: python3 -m unittest discover -s tests -p test_exit_teardown_runtime.py -v
+        env:
+          SD_REQUIRE_RUNTIME: "1"
+          SD_REQUIRE_DART: ${{ !matrix.sanitizer && '1' || '' }}
+          SD_EXIT_TEARDOWN_SANITIZER: ${{ matrix.sanitizer }}
+          SD_EXIT_TEARDOWN_RUNS: "3"
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runs_on }}
@@ -86,6 +121,14 @@ jobs:
         run: python tools/smoke_test.py ${{ matrix.target }} ${{ matrix.smoke }}
         env:
           # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
+          GGML_VK_VISIBLE_DEVICES: "0"
+      - name: Exit with a live context
+        # Exit teardown runs at exit on Apple platforms only; see the
+        # exit-teardown job. Here a context must be harmless to leave behind.
+        if: runner.os == 'Linux' && matrix.smoke
+        run: python3 -m unittest discover -s tests -p test_exit_teardown_runtime.py -v
+        env:
+          SD_EXIT_TEARDOWN_TARGET: ${{ matrix.target }}
           GGML_VK_VISIBLE_DEVICES: "0"
       - uses: actions/upload-artifact@v4
         if: runner.os == 'macOS'

@@ -20,5 +20,6 @@ add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.
 target_sources(stable-diffusion PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_exit.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.h")
