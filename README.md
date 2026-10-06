@@ -89,7 +89,12 @@ Outputs:
 Each framework exports only the `SD_API` symbols and has a `stable_diffusion`
 module map. Its Info.plist minimum OS (`MinimumOSVersion` on iOS,
 `LSMinimumSystemVersion` on macOS) is read from the binary's
-`LC_BUILD_VERSION`, so App Store validation sees matching values. The
+`LC_BUILD_VERSION`, so App Store validation sees matching values. Each
+framework embeds a `PrivacyInfo.xcprivacy` that declares its required-reason
+API use; `validate` fails when a slice lacks it or when its categories differ
+from the APIs the binary imports (see
+[`docs/apple_privacy_manifest.md`](docs/apple_privacy_manifest.md)). The
+per-target Apple runtime archives are bare dylibs and carry none. The
 frameworks are unsigned; Xcode signs them when it embeds them. The zip is
 reproducible from the same slices, and its `sha256` in `manifest.json` is the
 SwiftPM checksum (`swift package compute-checksum`).
