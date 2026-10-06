@@ -8,7 +8,9 @@ if(NOT EXISTS "${SD_NATIVE_UPSTREAM_DIR}/CMakeLists.txt")
         "Run: git submodule update --init --recursive")
 endif()
 
-add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}")
+# A short binary directory: mirroring the source path pushes the nested
+# Vulkan shader generator build past the 260-character Windows path limit.
+add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.
