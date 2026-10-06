@@ -27,6 +27,10 @@ python3 tools/validate_artifacts.py <target>
   `consumer`. Its Info.plist minimum OS is read from each binary's
   `LC_BUILD_VERSION`; never hard-code it, since a mismatch fails App Store
   upload.
+- Each XCFramework slice embeds `tools/apple/PrivacyInfo.xcprivacy`. When the
+  import audit fails after an upstream bump, find the new call sites and update
+  the manifest and `docs/apple_privacy_manifest.md` together; never add a
+  category only to make it pass.
 - A new target or backend needs device evidence before release, recorded in
   the PR.
 

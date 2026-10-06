@@ -3,7 +3,8 @@
 
 `build` wraps the `bin/` Apple slices (see `SLICES`) into
 `stable_diffusion.xcframework` and writes a zip whose SHA-256 is the SwiftPM
-`binaryTarget` checksum. `validate` checks a zip as a consumer would see it;
+`binaryTarget` checksum. `validate` checks a zip as a consumer would see it,
+including each slice's privacy manifest (see `apple_privacy_manifest.py`);
 `consumer` links it into `tests/swiftpm_consumer`, runs the macOS probe and
 builds the iOS device and simulator slices.
 
@@ -26,6 +27,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import apple_privacy_manifest
 from build import (
     APPLE_IOS_MIN,
     APPLE_MACOS_MIN,
@@ -42,6 +44,7 @@ FRAMEWORK = "stable_diffusion"
 XCFRAMEWORK = f"{FRAMEWORK}.xcframework"
 BUNDLE_IDENTIFIER = "dev.leehack.stable-diffusion-native"
 ARCHIVE_PREFIX = "stable-diffusion-native-apple-xcframework"
+PRIVACY_MANIFEST = REPO_ROOT / "tools" / "apple" / apple_privacy_manifest.MANIFEST_NAME
 # Fixed so that rebuilding the same slices yields the same SwiftPM checksum.
 ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 SYSTEM_DEPENDENCY = re.compile(f"^({APPLE_SYSTEM_DEPENDENCIES})$")
@@ -73,6 +76,14 @@ class Slice:
         if self.macos_layout:
             return f"{FRAMEWORK}.framework/Versions/A/Resources/Info.plist"
         return f"{FRAMEWORK}.framework/Info.plist"
+
+    @property
+    def privacy_manifest_path(self) -> str:
+        # Versioned bundles keep resources out of the framework root; a
+        # manifest there is unsealed content that fails code signing.
+        if self.macos_layout:
+            return f"{FRAMEWORK}.framework/Versions/A/Resources/{PRIVACY_MANIFEST.name}"
+        return f"{FRAMEWORK}.framework/{PRIVACY_MANIFEST.name}"
 
 
 SLICES = (
@@ -188,6 +199,7 @@ def make_framework(slice_: Slice, source: Path, root: Path, version: str) -> Pat
     min_version = slice_min_version(slice_, binary)
     with plist.open("wb") as handle:
         plistlib.dump(info_plist(slice_, version, min_version), handle)
+    shutil.copy2(PRIVACY_MANIFEST, root / slice_.identifier / slice_.privacy_manifest_path)
 
     if slice_.macos_layout:
         (framework / "Versions" / "Current").symlink_to("A")
@@ -328,7 +340,7 @@ def validate_zip(archive: Path) -> list[str]:
             if slice_.identifier in libraries:
                 problems += validate_slice(slice_, xcframework / slice_.identifier,
                                            libraries[slice_.identifier], symbols)
-        return problems
+        return problems + apple_privacy_manifest.validate_archive(archive, audit_imports=True)
 
 
 def check_consumer(archive: Path) -> None:

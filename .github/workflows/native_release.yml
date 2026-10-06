@@ -88,6 +88,10 @@ jobs:
           done
       - name: Package
         run: python3 tools/package_release.py --tag "${{ inputs.tag }}" --apple-xcframework
+      - name: Validate the XCFramework privacy manifests
+        run: >-
+          python3 tools/apple_privacy_manifest.py --audit-imports
+          "dist/stable-diffusion-native-apple-xcframework-${{ inputs.tag }}.zip"
       - name: Link the XCFramework into a SwiftPM consumer
         run: >-
           python3 tools/apple_xcframework.py consumer
