@@ -8,8 +8,13 @@ if(NOT EXISTS "${SD_NATIVE_UPSTREAM_DIR}/CMakeLists.txt")
         "Run: git submodule update --init --recursive")
 endif()
 
-# A short binary directory: mirroring the source path pushes the nested
-# Vulkan shader generator build past the 260-character Windows path limit.
+# Windows builds run close to the 260-character path limit. Keep the upstream
+# build directory short, and move ggml's nested Vulkan shader generator build
+# from ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix to ep.
+define_property(DIRECTORY PROPERTY EP_PREFIX INHERITED
+    BRIEF_DOCS "ExternalProject prefix"
+    FULL_DOCS "ExternalProject prefix, inherited by the upstream directories")
+set_property(DIRECTORY PROPERTY EP_PREFIX "${CMAKE_BINARY_DIR}/ep")
 add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 
 # Wrapper exports are compiled into the upstream library target, so they share
