@@ -36,6 +36,9 @@ jobs:
         with:
           submodules: true
       - uses: dart-lang/setup-dart@v1
+        with:
+          # Pinned: the harness expects this VM's aborts in its controls.
+          sdk: 3.13.5
       - name: Report progress while the Dart VM shuts down
         run: python3 -m unittest discover -s tests -p test_progress_stress.py -v
         env:
