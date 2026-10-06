@@ -1,7 +1,7 @@
 // Exit teardown under a real Dart VM.
 //
 // Usage: dart exit_teardown.dart <runtime> <probe> <model> <scenario> <api>
-//            <backend>|default
+//            <backend>|default <image size> <microseconds>
 //
 // Each scenario leaves the process with a context that no Dart code frees,
 // the way a Flutter quit or hot restart does:
@@ -15,11 +15,15 @@
 //   exit-in-run      main calls C exit() while a worker isolate generates,
 //                    as a Flutter quit does. dart:io's exit() would not do:
 //                    it leaves without running static destructors
+//   exit-in-free     main tells a worker isolate to free its context, the
+//                    only one, and calls C exit() the given number of
+//                    microseconds later: a quit that races a dispose
 //
-// With api `tracked` the harness calls sd_dart_new_sd_ctx and
-// sd_dart_generate_image, and the process must exit with code 0. With api
-// `raw` it calls new_sd_ctx and generate_image: the control, which aborts in
-// ggml-metal where Metal residency sets are live.
+// With api `tracked` the harness calls sd_dart_new_sd_ctx,
+// sd_dart_generate_image and sd_dart_exit_free, and the process must exit
+// with code 0. With api `raw` it calls new_sd_ctx, generate_image and
+// free_sd_ctx: the control, which aborts in ggml-metal where Metal residency
+// sets are live.
 import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
@@ -42,6 +46,7 @@ typedef GenerateDart = bool Function(
 
 final class Runtime {
   final Pointer<Void> Function(Pointer<Void>) load;
+  final void Function(Pointer<Void>) free;
   final GenerateDart generate;
   final Pointer<Void> contextParams;
   final Pointer<Void> generationParams;
@@ -50,6 +55,7 @@ final class Runtime {
 
   Runtime._(
     this.load,
+    this.free,
     this.generate,
     this.contextParams,
     this.generationParams,
@@ -58,7 +64,7 @@ final class Runtime {
   );
 
   factory Runtime(List<String> arguments) {
-    final [runtimePath, probePath, model, _, api, backend] = arguments;
+    final [runtimePath, probePath, model, _, api, backend, size, _] = arguments;
     final tracked = api == 'tracked';
     final runtime = DynamicLibrary.open(runtimePath);
     final probe = DynamicLibrary.open(probePath);
@@ -81,6 +87,10 @@ final class Runtime {
       runtime.lookupFunction<LoadNative, Pointer<Void> Function(Pointer<Void>)>(
         tracked ? 'sd_dart_new_sd_ctx' : 'new_sd_ctx',
       ),
+      runtime.lookupFunction<
+        Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)
+      >(tracked ? 'sd_dart_exit_free' : 'free_sd_ctx'),
       runtime.lookupFunction<GenerateNative, GenerateDart>(
         tracked ? 'sd_dart_generate_image' : 'generate_image',
       ),
@@ -89,9 +99,9 @@ final class Runtime {
         native(backend),
       ),
       probe.lookupFunction<
-        Pointer<Void> Function(Int),
-        Pointer<Void> Function(int)
-      >('probe_generation_params')(40),
+        Pointer<Void> Function(Int, Int),
+        Pointer<Void> Function(int, int)
+      >('probe_generation_params')(40, int.parse(size)),
       malloc(sizeOf<Pointer<Void>>()).cast(),
       malloc(sizeOf<Int>()).cast(),
     );
@@ -122,6 +132,11 @@ void worker((SendPort, List<String>) arguments) {
     ReceivePort();
     return;
   }
+  if (scenario == 'exit-in-free') {
+    final commands = ReceivePort()..listen((_) => runtime.free(context));
+    events.send(commands.sendPort);
+    return;
+  }
   for (;;) {
     events.send('generating');
     runtime.generateOn(context);
@@ -142,6 +157,18 @@ Future<void> main(List<String> arguments) async {
     events.sendPort,
     arguments,
   ), onExit: exited.sendPort);
+  final cExit = DynamicLibrary.process()
+      .lookupFunction<Void Function(Int), void Function(int)>('exit');
+  if (scenario == 'exit-in-free') {
+    final commands =
+        await events.firstWhere((event) => event is SendPort) as SendPort;
+    // Past the time teardown gives a thread after its last call in flight.
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    final clock = Stopwatch()..start();
+    commands.send(null);
+    while (clock.elapsedMicroseconds < int.parse(arguments[7])) {}
+    cExit(0);
+  }
   final waitFor = switch (scenario) {
     'leaked' => 'loaded',
     'killed-in-load' => 'loading',
@@ -150,8 +177,7 @@ Future<void> main(List<String> arguments) async {
   await events.firstWhere((event) => event == waitFor);
   if (scenario == 'exit-in-run') {
     await Future<void>.delayed(const Duration(milliseconds: 20));
-    DynamicLibrary.process()
-        .lookupFunction<Void Function(Int), void Function(int)>('exit')(0);
+    cExit(0);
   }
   isolate.kill(priority: Isolate.immediate);
   await exited.first;

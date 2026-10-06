@@ -33,7 +33,9 @@ APPLE_DEPENDENCIES = re.compile(
 # `src/sd_dart_exit.cpp` defines `__cxa_atexit`, so that every static destructor
 # of an Apple library runs exit teardown first. A library that imports the
 # system function registers its destructors past that definition, and exit
-# teardown then runs after the statics it needs are gone.
+# teardown then runs after the statics it needs are gone. This only shows that
+# the definition is there. That it wraps each destructor is what
+# `tests/test_exit_teardown.py` and `tests/test_exit_teardown_runtime.py` show.
 APPLE_STATIC_DESTRUCTOR_IMPORT = "___cxa_atexit"
 ELF_DEPENDENCIES = {
     "android": {"libc.so", "libm.so", "libdl.so", "liblog.so"},

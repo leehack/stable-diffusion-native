@@ -11,6 +11,9 @@ Linux target.
     SD_REQUIRE_RUNTIME=1            fail instead of skipping
     SD_REQUIRE_DART=1               fail when no Dart SDK is on PATH; the
                                     Dart VM harness skips without one
+    SD_REQUIRE_METAL_GENERATION=1   fail when the default device cannot run a
+                                    generation, instead of only loading
+                                    models on it; set it on a Mac
     SD_EXIT_TEARDOWN_SANITIZER=address
                                     build the runtime with AddressSanitizer
                                     under build/ and test that one instead
@@ -44,7 +47,10 @@ TARGET = build.TARGETS["macos-arm64" if platform.machine() == "arm64" else "maco
 SOURCE = REPO_ROOT / "tests" / "native" / "exit_teardown_runtime_test.cpp"
 DART_PROBE = REPO_ROOT / "tests" / "native" / "exit_teardown_dart_probe.cpp"
 DART_HARNESS = REPO_ROOT / "tests" / "dart" / "exit_teardown.dart"
-DART_SCENARIOS = ("idle", "leaked", "killed-in-load", "killed-in-run", "exit-in-run")
+DART_SCENARIOS = ("idle", "leaked", "killed-in-load", "killed-in-run", "exit-in-run",
+                  "exit-in-free")
+# How long after telling a worker to free its context `exit-in-free` exits.
+DART_FREE_DELAYS_US = (0, 2000, 6000)
 COMPILER = os.environ.get("CXX") or shutil.which("c++")
 DART = shutil.which("dart")
 TWO_LIBRARIES = REPO_ROOT / "tests" / "native" / "exit_teardown_two_libraries_test.cpp"
@@ -54,7 +60,7 @@ SANITIZER = os.environ.get("SD_EXIT_TEARDOWN_SANITIZER", "")
 RUNS = int(os.environ.get("SD_EXIT_TEARDOWN_RUNS", "1"))
 REAL_MODEL = os.environ.get("SD_EXIT_TEARDOWN_MODEL", "")
 REAL_MODEL_SIZE = os.environ.get("SD_EXIT_TEARDOWN_MODEL_SIZE", "256")
-SCENARIOS = ("idle", "dispose", "cancel", "generate-wait", "load-wait", "late-load")
+SCENARIOS = ("idle", "dispose", "free-quit", "cancel", "generate-wait", "load-wait", "late-load")
 # What the others do on a device that cannot compute is load, and free.
 GENERATING_SCENARIOS = ("cancel", "generate-wait")
 # `default` lets the runtime pick its device, which is Metal where there is one.
@@ -156,6 +162,8 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
                               env={**os.environ, **SCENARIO_ENV}).returncode != 0}
         if "cpu" in cls.load_only:
             raise AssertionError("the runtime cannot generate an image on the CPU")
+        if cls.load_only and os.environ.get("SD_REQUIRE_METAL_GENERATION"):
+            raise AssertionError("the default device cannot run a generation on this machine")
         if cls.load_only:
             message = ("the default device cannot run a generation on this machine: "
                        "there the scenarios only load a model, and those that need a "
@@ -224,24 +232,29 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
         self.compile(DART_PROBE, probe, "-shared", "-fPIC")
 
         backend = "cpu" if self.load_only else "default"
+        models = [(str(self.model), "64")] + ([(REAL_MODEL, REAL_MODEL_SIZE)] if REAL_MODEL else [])
 
-        def run(scenario: str, api: str) -> subprocess.CompletedProcess:
+        def run(scenario: str, api: str, model: str, size: str,
+                attempt: int = 0) -> subprocess.CompletedProcess:
+            delay = DART_FREE_DELAYS_US[attempt % len(DART_FREE_DELAYS_US)]
             return subprocess.run(
-                [DART, str(DART_HARNESS), str(self.library), str(probe), str(self.model),
-                 scenario, api, backend],
+                [DART, str(DART_HARNESS), str(self.library), str(probe), model, scenario, api,
+                 backend, size, str(delay)],
                 capture_output=True, text=True, timeout=600, errors="replace")
 
-        for scenario in DART_SCENARIOS:
-            for attempt in range(RUNS):
-                with self.subTest(scenario=scenario, run=attempt):
-                    result = run(scenario, "tracked")
-                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        # The control: with upstream's functions the same exits abort where
-        # Metal residency sets are live, and nowhere else.
-        aborted = [scenario for scenario in DART_SCENARIOS
-                   if METAL_ABORT in run(scenario, "raw").stderr]
-        print(f"note: with new_sd_ctx and generate_image on {backend}, {len(aborted)} of "
-              f"{len(DART_SCENARIOS)} Dart scenarios aborted in ggml-metal", flush=True)
+        for model, size in models:
+            for scenario in DART_SCENARIOS:
+                for attempt in range(RUNS):
+                    with self.subTest(model=Path(model).name, scenario=scenario, run=attempt):
+                        result = run(scenario, "tracked", model, size, attempt)
+                        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            # The control: with upstream's functions the same exits abort where
+            # Metal residency sets are live, and nowhere else.
+            aborted = [scenario for scenario in DART_SCENARIOS
+                       if METAL_ABORT in run(scenario, "raw", model, size).stderr]
+            print(f"note: with upstream's functions on {backend}, {len(aborted)} of "
+                  f"{len(DART_SCENARIOS)} Dart scenarios aborted in ggml-metal "
+                  f"({Path(model).name})", flush=True)
 
     @unittest.skipUnless(LLAMADART, "set SD_EXIT_TEARDOWN_LLAMADART to a libllamadart.dylib")
     def test_shares_a_process_with_libllamadart(self) -> None:

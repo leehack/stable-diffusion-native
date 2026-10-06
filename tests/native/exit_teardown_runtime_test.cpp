@@ -496,6 +496,35 @@ int test_load_wait(const char* model, const char* backend) {
     return 0;
 }
 
+std::atomic<bool> freeing{false};
+
+// The process exits while the only tracked context is being freed. Nothing is
+// tracked then, and teardown still waits for the free: the free needs the
+// statics that are destroyed once teardown is over.
+int test_free_quit(const char* model, const char* backend) {
+    CHECK(atexit([] {
+        if (!is_freed(witness.engine.load())) {
+            std::fprintf(stderr, "exit did not wait for the context that was being freed\n");
+            std::_Exit(1);
+        }
+    }) == 0);
+    static sd_ctx_t* context = load(model, backend);
+    CHECK(load_only || generate(context, 1) == 1);
+    witness.engine.store(engine_of(context));
+    std::thread([] {
+        freeing.store(true);
+        sd_dart_exit_free(context);
+        // Reached when the free was over before the exit began.
+        for (;;) {
+            sleep_ms(1000);
+        }
+    }).detach();
+    // Without a sleep: the exit has to begin while the free is running.
+    while (!freeing.load()) {
+    }
+    return 0;
+}
+
 // A context on another device, loaded after the first one was tracked, makes
 // the runtime create statics that did not exist when teardown was registered.
 // They are destroyed after teardown all the same.
@@ -520,7 +549,7 @@ int main(int argc, char** argv) {
     sd_set_progress_callback(collect_progress, nullptr);
     // The scenarios are about what teardown does once the calls in flight
     // have ended. A busy machine must not turn that into the timeout.
-    sd_dart_exit_set_wait_ms(120000);
+    sd_dart_exit_set_wait_ms(120000, 120000);
     if (argc == 3 && scenario == "make-model") {
         return make_model(argv[2]);
     }
@@ -546,6 +575,9 @@ int main(int argc, char** argv) {
         }
         if (scenario == "generate-wait") {
             return test_generate_wait(model, backend);
+        }
+        if (scenario == "free-quit") {
+            return test_free_quit(model, backend);
         }
         if (scenario == "load-wait") {
             return test_load_wait(model, backend);
