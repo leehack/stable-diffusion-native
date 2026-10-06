@@ -27,6 +27,14 @@ if !devices.contains("CPU") {
     print("error: no CPU device")
     exit(1)
 }
+guard symbol("sd_dart_progress_enable") != nil, symbol("sd_dart_progress_read") != nil else {
+    print("error: sd_dart_wrapper.h symbols are not visible process-wide")
+    exit(1)
+}
+guard Companion.progressSequence() == 0 else {
+    print("error: progress was recorded before it was enabled")
+    exit(1)
+}
 if symbol("ggml_init") != nil {
     print("error: ggml symbols leak into the process")
     exit(1)

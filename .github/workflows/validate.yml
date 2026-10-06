@@ -19,7 +19,31 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The wrapper tests compile against upstream's header.
+          submodules: true
       - run: python3 -m unittest discover -s tests -v
+
+  dart-vm:
+    name: dart vm (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dart-lang/setup-dart@v1
+        with:
+          # Pinned: the harness expects this VM's aborts in its controls.
+          sdk: 3.13.5
+      - name: Report progress while the Dart VM shuts down
+        run: python3 -m unittest discover -s tests -p test_progress_stress.py -v
+        env:
+          SD_REQUIRE_DART: "1"
+          SD_PROGRESS_STRESS_RUNS: "25"
 
   build:
     name: build (${{ matrix.target }})
@@ -28,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: macos-arm64, runs_on: macos-latest }
+          - { target: macos-arm64, runs_on: macos-latest, smoke: "--expect-device CPU" }
           - { target: macos-x64, runs_on: macos-latest }
           - { target: ios-arm64, runs_on: macos-latest }
           - { target: ios-arm64-sim, runs_on: macos-latest }

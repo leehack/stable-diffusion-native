@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Builds stable-diffusion.cpp runtime libraries per target.
 
-Each build exports only the public `stable-diffusion.h` API so the bundled
-ggml copy cannot collide with another ggml loaded in the same process.
+Each build exports only the public `stable-diffusion.h` API and this
+repository's `src/sd_dart_wrapper.h` additions, so the bundled ggml copy cannot
+collide with another ggml loaded in the same process.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ from sd_api import api_symbols
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM_DIR = REPO_ROOT / "third_party" / "stable-diffusion.cpp"
 HEADER = UPSTREAM_DIR / "include" / "stable-diffusion.h"
+WRAPPER_HEADER = REPO_ROOT / "src" / "sd_dart_wrapper.h"
+# Shipped with every payload; their `SD_API` declarations are the export list.
+HEADERS = (HEADER, WRAPPER_HEADER)
 BUILD_ROOT = REPO_ROOT / "build"
 BIN_ROOT = REPO_ROOT / "bin"
 
@@ -148,7 +152,7 @@ def llvm_tool(target: Target, name: str) -> str:
 
 
 def export_linker_flags(target: Target, work_dir: Path) -> list[str]:
-    symbols = api_symbols(HEADER)
+    symbols = api_symbols(*HEADERS)
     if target.os in ("macos", "ios"):
         path = work_dir / "exported_symbols.txt"
         path.write_text("".join(f"_{s}\n" for s in symbols))
@@ -211,7 +215,7 @@ def build(target: Target, jobs: int) -> Path:
     work_dir = BUILD_ROOT / target.name
     work_dir.mkdir(parents=True, exist_ok=True)
     cmake_args = configure_args(target, work_dir)
-    run(["cmake", "-S", str(UPSTREAM_DIR), "-B", str(work_dir), *cmake_args])
+    run(["cmake", "-S", str(REPO_ROOT), "-B", str(work_dir), *cmake_args])
     run(["cmake", "--build", str(work_dir), "--config", "Release", "-j", str(jobs)])
 
     out_dir = BIN_ROOT / target.name
@@ -228,7 +232,8 @@ def build(target: Target, jobs: int) -> Path:
         import_lib = next(work_dir.rglob("stable-diffusion.lib"), None)
         if import_lib:
             shutil.copy2(import_lib, out_dir / "lib" / import_lib.name)
-    shutil.copy2(HEADER, out_dir / "include" / HEADER.name)
+    for header in HEADERS:
+        shutil.copy2(header, out_dir / "include" / header.name)
 
     info = {
         "target": target.name,
@@ -240,7 +245,7 @@ def build(target: Target, jobs: int) -> Path:
             "commit": upstream_commit(),
         },
         "cmakeArgs": [a for a in cmake_args if not a.startswith("-DCMAKE_SHARED_LINKER_FLAGS")],
-        "exportedSymbols": api_symbols(HEADER),
+        "exportedSymbols": api_symbols(*HEADERS),
     }
     (out_dir / "build-info.json").write_text(json.dumps(info, indent=2) + "\n")
     print(f"built {target.name}: {out_dir / 'lib' / target.library}")

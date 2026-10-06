@@ -14,9 +14,9 @@ elsewhere.
 - Pin an upstream stable-diffusion.cpp commit as a submodule.
 - Build one shared library per platform with upstream's C API
   (`stable-diffusion.h`) as the FFI boundary.
-- Export only that API. stable-diffusion.cpp embeds its own patched ggml;
-  hiding it lets the library share a process with another ggml, such as
-  llama.cpp's.
+- Export only that API and the [wrapper API](#wrapper-api) this repository
+  adds. stable-diffusion.cpp embeds its own patched ggml; hiding it lets the
+  library share a process with another ggml, such as llama.cpp's.
 - Publish runtime archives, unstripped symbol archives, an Apple SwiftPM
   XCFramework, `manifest.json` and `SHA256SUMS`.
 
@@ -52,6 +52,100 @@ Android GPU backends are not shipped. On tested devices, Vulkan crashed in
 the Adreno 750 driver's shader compiler and on a null `vkGetBufferDeviceAddress`
 on Mali-G68, and OpenCL on Adreno 750 was slower than the CPU.
 
+## Wrapper API
+
+`src/sd_dart_wrapper.h` declares the exports this repository adds to
+upstream's. It is compiled into the same library and ships next to
+`stable-diffusion.h` in every archive and XCFramework slice.
+
+```c
+typedef struct {
+    uint64_t sequence;  // reports are numbered from 1 in the order recorded
+    int32_t step;       // the arguments of upstream's progress callback
+    int32_t steps;
+    float time;
+} sd_dart_progress_t;
+
+void sd_dart_progress_enable(void);
+size_t sd_dart_progress_read(uint64_t after, sd_dart_progress_t* reports,
+                             size_t capacity, uint64_t* latest);
+```
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_progress_enable` | Records progress in the library instead of printing progress bars to stdout, for every later call in the process, model loads included. Idempotent; when it returns the recorder is registered. |
+| `sd_dart_progress_read` | Copies the reports with a sequence greater than `after` into `reports`, oldest first, at most `capacity`, and returns how many. `latest`, if not `NULL`, receives the sequence of the newest report (0 if none); a `capacity` of 0 only asks for that. |
+
+Upstream's `sd_set_progress_callback` calls back on the thread that is loading
+or generating, for as long as that call runs. A callback into a managed
+runtime cannot be made safe there. A Dart `NativeCallable` is called after
+its isolate or the VM has shut down, which aborts the process, and a wrapper
+that waits for a call in flight before dropping the callback can deadlock VM
+shutdown. So the library takes no callback: it records the reports itself,
+and the caller reads them in order whenever it likes.
+
+What is guaranteed:
+
+- **Every report, in order.** The sequences of one call's reports are
+  consecutive, and each report is whole: the three values of one upstream
+  call, never a mix of two.
+- **History.** The library keeps the 4095 most recent reports. A caller that
+  reads before more than that were recorded since its last read misses none.
+  The fastest sources measured on an M4 Max are `convert` (746 reports a
+  second, 47 in 50 ms) and a tiled VAE decode with 64-pixel tiles (195 a
+  second, 10 in 50 ms); sampling a batch of one-step images reports 16 times
+  a second. So a 50 ms poll uses about 1% of the history, and a caller may
+  stall for more than five seconds before a report is lost.
+- **Overflow is visible.** If more than 4095 reports were recorded since
+  `after`, the older ones are gone and the first report returned is not
+  `after + 1`.
+- **Never blocks.** `sd_dart_progress_read` takes no lock, makes no system
+  call, never waits for a reporting thread and copies at most `capacity` + 4
+  reports; a reporting thread never waits for a reader. It is safe as a Dart
+  leaf call. A call may return fewer reports than there are; the caller has
+  them all once the last sequence it holds equals `latest`.
+- **Nothing to undo.** No call is needed when the caller goes away, and the
+  state is never destroyed, so reporting and reading stay valid while
+  `exit()` runs.
+
+What is not:
+
+- **Which call a report belongs to.** Reports are process-wide, as upstream's
+  callback is. Every context's loads and generations go into the one
+  sequence, so two contexts working at once see each other's reports, load
+  reports included, and each takes up part of the other's history.
+- **A registration that survives `sd_set_progress_callback`.** The first
+  `sd_dart_progress_enable` call registers the recorder there. That function
+  is not synchronized, so make the call before another thread starts a load
+  or generation. A later `sd_set_progress_callback` call replaces the
+  recorder, `latest` stops advancing, and `sd_dart_progress_enable` does not
+  register it again. A caller that wants a C callback uses upstream's
+  function instead of this API.
+- **A shorter exit.** A process whose caller died still waits for a native
+  call that is in flight: the Dart VM, for one, exits only after the isolate
+  inside `new_sd_ctx` or `generate_image` returns.
+
+To follow one call, ask for `latest` before starting it, read from there on a
+timer, and read once more when the call has returned:
+
+```c
+uint64_t after;
+sd_dart_progress_read(0, NULL, 0, &after);
+/* start the call on another thread; then, on each tick and once at the end: */
+uint64_t latest;
+do {
+    size_t count = sd_dart_progress_read(after, reports, capacity, &latest);
+    for (size_t i = 0; i < count; i++) {
+        /* reports[i].sequence == after + 1 unless reports were lost */
+        after = reports[i].sequence;
+    }
+} while (after < latest);
+```
+
+`tests/test_progress_stress.py` runs this against a real Dart VM: one that
+dies while a native call is reporting progress, and one that polls a batch of
+images; see its docstring.
+
 ## Build
 
 ```bash
@@ -72,7 +166,8 @@ Outputs:
 
 - `bin/<target>/lib/`: stripped runtime library.
 - `bin/<target>/symbols/`: unstripped library for crash symbolication.
-- `bin/<target>/include/stable-diffusion.h` and `build-info.json`.
+- `bin/<target>/include/`: `stable-diffusion.h` and `sd_dart_wrapper.h`.
+- `bin/<target>/build-info.json`.
 - `dist/`: release archives, `manifest.json`, `SHA256SUMS`.
 
 ## Apple XCFramework

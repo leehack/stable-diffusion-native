@@ -33,7 +33,7 @@ from build import (
     APPLE_MACOS_MIN,
     BIN_ROOT,
     BUILD_ROOT,
-    HEADER,
+    HEADERS,
     REPO_ROOT,
     TARGETS,
 )
@@ -123,12 +123,8 @@ def bundle_version(tag: str) -> str:
 
 
 def module_map() -> str:
-    return (
-        f"framework module {FRAMEWORK} {{\n"
-        f'  header "{HEADER.name}"\n'
-        "  export *\n"
-        "}\n"
-    )
+    headers = "".join(f'  header "{header.name}"\n' for header in HEADERS)
+    return f"framework module {FRAMEWORK} {{\n{headers}  export *\n}}\n"
 
 
 def build_versions(binary: Path) -> dict[str, set[str]]:
@@ -191,7 +187,8 @@ def make_framework(slice_: Slice, source: Path, root: Path, version: str) -> Pat
     shutil.copy2(source, binary)
     binary.chmod(0o755)
     run(["install_name_tool", "-id", slice_.install_name, str(binary)])
-    shutil.copy2(HEADER, content / "Headers" / HEADER.name)
+    for header in HEADERS:
+        shutil.copy2(header, content / "Headers" / header.name)
     (content / "Modules" / "module.modulemap").write_text(module_map())
 
     plist = root / slice_.identifier / slice_.info_plist_path
@@ -278,8 +275,9 @@ def validate_slice(slice_: Slice, root: Path, entry: dict, expected_symbols: set
         return problems + [f"{where}: missing binary or Info.plist"]
     if not (root / f"{FRAMEWORK}.framework" / "Modules" / "module.modulemap").is_file():
         problems.append(f"{where}: missing module map")
-    if not (root / f"{FRAMEWORK}.framework" / "Headers" / HEADER.name).is_file():
-        problems.append(f"{where}: missing {HEADER.name}")
+    for header in HEADERS:
+        if not (root / f"{FRAMEWORK}.framework" / "Headers" / header.name).is_file():
+            problems.append(f"{where}: missing {header.name}")
     if slice_.macos_layout:
         current = root / f"{FRAMEWORK}.framework" / "Versions" / "Current"
         if not current.is_symlink() or os.readlink(current) != "A":
@@ -334,8 +332,9 @@ def validate_zip(archive: Path) -> list[str]:
         expected = {s.identifier for s in SLICES}
         if set(libraries) != expected:
             problems.append(f"slices {sorted(libraries)}, expected {sorted(expected)}")
-        symbols = set(api_symbols(xcframework / "ios-arm64" / f"{FRAMEWORK}.framework"
-                                  / "Headers" / HEADER.name))
+        shipped = xcframework / "ios-arm64" / f"{FRAMEWORK}.framework" / "Headers"
+        symbols = set(api_symbols(*(shipped / header.name for header in HEADERS
+                                    if (shipped / header.name).is_file())))
         for slice_ in SLICES:
             if slice_.identifier in libraries:
                 problems += validate_slice(slice_, xcframework / slice_.identifier,
