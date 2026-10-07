@@ -203,14 +203,16 @@ What is guaranteed:
   have ended, and frees only then. If one is still running after the wait,
   it frees nothing at all rather than what happens to be idle.
 - **A bounded exit, and no wait without a reason.** With no call in flight
-  teardown frees at once; with nothing tracked and no call creating or
-  freeing a tracked object, it returns at once. Otherwise the wait ends when
-  the calls do, at the latest after 15 s while `sd_dart_new_sd_ctx` or
-  `sd_dart_generate_image` is in flight and after 2 s for any other call, plus
-  250 ms for a thread that has just left a call to finish the short calls
-  that follow it.
-- **A free in flight is waited for** like a load, also when it is freeing the
-  last tracked object and the registry is already empty.
+  teardown frees once 250 ms have passed since the last one ended: at once
+  when that is long ago, and after 255 ms, as measured, when the quit
+  directly follows a call. With nothing tracked and no call creating or freeing a tracked
+  object, it returns at once. Otherwise the wait ends when the calls do, at
+  the latest after 15 s while `sd_dart_new_sd_ctx` or
+  `sd_dart_generate_image` is in flight and after 2 s for any other call,
+  plus the same 250 ms, which a thread that has just left a call gets to
+  finish the short calls that follow it.
+- **A free in flight is waited for**, with the 2 s bound, also when it is
+  freeing the last tracked object and the registry is already empty.
 - **Nothing returns into freed memory.** Once teardown has begun, a thread
   that ends its outermost call in flight, or reaches the registry outside
   one, never returns to its caller.
@@ -233,9 +235,9 @@ What is not:
   step and before the decode of each image: a load, the text encoder, one
   sampling step and the VAE decode of one image run to their end. Teardown waits up to 15 s for
   them, so **quitting during a large generation can delay the exit of the
-  process by up to 15 s**. A phase that outlasts the bound leaves everything
-  allocated, and Metal aborts as before. Measured with SD-Turbo (q8, 4 steps)
-  on an M4 Max:
+  process by up to 15 s**. A phase that outlasts the bound costs the whole
+  wait and still leaves everything allocated: Metal aborts as before, 15 s
+  later. Measured with SD-Turbo (q8, 4 steps) on an M4 Max:
 
   | Size | One step, Metal | VAE decode, Metal | VAE decode, CPU |
   | --- | --- | --- | --- |

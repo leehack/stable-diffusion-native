@@ -81,9 +81,11 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // bounded time for the calls in flight and then frees the tracked objects in
 // sd_dart_exit_stage order, latest tracked first within a stage. If a call is
 // still in flight when the wait ends, it frees nothing. With no call in
-// flight it does not wait. Neither does it when nothing is tracked and no
-// call in flight is creating or freeing a tracked object: sd_dart_new_sd_ctx()
-// and sd_dart_exit_free() are waited for whatever the registry holds.
+// flight it waits only until 250 ms have passed since the last one ended, the
+// time a thread gets for the short calls that follow a call in flight. It
+// does not wait at all when nothing is tracked and no call in flight is
+// creating or freeing a tracked object: sd_dart_new_sd_ctx() and
+// sd_dart_exit_free() are waited for whatever the registry holds.
 //
 // A call in flight is the time a thread spends inside sd_dart_new_sd_ctx(),
 // sd_dart_generate_image() or sd_dart_exit_free(), or between
@@ -100,8 +102,9 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 //   quits during a large generation can take that much longer to exit.
 // - 2 s otherwise: for sd_dart_exit_free() and for calls marked with
 //   sd_dart_exit_call_begin().
-// A phase that outlasts its bound leaves everything allocated, and the
-// process exits as it would have without this registry.
+// A phase that outlasts its bound costs the whole wait and still leaves
+// everything allocated: the process then exits as it would have without this
+// registry, only that much later.
 //
 // Once teardown has begun, the objects a thread holds may be freed as soon as
 // it has no call in flight. From then on, the end of a thread's outermost call

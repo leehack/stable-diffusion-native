@@ -388,7 +388,9 @@ int test_timeout() {
     sd_dart_exit_teardown();
     const int64_t waited = elapsed_ms(started);
     CHECK(waited >= 900);
-    CHECK(waited < 20000);
+    // Well short of the default for loads and generations, which a setter
+    // that dropped `work_wait_ms` would leave in place.
+    CHECK(waited < 5000);
     CHECK(recorded().empty());
     CHECK(contexts_freed.load() == 0);
     CHECK(sd_dart_exit_tracked_count() == tracked);
@@ -475,6 +477,66 @@ int test_long_work() {
     return 0;
 }
 
+// The default bound for loads and generations, which this scenario does not
+// set: a generation that cannot be cancelled and ends 2.5 s after teardown
+// began, later than the default for other calls allows, is waited for, and
+// everything is freed.
+int test_default_work_wait() {
+    track_out_of_stage_order();
+    sd_ctx_params_t params{};
+    static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    run_generation.store([](sd_ctx_t*) {
+        while (!teardown_requested.load()) {
+            sleep_ms(1);
+        }
+        sleep_ms(2500);
+        record("generation-finished");
+        return true;
+    });
+    std::thread([] {
+        sd_img_gen_params_t request{};
+        sd_dart_generate_image(context, &request, nullptr, nullptr);
+    }).detach();
+    while (!context->generating.load()) {
+        sleep_ms(1);
+    }
+
+    teardown_requested.store(true);
+    sd_dart_exit_teardown();
+    std::vector<std::string> expected = {"generation-finished"};
+    expected.insert(expected.end(), kStageOrder.begin(), kStageOrder.end());
+    CHECK(recorded() == expected);
+    CHECK(contexts_freed.load() == 1);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
+// The default bound for other calls, which this scenario does not set: with
+// a call that never ends, teardown gives up after 2 s and frees nothing.
+int test_default_plain_timeout() {
+    track_out_of_stage_order();
+    static std::atomic<bool> in_call{false};
+    std::thread([] {
+        sd_dart_exit_call_begin();
+        in_call.store(true);
+        sleep_ms(600000);
+    }).detach();
+    while (!in_call.load()) {
+        sleep_ms(1);
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    const int64_t waited = elapsed_ms(started);
+    CHECK(waited >= 1800);
+    // Far from the default for loads and generations, with room for a runner
+    // that stalls.
+    CHECK(waited < 6000);
+    CHECK(recorded().empty());
+    CHECK(sd_dart_exit_tracked_count() == static_cast<int32_t>(kStageOrder.size()));
+    return 0;
+}
+
 // With contexts tracked and nothing in flight, teardown frees them without
 // waiting, however long the bounds are.
 int test_idle_no_wait() {
@@ -506,6 +568,26 @@ int test_idle_wait() {
     CHECK(elapsed_ms(started) < 5000);
     CHECK(contexts_freed.load() == 0);
     CHECK(untracked->cancel_requests.load() == 0);
+    return 0;
+}
+
+// The same once everything that was tracked has been freed: a call that
+// created or freed a tracked object counts as one only until it returns.
+int test_idle_wait_after_free() {
+    sd_ctx_params_t params{};
+    sd_dart_exit_free(sd_dart_new_sd_ctx(&params));
+    char* object = name("object");
+    CHECK(sd_dart_exit_track(object, free_named, SD_DART_EXIT_STAGE_RESOURCE));
+    sd_dart_exit_free(object);
+    CHECK(contexts_freed.load() == 1);
+    CHECK(recorded() == std::vector<std::string>({"object"}));
+    CHECK(sd_dart_exit_tracked_count() == 0);
+
+    std::thread([] { sd_dart_exit_call_begin(); }).join();
+    sd_dart_exit_set_wait_ms(10000, 10000);
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    CHECK(elapsed_ms(started) < 5000);
     return 0;
 }
 
@@ -990,8 +1072,11 @@ int main(int argc, char** argv) {
         {"timeout", test_timeout},
         {"timeout-plain", test_timeout_plain},
         {"long-work", test_long_work},
+        {"default-work-wait", test_default_work_wait},
+        {"default-plain-timeout", test_default_plain_timeout},
         {"idle-no-wait", test_idle_no_wait},
         {"idle-wait", test_idle_wait},
+        {"idle-wait-after-free", test_idle_wait_after_free},
         {"own-call", test_own_call},
         {"own-work-call", test_own_work_call},
         {"blocked", test_blocked},

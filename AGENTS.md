@@ -18,7 +18,9 @@ Guidance for coding agents working in `stable-diffusion-native`.
   or deadlocks VM shutdown. Record state natively and let the caller poll.
   Wrapper state has no destructor; threads still use it while `exit()` runs.
   The one wait is exit teardown's, which is bounded and frees nothing when it
-  runs out.
+  runs out: 15 s while a load or a generation is in flight, 2 s for any other
+  call, so quitting during a large generation can delay the exit by up to
+  15 s.
 - Whatever a Dart caller does to a tracked object begins and ends in one
   native call: tracking in the call that creates it, untracking in the call
   that frees it, and a call in flight around anything that can outlast the
