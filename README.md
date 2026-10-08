@@ -356,10 +356,10 @@ stable-diffusion.cpp's own automatic fit works with:
 - **No context and no model, but the first call initializes the devices.** It
   registers ggml's backends, as `sd_list_devices` does. On Vulkan that creates
   the instance. On Metal it compiles the shader libraries: about 50 ms when
-  the system has them cached, 16 s on an M4 Max and 27 to 42 s on GitHub's
-  macOS runners when it had not. Make the first call on a thread that may
-  wait that long, never on a UI thread; it can also outlast the 15 s that
-  exit teardown waits for it. A later call takes about a microsecond.
+  the system has them cached, 16 s on an M4 Max and 27 to 45 s in five runs
+  on GitHub's macOS runners when it had not. Make the first call on a thread
+  that may wait that long, never on a UI thread; it can also outlast the 15 s
+  that exit teardown waits for it. A later call takes about a microsecond.
 - **The default device ignores `SD_VK_DEVICE`.** Upstream uses the Vulkan
   device of that number for a context without a `backend`, and falls back
   when the device does not initialize, which a query cannot know without

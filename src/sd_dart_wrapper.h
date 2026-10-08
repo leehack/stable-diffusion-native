@@ -249,9 +249,9 @@ SD_API void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mo
 // ggml's backends, as sd_list_devices() does, and with that initializes the
 // devices: on Vulkan it creates the instance, and on Metal it compiles the
 // shader libraries, which takes about 50 ms when the system has them cached
-// and took 16 s on an M4 Max and 27 to 42 s on GitHub's macOS runners when it
-// had not. Make the first call on a thread that may wait that long, never on
-// a UI thread. A later call returns within microseconds. They are callable
+// and took 16 s on an M4 Max and tens of seconds on GitHub's macOS runners
+// when it had not. Make the first call on a thread that may wait that long,
+// never on a UI thread. A later call returns within microseconds. They are callable
 // from any thread, also while another one loads or generates.
 //
 // A query reads ggml's device registry, which exit() destroys, so exit
