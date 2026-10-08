@@ -356,9 +356,10 @@ SD_API void sd_dart_log_set_level(int32_t level);
 //   fell behind, and by how many messages.
 // - Callable from any thread at any time, also before sd_dart_log_enable(),
 //   during exit teardown and after it. It allocates nothing, and waits only
-//   for the copy of one message by another thread. Should that thread have
-//   died during the copy, which only the end of the process can cause, it
-//   gives up after 65536 attempts and returns 0.
+//   for the copy of one message by another thread. Should that thread not
+//   finish the copy within 100 ms, because it died during it, which only the
+//   end of the process can cause, or because the scheduler kept it off its
+//   processor that long, the call returns 0.
 //
 // Messages are process-wide, as upstream's callback is: every context's go
 // into the one sequence, and a message does not say which call made it.
@@ -368,7 +369,7 @@ SD_API uint64_t sd_dart_log_read(uint64_t after, char* text, size_t capacity, in
 // read had returned by then: what was lost to a caller that reads in order,
 // and everything that left for a caller that never reads. It also counts a
 // message that could not be recorded because the thread holding the buffer
-// had died.
+// did not release it within 100 ms.
 SD_API uint64_t sd_dart_log_dropped(void);
 
 // Copies the SD_LOG_ERROR messages that were recorded, by any thread, while
@@ -379,6 +380,11 @@ SD_API uint64_t sd_dart_log_dropped(void);
 // 0 when that call logged no error, when the thread has made no such call or
 // when sd_dart_log_enable() was not called before it.
 //
+// - An empty result does not prove that the call logged no error. The errors
+//   are kept behind a flag of their own, which only another error or a read
+//   of this function holds, for one copy. An error whose thread cannot get
+//   that flag within 100 ms is not kept here; with a level that records it,
+//   it is still in the log, or counted by sd_dart_log_dropped().
 // - Read it on the thread that made the call, before that thread makes
 //   another one. A Dart isolate stays on its thread between two native calls
 //   that no asynchronous gap separates.
@@ -386,7 +392,8 @@ SD_API uint64_t sd_dart_log_dropped(void);
 //   bytes, and only until 32 later ones have replaced them.
 // - Errors are process-wide: those that another thread's call logs in the
 //   meantime are included.
-// - Never blocks, also after teardown, and allocates nothing.
+// - Never blocks after teardown, allocates nothing, and waits only for the
+//   copy of one error by another thread, at most 100 ms.
 SD_API size_t sd_dart_last_error(char* text, size_t capacity);
 
 #ifdef __cplusplus

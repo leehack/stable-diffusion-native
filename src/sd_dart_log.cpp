@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <thread>
 #include <type_traits>
@@ -18,11 +19,15 @@ constexpr size_t kTextBytes   = SD_DART_LOG_TEXT_SIZE - 1;
 // The error messages kept for sd_dart_last_error(), and their length.
 constexpr uint64_t kErrors     = 32;
 constexpr size_t kErrorBytes = 511;
-// How often a thread yields for the buffer before it gives up. The buffer is
-// held for one copy, so only a thread that died holding it, as ExitProcess()
-// lets one, makes another give up. A logging thread then loses its message
-// rather than hang the exit, and the ones after it do not wait at all.
-constexpr int kYields = 1 << 16;
+// How long a thread waits for a flag before it gives up. A flag is held for
+// one copy, which takes less than a microsecond, so the wait only ends for a
+// holder that the scheduler keeps off its processor that long, or that died
+// holding the flag, as ExitProcess() lets one. A logging thread then loses
+// its message rather than hang the exit, and the ones after it do not wait
+// at all.
+constexpr std::chrono::milliseconds kWait{100};
+// The clock is read once per this many attempts.
+constexpr int kAttemptsPerClockRead = 64;
 
 enum Registration : int { kUnregistered, kRegistering, kRegistered };
 
@@ -36,22 +41,30 @@ struct Error {
     char text[kErrorBytes];
 };
 
+struct Flag {
+    std::atomic_flag busy;
+    // A logging thread gave up waiting for the flag and none has had it
+    // since.
+    std::atomic<bool> stuck;
+};
+
 // All zeros to begin with, so it takes no space in the library file.
 struct Log {
-    std::atomic_flag busy;
     std::atomic<int> registration;
     // The lowest level recorded, as the distance from SD_LOG_INFO.
     std::atomic<int32_t> level_above_info;
     std::atomic<uint64_t> dropped;
-    // A logging thread gave up waiting for the buffer and none has had it
-    // since.
-    std::atomic<bool> stuck;
     // The number of the newest error message. Message n is in
     // errors[n % kErrors] until message n + kErrors replaces it.
     std::atomic<uint64_t> errors_recorded;
 
-    // The rest belongs to the thread that set `busy`.
+    // The errors have a flag of their own, so that the reason of a failed
+    // call never waits behind the other messages or their reader.
+    Flag errors_flag;
     Error errors[kErrors];
+
+    // The rest belongs to the thread that set `messages_flag`.
+    Flag messages_flag;
     // The sequence of the newest message, how many messages the buffer holds
     // and the highest sequence a read has returned.
     uint64_t newest;
@@ -78,18 +91,43 @@ Log state;
 thread_local uint64_t window_begin = 0;
 thread_local uint64_t window_end   = 0;
 
-bool acquire(int yields) {
-    for (int i = 0; i < yields; ++i) {
-        if (!state.busy.test_and_set(std::memory_order_acquire)) {
-            return true;
-        }
-        std::this_thread::yield();
+bool try_acquire(Flag& flag) {
+    return !flag.busy.test_and_set(std::memory_order_acquire);
+}
+
+// For a thread that reads: waits for the flag, at most kWait.
+bool acquire(Flag& flag) {
+    if (try_acquire(flag)) {
+        return true;
     }
+    const auto deadline = std::chrono::steady_clock::now() + kWait;
+    do {
+        for (int i = 0; i < kAttemptsPerClockRead; ++i) {
+            std::this_thread::yield();
+            if (try_acquire(flag)) {
+                return true;
+            }
+        }
+    } while (std::chrono::steady_clock::now() < deadline);
     return false;
 }
 
-void release() {
-    state.busy.clear(std::memory_order_release);
+// For a thread that logs: does not wait again for a flag that another
+// logging thread gave up on.
+bool acquire_to_log(Flag& flag) {
+    const bool stuck = flag.stuck.load(std::memory_order_relaxed);
+    if (stuck ? try_acquire(flag) : acquire(flag)) {
+        if (stuck) {
+            flag.stuck.store(false, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    flag.stuck.store(true, std::memory_order_relaxed);
+    return false;
+}
+
+void release(Flag& flag) {
+    flag.busy.clear(std::memory_order_release);
 }
 
 void put(size_t offset, const void* source, size_t length) {
@@ -171,22 +209,20 @@ void record(int32_t level, const char* origin, const char* text) {
     if (length == 0) {
         return;
     }
-    if (!acquire(state.stuck.load(std::memory_order_relaxed) ? 1 : kYields)) {
-        state.stuck.store(true, std::memory_order_relaxed);
+    const size_t origin_length = std::strlen(origin);
+    if (is_error && acquire_to_log(state.errors_flag)) {
+        store_error(origin, origin_length, text, length);
+        release(state.errors_flag);
+    }
+    if (!wanted) {
+        return;
+    }
+    if (!acquire_to_log(state.messages_flag)) {
         state.dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (state.stuck.load(std::memory_order_relaxed)) {
-        state.stuck.store(false, std::memory_order_relaxed);
-    }
-    const size_t origin_length = std::strlen(origin);
-    if (is_error) {
-        store_error(origin, origin_length, text, length);
-    }
-    if (wanted) {
-        store(level, origin, origin_length, text, length);
-    }
-    release();
+    store(level, origin, origin_length, text, length);
+    release(state.messages_flag);
 }
 
 void record_upstream(enum sd_log_level_t level, const char* text, void*) {
@@ -249,11 +285,11 @@ void sd_dart_log_set_level(int32_t level) {
 }
 
 uint64_t sd_dart_log_read(uint64_t after, char* text, size_t capacity, int32_t* level, size_t* length) {
-    if (!acquire(kYields)) {
+    if (!acquire(state.messages_flag)) {
         return 0;
     }
     if (after >= state.newest) {
-        release();
+        release(state.messages_flag);
         return 0;
     }
     const uint64_t oldest = state.newest - state.count + 1;
@@ -283,7 +319,7 @@ uint64_t sd_dart_log_read(uint64_t after, char* text, size_t capacity, int32_t* 
     state.cursor_sequence = wanted + 1;
     state.cursor          = (offset + sizeof(header) + header.length) & (kBufferBytes - 1);
     state.returned        = std::max(state.returned, wanted);
-    release();
+    release(state.messages_flag);
     return wanted;
 }
 
@@ -293,7 +329,7 @@ uint64_t sd_dart_log_dropped(void) {
 
 size_t sd_dart_last_error(char* text, size_t capacity) {
     size_t length = 0;
-    if (window_end > window_begin && acquire(kYields)) {
+    if (window_end > window_begin && acquire(state.errors_flag)) {
         const uint64_t recorded = state.errors_recorded.load();
         const uint64_t kept     = recorded > kErrors ? recorded - kErrors : 0;
         for (uint64_t number = std::max(window_begin, kept) + 1; number <= window_end; ++number) {
@@ -305,7 +341,7 @@ size_t sd_dart_last_error(char* text, size_t capacity) {
                 }
             }
         }
-        release();
+        release(state.errors_flag);
     }
     if (text != nullptr && capacity > 0) {
         text[std::min(length, capacity - 1)] = '\0';

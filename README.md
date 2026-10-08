@@ -412,9 +412,13 @@ What is guaranteed:
   that count is everything that left the buffer.
 - **The logging thread allocates nothing and waits for nothing but one copy.**
   The buffer is held for the copy of a single message, by a reader as by a
-  writer. A thread can only die holding it when the process ends, as
-  `ExitProcess` ends threads on Windows: a logging thread then gives up after
-  65536 attempts and loses its message, and the ones after it do not wait.
+  writer, and the errors that `sd_dart_last_error` returns are behind a flag
+  of their own, so a failed call's reason never waits behind the other
+  messages or their reader. A thread waits at most 100 ms for either: longer
+  than that only a holder takes that the scheduler keeps off its processor,
+  or one that died, as `ExitProcess` ends threads on Windows. A logging
+  thread then loses its message, which `sd_dart_log_dropped` counts, and the
+  ones after it do not wait.
 - **Nothing to undo, and valid during exit.** No call is needed when the
   caller goes away. The state is never destroyed, so logging and reading stay
   valid while `exit()` runs, during exit teardown and after it; reading and
@@ -432,7 +436,9 @@ What is not:
   the errors that another thread's call logged while this one ran.
 - **A reason for every failure.** It is what upstream logged at `SD_LOG_ERROR`.
   A file in the wrong role, such as a full model given as the only VAE, gets
-  one line, `get sd version from file failed: ''`.
+  one line, `get sd version from file failed: ''`. An empty last error does
+  not prove that nothing was logged either: an error whose thread could not
+  get the errors' flag within 100 ms is not kept there.
 - **A last error on another thread.** It belongs to the thread that made the
   call: read it there, before that thread's next load or generation. A Dart
   isolate stays on its thread between two native calls that no asynchronous

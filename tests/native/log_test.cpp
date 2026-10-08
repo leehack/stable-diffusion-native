@@ -461,6 +461,56 @@ void test_last_error() {
     CHECK(last_error() == "during");
 }
 
+// The errors of a call are read while other threads log more of them: each
+// one read is whole, and they are in the order they were logged.
+void test_errors_are_read_whole_while_others_log() {
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> logged{0};
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < 2; thread++) {
+        threads.emplace_back([thread, &stop, &logged] {
+            for (uint64_t n = 1; !stop.load(); n++) {
+                log(SD_LOG_ERROR, std::to_string(thread) + " " + numbered(n, 30 + n % 400));
+                logged.fetch_add(1);
+                if (n % 16 == 0) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    uint64_t lines = 0;
+    for (int call = 0; call < 2000; call++) {
+        const uint64_t before = logged.load();
+        sd_dart_log_call_begin();
+        while (logged.load() < before + 3) {
+            std::this_thread::yield();
+        }
+        sd_dart_log_call_end();
+        // One call: later errors replace the ones of this window meanwhile.
+        std::vector<char> text(1 << 15);
+        const size_t length = sd_dart_last_error(text.data(), text.size());
+        CHECK(length < text.size() && std::strlen(text.data()) == length);
+        const std::string errors = text.data();
+        uint64_t last[2]         = {0, 0};
+        for (size_t start = 0; start < errors.size();) {
+            const size_t end       = std::min(errors.find('\n', start), errors.size());
+            const std::string line = errors.substr(start, end - start);
+            const int thread       = line[0] - '0';
+            CHECK(line.size() > 10 && (thread == 0 || thread == 1) && line[1] == ' ');
+            const uint64_t n = std::strtoull(line.c_str() + 10, nullptr, 10);
+            CHECK(n > last[thread] && line.substr(2) == numbered(n, 30 + n % 400));
+            last[thread] = n;
+            lines++;
+            start = end + 1;
+        }
+    }
+    stop.store(true);
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    CHECK(lines > 0);
+}
+
 // Threads that log and read are still running when main returns: neither may
 // touch anything that exit() destroys.
 int test_exit() {
@@ -524,5 +574,6 @@ int main(int argc, char** argv) {
     test_concurrent_logging_and_reading();
     test_a_reader_that_keeps_up_loses_nothing();
     test_last_error();
+    test_errors_are_read_whole_while_others_log();
     return 0;
 }
