@@ -478,9 +478,12 @@ int test_exit() {
             for (;;) {
                 const Message message = read(after);
                 after                 = message.sequence != 0 ? message.sequence : after;
+                // Errors are logged meanwhile, so what the window holds
+                // changes from one call to the next.
+                char errors[64];
                 sd_dart_log_call_begin();
                 sd_dart_log_call_end();
-                last_error();
+                CHECK(sd_dart_last_error(errors, sizeof(errors)) >= std::strlen(errors));
                 sd_dart_log_dropped();
             }
         }).detach();
