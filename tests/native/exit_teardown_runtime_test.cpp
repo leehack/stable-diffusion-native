@@ -590,6 +590,28 @@ int test_exit_in_load(const char* model, const char* backend) {
     return 0;
 }
 
+std::atomic<int> device_queries{0};
+
+// Returns from main while threads query the device memory and nothing is
+// tracked. Teardown still waits for the queries: they read ggml's device
+// registry, which exit() destroys.
+int test_query_quit() {
+    for (int i = 0; i < 4; ++i) {
+        std::thread([] {
+            sd_dart_gpu_device_memory_t memory;
+            for (;;) {
+                sd_dart_gpu_device_memory(SD_DART_GPU_DEFAULT_DEVICE, &memory);
+                device_queries.fetch_add(1);
+            }
+        }).detach();
+    }
+    while (device_queries.load() < 1000) {
+        sleep_ms(1);
+    }
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
 std::string last_error() {
     char text[SD_DART_LOG_TEXT_SIZE];
     const size_t length = sd_dart_last_error(text, sizeof(text));
@@ -727,6 +749,9 @@ int main(int argc, char** argv) {
         }
         if (scenario == "log") {
             return test_log(model, backend);
+        }
+        if (scenario == "query-quit") {
+            return test_query_quit();
         }
         if (scenario == "exit-in-generation") {
             return test_exit_in_generation(model, backend);

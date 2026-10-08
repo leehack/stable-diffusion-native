@@ -4,6 +4,7 @@
 // Usage: device_memory_test backend|no-backend
 // for a build with SD_DART_GPU_BACKEND set to 1 or to 0.
 
+#include "sd_dart_internal.h"
 #include "sd_dart_wrapper.h"
 
 #include "ggml-backend.h"
@@ -160,8 +161,8 @@ int test_backend() {
         CHECK(memory.description[i] == '\0');
     }
 
-    // Every call that reached the registry was a call in flight, also the
-    // one whose device failed.
+    // Every call that reached the registry was one that exit teardown waits
+    // for, also the one whose device failed.
     CHECK(calls_begun > 0 && calls_begun == calls_ended);
     return 0;
 }
@@ -217,12 +218,13 @@ size_t sd_list_devices(char* buffer, size_t buffer_size) {
     return 0;
 }
 
-void sd_dart_exit_call_begin(void) {
+SdDartStaticsCall::SdDartStaticsCall()
+    : counted_(true) {
     ++calls_begun;
 }
 
-void sd_dart_exit_call_end(void) {
-    ++calls_ended;
+SdDartStaticsCall::~SdDartStaticsCall() {
+    calls_ended += counted_ ? 1 : 0;
 }
 
 int main(int argc, char** argv) {

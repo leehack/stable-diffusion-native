@@ -183,7 +183,7 @@ statics is destroyed.
 | `sd_dart_exit_track`, `_untrack` | For C and C++ callers: track any other object, such as an `upscaler_ctx_t`, with its free function and a stage, or stop tracking it. |
 | `sd_dart_exit_tracked_count` | Number of tracked objects. |
 | `sd_dart_exit_call_begin`, `_end` | For C and C++ callers: mark a call in flight around an upstream function that has no wrapper. |
-| `sd_dart_exit_set_wait_ms` | How long teardown waits for calls in flight: `work_wait_ms` (15000 by default) while a load or a generation is among them, `wait_ms` (2000) otherwise. |
+| `sd_dart_exit_set_wait_ms` | How long teardown waits for calls in flight: `work_wait_ms` (15000 by default) while a load, a generation or a device query is among them, `wait_ms` (2000) otherwise. |
 | `sd_dart_exit_teardown` | Runs teardown now, for native hosts on platforms where it does not run by itself. Follow it directly with `exit()`. |
 
 A Dart caller replaces `new_sd_ctx`, `generate_image`, `sd_cancel_generation`
@@ -205,12 +205,19 @@ What is guaranteed:
 - **A bounded exit, and no wait without a reason.** With no call in flight
   teardown frees once 250 ms have passed since the last one ended: at once
   when that is long ago, and after 255 ms, as measured, when the quit
-  directly follows a call. With nothing tracked and no call creating or freeing a tracked
-  object, it returns at once. Otherwise the wait ends when the calls do, at
-  the latest after 15 s while `sd_dart_new_sd_ctx` or
-  `sd_dart_generate_image` is in flight and after 2 s for any other call,
-  plus the same 250 ms, which a thread that has just left a call gets to
-  finish the short calls that follow it.
+  directly follows a call. With nothing tracked and no call creating or
+  freeing a tracked object or querying the devices, it returns at once.
+  Otherwise the wait ends when the calls do, at the latest after 15 s while
+  `sd_dart_new_sd_ctx`, `sd_dart_generate_image`, `sd_dart_gpu_device_count`
+  or `sd_dart_gpu_device_memory` is in flight and after 2 s for any other
+  call, plus the same 250 ms, which a thread that has just left a call gets
+  to finish the short calls that follow it.
+- **A device query in flight is waited for**, with the 15 s bound, also when
+  nothing is tracked, which is the state of a caller that asks for the
+  device's memory before its first load. The query reads ggml's device
+  registry, a static that `exit()` destroys. Before this wait a process that
+  exited during `sd_dart_gpu_device_memory` crashed in 2 of 200 runs with
+  four querying threads on an M4 Max, and in 0 of 300 with it.
 - **A free in flight is waited for**, with the 2 s bound, also when it is
   freeing the last tracked object and the registry is already empty.
 - **Nothing returns into freed memory.** Once teardown has begun, a thread
@@ -335,8 +342,10 @@ stable-diffusion.cpp's own automatic fit works with:
 - **No context and no model.** The first call registers ggml's backends, as
   `sd_list_devices` does; on Vulkan that creates the instance and can take
   hundreds of milliseconds. A later call takes microseconds on Metal.
-- **Any thread, any time before teardown.** Each function is a call in flight
-  for [exit teardown](#exit-teardown), so it blocks after teardown.
+- **Any thread, any time before teardown.** [Exit teardown](#exit-teardown)
+  waits for a query in flight, also when nothing is tracked, with the bound
+  of a load (15 s by default), and a query blocks after teardown. Past the
+  bound the exit goes on under the query, as it would without the registry.
 - **Whether `free_bytes` is a live figure is not reported.** On Vulkan that
   depends on `VK_EXT_memory_budget`, which ggml checks without exposing the
   result. Without it the check a caller makes is against the device's size.

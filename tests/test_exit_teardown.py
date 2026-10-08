@@ -1,8 +1,9 @@
 """Builds and runs `tests/native/exit_teardown_test.cpp`.
 
-The test links `src/sd_dart_exit.cpp` and `src/sd_dart_log.cpp` against
-stand-ins for the upstream functions they wrap, so it needs the submodules'
-headers but no built runtime.
+The test links `src/sd_dart_exit.cpp`, `src/sd_dart_log.cpp` and
+`src/sd_dart_device.cpp` against stand-ins for the upstream functions they
+wrap and for ggml's device registry, so it needs the submodules' headers but
+no built runtime.
 Each scenario runs in its own process, as teardown runs once per process.
 """
 
@@ -17,6 +18,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [
+    REPO_ROOT / "src" / "sd_dart_device.cpp",
     REPO_ROOT / "src" / "sd_dart_exit.cpp",
     REPO_ROOT / "src" / "sd_dart_log.cpp",
     REPO_ROOT / "tests" / "native" / "exit_teardown_test.cpp",
@@ -42,8 +44,8 @@ SANITIZER_ENV = {
 
 def compile_command(output: Path, sources: list[Path], *flags: str) -> list[str]:
     includes = [f"-I{directory}" for directory in INCLUDE_DIRS]
-    return [COMPILER, "-std=c++17", "-O1", "-g", "-pthread", *flags, *includes,
-            *map(str, sources), "-o", str(output)]
+    return [COMPILER, "-std=c++17", "-O1", "-g", "-pthread", "-DSD_DART_GPU_BACKEND=1", *flags,
+            *includes, *map(str, sources), "-o", str(output)]
 
 
 @unittest.skipIf(sys.platform == "win32", "uses a GCC or Clang command line")
@@ -72,6 +74,7 @@ class ExitTeardownTest(unittest.TestCase):
                                        text=True).stdout.split()
             self.assertIn("generate-in-flight", scenarios)
             self.assertIn("log-at-exit", scenarios)
+            self.assertIn("device-memory-in-flight", scenarios)
 
             def run(scenario: str) -> subprocess.CompletedProcess:
                 return subprocess.run(

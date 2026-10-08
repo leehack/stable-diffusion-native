@@ -40,8 +40,10 @@ struct Registry {
     std::chrono::steady_clock::time_point last_call_end{};
     uint64_t next_order = 0;
     int32_t calls       = 0;
-    // The calls in flight that create or free a tracked object. Their object
-    // is in the registry only before or after the call, never during it.
+    // The calls in flight that teardown waits for with nothing tracked. One
+    // that creates or frees a tracked object has its object in the registry
+    // only before or after the call, never during it; one that queries the
+    // devices uses the library's statics without any object.
     int32_t object_calls = 0;
     // The loads and generations in flight.
     int32_t work_calls   = 0;
@@ -68,7 +70,8 @@ thread_local int32_t work_depth = 0;
 // What a call in flight is to teardown, beyond something to wait for.
 enum CallKind : int {
     kPlainCall = 0,
-    // Creates or frees a tracked object: waited for with nothing tracked.
+    // Creates or frees a tracked object, or uses the library's statics
+    // without one: waited for with nothing tracked.
     kObjectCall = 1,
     // A load or a generation: waited for with the longer bound.
     kWorkCall = 2,
@@ -342,8 +345,9 @@ void sd_dart_exit_teardown(void) {
             return;
         }
         teardown_thread = true;
-        // With nothing to free and no object being created or freed, a call
-        // in flight is no reason to hold up the exit.
+        // With nothing to free, a call in flight that neither creates or
+        // frees an object nor uses the library's statics is no reason to hold
+        // up the exit.
         if (registry.object_calls == 0 && registry.objects.empty()) {
             return;
         }
@@ -381,6 +385,25 @@ void sd_dart_exit_teardown(void) {
             registry.objects.erase(object);
         }
         entry.free_fn(object);
+    }
+}
+
+// The first query initializes the device, which a load would otherwise do,
+// so it gets the bound of a load.
+SdDartStaticsCall::SdDartStaticsCall() {
+    Registry& registry = state();
+    std::unique_lock<std::mutex> lock(registry.mutex);
+    counted_ = admit(registry, lock);
+    if (counted_) {
+        enter_call(registry, kObjectCall | kWorkCall);
+    }
+}
+
+SdDartStaticsCall::~SdDartStaticsCall() {
+    if (counted_) {
+        Registry& registry = state();
+        std::unique_lock<std::mutex> lock(registry.mutex);
+        leave_call(registry, lock, kObjectCall | kWorkCall);
     }
 }
 

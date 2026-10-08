@@ -1,3 +1,4 @@
+#include "sd_dart_internal.h"
 #include "sd_dart_wrapper.h"
 
 #include "ggml-backend.h"
@@ -14,15 +15,6 @@
 #endif
 
 namespace {
-
-// Exit teardown waits for the call, and blocks it once teardown has begun:
-// ggml's device registry is a static that exit() destroys.
-struct CallInFlight {
-    CallInFlight() { sd_dart_exit_call_begin(); }
-    ~CallInFlight() { sd_dart_exit_call_end(); }
-    CallInFlight(const CallInFlight&)            = delete;
-    CallInFlight& operator=(const CallInFlight&) = delete;
-};
 
 bool is_gpu(ggml_backend_dev_t device) {
     const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
@@ -65,7 +57,8 @@ int32_t sd_dart_gpu_device_count(void) {
     if (!SD_DART_GPU_BACKEND) {
         return SD_DART_GPU_NO_BACKEND;
     }
-    CallInFlight call;
+    // ggml's device registry is a static that exit() destroys.
+    SdDartStaticsCall call;
     try {
         register_backends();
         int32_t devices    = 0;
@@ -86,7 +79,8 @@ int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memor
     if (!SD_DART_GPU_BACKEND) {
         return SD_DART_GPU_NO_BACKEND;
     }
-    CallInFlight call;
+    // ggml's device registry is a static that exit() destroys.
+    SdDartStaticsCall call;
     try {
         register_backends();
         ggml_backend_dev_t device = find_device(device_index);

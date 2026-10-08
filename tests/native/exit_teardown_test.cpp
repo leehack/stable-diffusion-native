@@ -1,11 +1,13 @@
 // Exercises src/sd_dart_exit.cpp against stand-ins for the upstream functions
-// it wraps, so it needs no model and runs under sanitizers.
+// it wraps and for ggml's device registry, so it needs no model and runs
+// under sanitizers.
 //
 // Each scenario runs in its own process: teardown runs once per process and
 // leaves the registry unusable from other threads.
 
 #include "sd_dart_wrapper.h"
 
+#include "ggml-backend.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1032,6 +1034,126 @@ int test_generate_in_flight() {
     return 0;
 }
 
+// The stand-in for ggml's device registry: a static that exit() destroys,
+// as ggml's is, and that a device query reads.
+struct DeviceRegistry {
+    ggml_backend_device* device = nullptr;
+    ~DeviceRegistry() {
+        destroyed.store(true);
+        if (queries.load() > 0) {
+            std::fprintf(stderr, "the device registry was destroyed under a device query\n");
+            std::_Exit(1);
+        }
+    }
+    static std::atomic<bool> destroyed;
+    // The queries that are reading the registry.
+    static std::atomic<int> queries;
+};
+std::atomic<bool> DeviceRegistry::destroyed{false};
+std::atomic<int> DeviceRegistry::queries{0};
+
+DeviceRegistry& device_registry() {
+    static DeviceRegistry registry;
+    return registry;
+}
+
+// What a device query does while it reads the registry; null for nothing.
+std::atomic<void (*)()> hold_query{nullptr};
+std::atomic<bool> in_query{false};
+std::atomic<bool> query_returned{false};
+
+void hold_query_through_teardown() {
+    in_query.store(true);
+    CHECK(wait_for_teardown());
+    CHECK(!DeviceRegistry::destroyed.load());
+    sleep_ms(100);
+    CHECK(!DeviceRegistry::destroyed.load());
+    record("query-finished");
+}
+
+// Teardown waits for a device query although nothing is tracked: the query
+// reads statics that are destroyed once teardown is over. The process then
+// exits, so that the registry's destructor has its say.
+int query_in_flight(void (*query)()) {
+    // Registered before the registry exists, so it runs after the registry's
+    // destructor, and with that after teardown.
+    CHECK(atexit([] {
+        if (recorded() != std::vector<std::string>({"query-finished"}) || query_returned.load()) {
+            std::fprintf(stderr, "exit teardown did not wait for the device query\n");
+            std::_Exit(1);
+        }
+    }) == 0);
+    sd_dart_exit_set_wait_ms(30000, 30000);
+    start_heartbeat();
+    hold_query.store(hold_query_through_teardown);
+    static void (*run_query)() = query;
+    std::thread([] {
+        run_query();
+        query_returned.store(true);
+    }).detach();
+    while (!in_query.load()) {
+        sleep_ms(1);
+    }
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    teardown_requested.store(true);
+    if (!kTeardownRunsAtExit) {
+        sd_dart_exit_teardown();
+        CHECK(recorded() == std::vector<std::string>({"query-finished"}));
+    }
+    return 0;
+}
+
+int test_device_memory_in_flight() {
+    return query_in_flight([] {
+        sd_dart_gpu_device_memory_t memory;
+        sd_dart_gpu_device_memory(SD_DART_GPU_DEFAULT_DEVICE, &memory);
+    });
+}
+
+int test_device_count_in_flight() {
+    return query_in_flight([] { sd_dart_gpu_device_count(); });
+}
+
+// A device query that outlasts the bound of a load costs that wait and no
+// more: the bound for other calls, far longer here, is not the one applied.
+int test_device_query_timeout() {
+    sd_dart_exit_set_wait_ms(600000, 300);
+    hold_query.store([] {
+        in_query.store(true);
+        sleep_ms(600000);
+    });
+    std::thread([] { sd_dart_gpu_device_count(); }).detach();
+    while (!in_query.load()) {
+        sleep_ms(1);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    const int64_t waited = elapsed_ms(started);
+    CHECK(waited >= 250 && waited < 20000);
+    // The exit goes on under the query, as it did before the registry.
+    std::_Exit(0);
+}
+
+// A device query after a query that returned does not hold up the exit, and
+// one that begins after teardown never reaches the registry.
+int test_device_query_idle() {
+    sd_dart_gpu_device_memory_t memory;
+    CHECK(sd_dart_gpu_device_count() == 1);
+    CHECK(sd_dart_gpu_device_memory(0, &memory) == SD_DART_GPU_OK);
+    sd_dart_exit_set_wait_ms(30000, 30000);
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    CHECK(elapsed_ms(started) < 5000);
+    static std::atomic<bool> late_query_returned{false};
+    std::thread([] {
+        sd_dart_gpu_device_count();
+        late_query_returned.store(true);
+    }).detach();
+    sleep_ms(200);
+    CHECK(!late_query_returned.load() && DeviceRegistry::queries.load() == 0);
+    return 0;
+}
+
 // A call that fails leaves the reason upstream logged for it with the thread
 // that made the call, once the recorder is enabled.
 int test_last_error() {
@@ -1147,6 +1269,62 @@ int test_log_at_exit() {
 
 }  // namespace
 
+struct ggml_backend_device {
+    const char* name = "MTL0";
+};
+
+// Each registry function reads the registry, and none may find it destroyed.
+struct RegistryRead {
+    RegistryRead() {
+        CHECK(!DeviceRegistry::destroyed.load());
+        DeviceRegistry::queries.fetch_add(1);
+    }
+    ~RegistryRead() { DeviceRegistry::queries.fetch_sub(1); }
+};
+
+size_t sd_list_devices(char*, size_t) {
+    RegistryRead read;
+    static ggml_backend_device device;
+    device_registry().device = &device;
+    if (void (*hold)() = hold_query.load()) {
+        hold();
+    }
+    return 0;
+}
+
+size_t ggml_backend_dev_count(void) {
+    RegistryRead read;
+    return 1;
+}
+
+ggml_backend_dev_t ggml_backend_dev_get(size_t) {
+    RegistryRead read;
+    return device_registry().device;
+}
+
+ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
+    RegistryRead read;
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU ? device_registry().device : nullptr;
+}
+
+const char* ggml_backend_dev_name(ggml_backend_dev_t device) {
+    return device->name;
+}
+
+const char* ggml_backend_dev_description(ggml_backend_dev_t) {
+    return "a stand-in";
+}
+
+enum ggml_backend_dev_type ggml_backend_dev_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+void ggml_backend_dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
+    RegistryRead read;
+    *free  = 1;
+    *total = 2;
+}
+
 void sd_set_log_callback(sd_log_cb_t callback, void*) {
     log_callback.store(callback);
 }
@@ -1242,6 +1420,10 @@ int main(int argc, char** argv) {
         {"cancel", test_cancel},
         {"load-in-flight", test_load_in_flight},
         {"generate-in-flight", test_generate_in_flight},
+        {"device-memory-in-flight", test_device_memory_in_flight},
+        {"device-count-in-flight", test_device_count_in_flight},
+        {"device-query-timeout", test_device_query_timeout},
+        {"device-query-idle", test_device_query_idle},
         {"last-error", test_last_error},
         {"log-at-exit", test_log_at_exit},
     };

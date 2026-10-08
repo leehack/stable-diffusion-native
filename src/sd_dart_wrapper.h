@@ -84,16 +84,21 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // flight it waits only until 250 ms have passed since the last one ended, the
 // time a thread gets for the short calls that follow a call in flight. It
 // does not wait at all when nothing is tracked and no call in flight is
-// creating or freeing a tracked object: sd_dart_new_sd_ctx() and
-// sd_dart_exit_free() are waited for whatever the registry holds.
+// creating or freeing a tracked object or querying the devices:
+// sd_dart_new_sd_ctx(), sd_dart_exit_free(), sd_dart_gpu_device_count() and
+// sd_dart_gpu_device_memory() are waited for whatever the registry holds.
 //
 // A call in flight is the time a thread spends inside sd_dart_new_sd_ctx(),
-// sd_dart_generate_image() or sd_dart_exit_free(), or between
-// sd_dart_exit_call_begin() and sd_dart_exit_call_end().
+// sd_dart_generate_image(), sd_dart_exit_free(), sd_dart_gpu_device_count()
+// or sd_dart_gpu_device_memory(), or between sd_dart_exit_call_begin() and
+// sd_dart_exit_call_end().
 //
 // The wait ends when the calls do, and it has two bounds:
-// - 15 s while a load or a generation is in flight, that is
-//   sd_dart_new_sd_ctx() or sd_dart_generate_image(). stable-diffusion.cpp
+// - 15 s while a load, a generation or a device query is in flight, that is
+//   sd_dart_new_sd_ctx(), sd_dart_generate_image(),
+//   sd_dart_gpu_device_count() or sd_dart_gpu_device_memory(). The first
+//   device query initializes the device, as a load otherwise does; a later
+//   one returns within microseconds. stable-diffusion.cpp
 //   reads a cancellation only between the phases of a generation: before a
 //   sampling step and before the decode of each image. A load, the text
 //   encoder, a sampling step and the VAE decode of an image each run to their
@@ -172,8 +177,8 @@ SD_API void sd_dart_exit_call_begin(void);
 SD_API void sd_dart_exit_call_end(void);
 
 // Sets how long teardown waits for calls in flight: `work_wait_ms` while a
-// load or a generation is among them, `wait_ms` otherwise. Negative values are
-// treated as zero. The defaults are 2000 and 15000. A host that would rather
+// load, a generation or a device query is among them, `wait_ms` otherwise.
+// Negative values are treated as zero. The defaults are 2000 and 15000. A host that would rather
 // abort in ggml-metal than exit late passes one value for both.
 SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms);
 
@@ -233,8 +238,14 @@ SD_API void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mo
 // The functions create no context and load no model. The first call registers
 // ggml's backends, as sd_list_devices() does, which on Vulkan creates the
 // instance and can take hundreds of milliseconds. They are callable from any
-// thread, also while another one loads or generates, and each is a call in
-// flight for exit teardown, so it blocks after teardown.
+// thread, also while another one loads or generates.
+//
+// A query reads ggml's device registry, which exit() destroys, so exit
+// teardown waits for one that is in flight, also when nothing is tracked,
+// and a query blocks after teardown. The wait has the bound of a load, 15 s
+// unless sd_dart_exit_set_wait_ms() changed it. Past that bound teardown
+// frees nothing and the exit goes on under the query, as it would without
+// the registry: the registry may then be destroyed while the query reads it.
 
 enum sd_dart_gpu_status {
     SD_DART_GPU_OK = 0,
