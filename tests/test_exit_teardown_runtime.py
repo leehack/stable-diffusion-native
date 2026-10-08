@@ -4,9 +4,10 @@ Needs the macOS runtime of this host under `bin/` (`tools/build.py build
 --target macos-arm64`) and skips without it. The test binary writes its own
 12 MB model, so nothing is downloaded.
 
-On Linux, where teardown does not run at exit, it only checks that a context
-left alive at exit does not need it: set `SD_EXIT_TEARDOWN_TARGET` to a built
-Linux target.
+On Linux, where teardown does not run at exit, it checks that a context left
+alive at exit does not need it, and reports what an exit does to a load or a
+generation in flight, which nothing waits for there: set
+`SD_EXIT_TEARDOWN_TARGET` to a built Linux target.
 
     SD_REQUIRE_RUNTIME=1            fail instead of skipping
     SD_REQUIRE_DART=1               fail when no Dart SDK is on PATH; the
@@ -60,11 +61,15 @@ SANITIZER = os.environ.get("SD_EXIT_TEARDOWN_SANITIZER", "")
 RUNS = int(os.environ.get("SD_EXIT_TEARDOWN_RUNS", "1"))
 REAL_MODEL = os.environ.get("SD_EXIT_TEARDOWN_MODEL", "")
 REAL_MODEL_SIZE = os.environ.get("SD_EXIT_TEARDOWN_MODEL_SIZE", "256")
-SCENARIOS = ("idle", "dispose", "free-quit", "cancel", "generate-wait", "load-wait", "late-load")
+SCENARIOS = ("idle", "dispose", "free-quit", "cancel", "generate-wait", "load-wait", "late-load",
+             "log", "query-quit")
 # What the others do on a device that cannot compute is load, and free.
 GENERATING_SCENARIOS = ("cancel", "generate-wait")
 # `default` lets the runtime pick its device, which is Metal where there is one.
 BACKENDS = ("default", "cpu")
+# What Linux reports of an exit during a call, and how often it tries each.
+EXIT_IN_CALL_SCENARIOS = {"exit-in-load": "loading", "exit-in-generation": "generating"}
+EXIT_IN_CALL_RUNS = 5
 METAL_ABORT = "[rsets->data count] == 0"
 SCENARIO_ENV = {"ASAN_OPTIONS": "detect_leaks=0"}
 
@@ -90,6 +95,11 @@ def build_test(library: Path, output: Path, *flags: str, source: Path = SOURCE) 
         check=True)
 
 
+def annotate(level: str, message: str) -> None:
+    print(f"::{level} title=exit teardown::{message}" if os.environ.get("GITHUB_ACTIONS")
+          else f"{level}: {message}", flush=True)
+
+
 @unittest.skipUnless(sys.platform == "linux" and LINUX_TARGET,
                      "set SD_EXIT_TEARDOWN_TARGET to a built Linux target")
 class LiveContextAtExitTest(unittest.TestCase):
@@ -100,34 +110,73 @@ class LiveContextAtExitTest(unittest.TestCase):
     driver at hand, which CI only has in software (Mesa lavapipe).
     """
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.target = build.TARGETS[LINUX_TARGET]
+        library = build.BIN_ROOT / cls.target.name / "lib" / cls.target.library
+        if not library.is_file():
+            raise AssertionError(f"no runtime at {library}")
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.directory.cleanup)
+        cls.binary = Path(cls.directory.name) / "exit_teardown_runtime_test"
+        cls.model = Path(cls.directory.name) / "model.safetensors"
+        build_test(library, cls.binary)
+        subprocess.run([str(cls.binary), "make-model", str(cls.model)], check=True, timeout=600)
+        cls.backends = ["cpu"] + (["Vulkan0"] if "vulkan" in cls.target.accelerators else [])
+
     def test_exits_cleanly_with_a_context_alive(self) -> None:
-        target = build.TARGETS[LINUX_TARGET]
-        library = build.BIN_ROOT / target.name / "lib" / target.library
-        self.assertTrue(library.is_file(), f"no runtime at {library}")
-        with tempfile.TemporaryDirectory() as directory:
-            binary = Path(directory) / "exit_teardown_runtime_test"
-            model = Path(directory) / "model.safetensors"
-            build_test(library, binary)
-            subprocess.run([str(binary), "make-model", str(model)], check=True, timeout=600)
-            backends = ["cpu"] + (["Vulkan0"] if "vulkan" in target.accelerators else [])
-            for backend in backends:
-                with self.subTest(backend=backend):
-                    result = subprocess.run(
-                        [str(binary), "idle-untracked", str(model), backend],
-                        capture_output=True, text=True, timeout=600, errors="replace")
-                    generated = f"generated on {backend}" in result.stdout
-                    lines = result.stderr.strip().splitlines()
-                    outcome = (f"{target.name} on {backend}: "
-                               + ("exit with a live context" if generated
-                                  else "no context to exit with; the run")
-                               + f" returned {result.returncode}"
-                               + (f": {lines[-1]}" if result.returncode != 0 and lines else ""))
-                    level = "notice" if generated and result.returncode == 0 else "warning"
-                    print(f"::{level} title=exit teardown::{outcome}"
-                          if os.environ.get("GITHUB_ACTIONS") else f"{level}: {outcome}", flush=True)
-                    if backend == "cpu":
-                        self.assertTrue(generated, result.stderr)
-                        self.assertEqual(0, result.returncode, result.stderr)
+        for backend in self.backends:
+            with self.subTest(backend=backend):
+                result = subprocess.run(
+                    [str(self.binary), "idle-untracked", str(self.model), backend],
+                    capture_output=True, text=True, timeout=600, errors="replace")
+                generated = f"generated on {backend}" in result.stdout
+                lines = result.stderr.strip().splitlines()
+                outcome = (f"{self.target.name} on {backend}: "
+                           + ("exit with a live context" if generated
+                              else "no context to exit with; the run")
+                           + f" returned {result.returncode}"
+                           + (f": {lines[-1]}" if result.returncode != 0 and lines else ""))
+                annotate("notice" if generated and result.returncode == 0 else "warning", outcome)
+                if backend == "cpu":
+                    self.assertTrue(generated, result.stderr)
+                    self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_reports_what_an_exit_during_a_call_does(self) -> None:
+        """Measured, never failed: nothing waits for a call in flight at exit here.
+
+        A thread that is inside a load or a generation when main returns goes
+        on using statics that exit() destroys (leehack/llamadart#949). The
+        counts say whether a runner reproduces that.
+        """
+        for backend in self.backends:
+            for scenario, began in EXIT_IN_CALL_SCENARIOS.items():
+                outcomes: dict[str, int] = {}
+                detail = ""
+                for _ in range(EXIT_IN_CALL_RUNS):
+                    try:
+                        result = subprocess.run(
+                            [str(self.binary), scenario, str(self.model), backend],
+                            capture_output=True, text=True, timeout=120, errors="replace")
+                    except subprocess.TimeoutExpired:
+                        outcome = "hung"
+                    else:
+                        lines = result.stderr.strip().splitlines()
+                        if f"{began} on {backend}" not in result.stdout:
+                            outcome = "never began the call"
+                        elif result.returncode == 0:
+                            outcome = "clean"
+                        elif result.returncode < 0:
+                            outcome = signal.Signals(-result.returncode).name
+                        else:
+                            outcome = f"exit code {result.returncode}"
+                        if outcome != "clean" and lines:
+                            detail = f"; last line: {lines[-1][:200]}"
+                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                summary = ", ".join(f"{count} {outcome}" for outcome, count in sorted(outcomes.items()))
+                annotate("notice" if set(outcomes) == {"clean"} else "warning",
+                         f"{self.target.name} on {backend}: {scenario}, "
+                         f"{EXIT_IN_CALL_RUNS} runs: {summary}{detail}")
 
 
 @unittest.skipUnless(sys.platform == "darwin", "exit teardown runs at exit on Apple platforms only")

@@ -1,11 +1,16 @@
 // Exercises src/sd_dart_exit.cpp against stand-ins for the upstream functions
-// it wraps, so it needs no model and runs under sanitizers.
+// it wraps and for ggml's device registry, so it needs no model and runs
+// under sanitizers.
 //
 // Each scenario runs in its own process: teardown runs once per process and
 // leaves the registry unusable from other threads.
 
 #include "sd_dart_wrapper.h"
 
+#include "ggml-backend.h"
+#include "ggml.h"
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -96,6 +101,25 @@ const bool kTeardownRunsAtExit = true;
 #else
 const bool kTeardownRunsAtExit = false;
 #endif
+
+// The stand-in for upstream's log: nothing without a callback, and a text
+// that is gone when the callback returns.
+std::atomic<sd_log_cb_t> log_callback{nullptr};
+
+void upstream_log(enum sd_log_level_t level, const std::string& text) {
+    if (sd_log_cb_t callback = log_callback.load()) {
+        std::string passed = text + "\n";
+        callback(level, passed.c_str(), nullptr);
+        std::fill(passed.begin(), passed.end(), '#');
+    }
+}
+
+std::string last_error() {
+    char text[1024];
+    const size_t length = sd_dart_last_error(text, sizeof(text));
+    CHECK(length < sizeof(text) && std::strlen(text) == length);
+    return text;
+}
 
 // What the stand-ins do, set by the scenario before it calls a wrapper.
 std::atomic<bool> fail_load{false};
@@ -1010,7 +1034,303 @@ int test_generate_in_flight() {
     return 0;
 }
 
+// The stand-in for ggml's device registry: a static that exit() destroys,
+// as ggml's is, and that a device query reads.
+struct DeviceRegistry {
+    ggml_backend_device* device = nullptr;
+    ~DeviceRegistry() {
+        destroyed.store(true);
+        if (queries.load() > 0) {
+            std::fprintf(stderr, "the device registry was destroyed under a device query\n");
+            std::_Exit(1);
+        }
+    }
+    static std::atomic<bool> destroyed;
+    // The queries that are reading the registry.
+    static std::atomic<int> queries;
+};
+std::atomic<bool> DeviceRegistry::destroyed{false};
+std::atomic<int> DeviceRegistry::queries{0};
+
+DeviceRegistry& device_registry() {
+    static DeviceRegistry registry;
+    return registry;
+}
+
+// What a device query does while it reads the registry; null for nothing.
+std::atomic<void (*)()> hold_query{nullptr};
+std::atomic<bool> in_query{false};
+std::atomic<bool> query_returned{false};
+
+void hold_query_through_teardown() {
+    in_query.store(true);
+    CHECK(wait_for_teardown());
+    CHECK(!DeviceRegistry::destroyed.load());
+    sleep_ms(100);
+    CHECK(!DeviceRegistry::destroyed.load());
+    record("query-finished");
+}
+
+// Teardown waits for a device query although nothing is tracked: the query
+// reads statics that are destroyed once teardown is over. The process then
+// exits, so that the registry's destructor has its say.
+int query_in_flight(void (*query)()) {
+    // Registered before the registry exists, so it runs after the registry's
+    // destructor, and with that after teardown.
+    CHECK(atexit([] {
+        if (recorded() != std::vector<std::string>({"query-finished"}) || query_returned.load()) {
+            std::fprintf(stderr, "exit teardown did not wait for the device query\n");
+            std::_Exit(1);
+        }
+    }) == 0);
+    sd_dart_exit_set_wait_ms(30000, 30000);
+    start_heartbeat();
+    hold_query.store(hold_query_through_teardown);
+    static void (*run_query)() = query;
+    std::thread([] {
+        run_query();
+        query_returned.store(true);
+    }).detach();
+    while (!in_query.load()) {
+        sleep_ms(1);
+    }
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    teardown_requested.store(true);
+    if (!kTeardownRunsAtExit) {
+        sd_dart_exit_teardown();
+        CHECK(recorded() == std::vector<std::string>({"query-finished"}));
+    }
+    return 0;
+}
+
+int test_device_memory_in_flight() {
+    return query_in_flight([] {
+        sd_dart_gpu_device_memory_t memory;
+        sd_dart_gpu_device_memory(SD_DART_GPU_DEFAULT_DEVICE, &memory);
+    });
+}
+
+int test_device_count_in_flight() {
+    return query_in_flight([] { sd_dart_gpu_device_count(); });
+}
+
+// A device query that outlasts the bound of a load costs that wait and no
+// more: the bound for other calls, far longer here, is not the one applied.
+int test_device_query_timeout() {
+    sd_dart_exit_set_wait_ms(600000, 300);
+    hold_query.store([] {
+        in_query.store(true);
+        sleep_ms(600000);
+    });
+    std::thread([] { sd_dart_gpu_device_count(); }).detach();
+    while (!in_query.load()) {
+        sleep_ms(1);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    const int64_t waited = elapsed_ms(started);
+    CHECK(waited >= 250 && waited < 20000);
+    // The exit goes on under the query, as it did before the registry.
+    std::_Exit(0);
+}
+
+// A device query after a query that returned does not hold up the exit, and
+// one that begins after teardown never reaches the registry.
+int test_device_query_idle() {
+    sd_dart_gpu_device_memory_t memory;
+    CHECK(sd_dart_gpu_device_count() == 1);
+    CHECK(sd_dart_gpu_device_memory(0, &memory) == SD_DART_GPU_OK);
+    sd_dart_exit_set_wait_ms(30000, 30000);
+    const auto started = std::chrono::steady_clock::now();
+    sd_dart_exit_teardown();
+    CHECK(elapsed_ms(started) < 5000);
+    static std::atomic<bool> late_query_returned{false};
+    std::thread([] {
+        sd_dart_gpu_device_count();
+        late_query_returned.store(true);
+    }).detach();
+    sleep_ms(200);
+    CHECK(!late_query_returned.load() && DeviceRegistry::queries.load() == 0);
+    return 0;
+}
+
+// A call that fails leaves the reason upstream logged for it with the thread
+// that made the call, once the recorder is enabled.
+int test_last_error() {
+    sd_ctx_params_t params{};
+    sd_img_gen_params_t request{};
+    fail_load.store(true);
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    CHECK(last_error().empty());
+
+    sd_dart_log_enable();
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    const std::string reason = "model_loader.cpp:1 - tensor 'x' not in model metadata\n"
+                               "diffusion_engine.cpp:2 - new_sd_ctx_t failed";
+    CHECK(last_error() == reason);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    // Another thread's call has its own.
+    std::thread([&] {
+        CHECK(last_error().empty());
+        fail_load.store(false);
+        sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+        CHECK(context != nullptr && last_error().empty());
+        sd_dart_exit_free(context);
+    }).join();
+    CHECK(last_error() == reason);
+
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    CHECK(context != nullptr && last_error().empty());
+    run_generation.store([](sd_ctx_t*) { return false; });
+    CHECK(!sd_dart_generate_image(context, &request, nullptr, nullptr));
+    CHECK(last_error() == "diffusion_engine.cpp:3 - generate_image failed");
+    run_generation.store(nullptr);
+    CHECK(sd_dart_generate_image(context, &request, nullptr, nullptr));
+    CHECK(last_error().empty());
+    // A call that is not a load or a generation leaves it alone.
+    run_generation.store([](sd_ctx_t*) { return false; });
+    CHECK(!sd_dart_generate_image(context, &request, nullptr, nullptr));
+    sd_dart_exit_free(context);
+    CHECK(last_error() == "diffusion_engine.cpp:3 - generate_image failed");
+
+    // The messages themselves are there to read, the free's among them.
+    std::vector<std::string> messages;
+    char text[SD_DART_LOG_TEXT_SIZE];
+    int32_t level = -1;
+    for (uint64_t after = 0; (after = sd_dart_log_read(after, text, sizeof(text), &level, nullptr)) != 0;) {
+        CHECK(messages.size() + 1 == after);
+        messages.push_back(std::to_string(level) + " " + text);
+    }
+    CHECK(messages.size() == 6);
+    CHECK(messages[0] == "4 model_loader.cpp:1 - tensor 'x' not in model metadata");
+    CHECK(messages[2] == "2 diffusion_engine.cpp:4 - free_sd_ctx");
+    CHECK(messages[5] == "2 diffusion_engine.cpp:4 - free_sd_ctx");
+    sd_dart_exit_teardown();
+    return 0;
+}
+
+std::atomic<bool> log_thread_started{false};
+
+void expect_teardown_logged() {
+    // After teardown, on the thread that ran it: reading still works, and
+    // what the free of the tracked context logged during teardown is there.
+    bool freed = false;
+    char text[SD_DART_LOG_TEXT_SIZE];
+    uint64_t after = 0;
+    for (uint64_t next = 0; (next = sd_dart_log_read(after, text, sizeof(text), nullptr, nullptr)) != 0;) {
+        after = next;
+        freed = freed || std::strcmp(text, "diffusion_engine.cpp:4 - free_sd_ctx") == 0;
+    }
+    if (after == 0 || freed != kTeardownRunsAtExit || (contexts_freed.load() == 1) != kTeardownRunsAtExit) {
+        std::fprintf(stderr, "read %llu messages after teardown, the free's %s among them\n",
+                     static_cast<unsigned long long>(after), freed ? "is" : "is not");
+        std::_Exit(1);
+    }
+    last_error();
+    sd_dart_log_dropped();
+}
+
+// The process exits with the recorder enabled, a tracked context that logs
+// when teardown frees it, and threads that go on logging and reading through
+// teardown and whatever exit() does after it.
+int test_log_at_exit() {
+    // Registered first, so it runs after the teardown registered by tracking.
+    CHECK(atexit(expect_teardown_logged) == 0);
+    sd_dart_log_enable();
+    sd_dart_log_set_level(SD_LOG_DEBUG);
+    for (int i = 0; i < 2; ++i) {
+        std::thread([] {
+            for (uint64_t n = 0;; ++n) {
+                // Short, so that the free's message is still in the buffer
+                // when the check reads it.
+                upstream_log(n % 5 == 0 ? SD_LOG_ERROR : SD_LOG_DEBUG, "w");
+                log_thread_started.store(true);
+                if (n % 8 == 0) {
+                    sleep_ms(1);
+                }
+            }
+        }).detach();
+    }
+    std::thread([] {
+        char text[SD_DART_LOG_TEXT_SIZE];
+        for (uint64_t after = 0;;) {
+            const uint64_t next = sd_dart_log_read(after, text, sizeof(text), nullptr, nullptr);
+            after               = next != 0 ? next : after;
+            last_error();
+        }
+    }).detach();
+    while (!log_thread_started.load()) {
+        sleep_ms(1);
+    }
+    sd_ctx_params_t params{};
+    CHECK(sd_dart_new_sd_ctx(&params) != nullptr);
+    return 0;
+}
+
 }  // namespace
+
+struct ggml_backend_device {
+    const char* name = "MTL0";
+};
+
+// Each registry function reads the registry, and none may find it destroyed.
+struct RegistryRead {
+    RegistryRead() {
+        CHECK(!DeviceRegistry::destroyed.load());
+        DeviceRegistry::queries.fetch_add(1);
+    }
+    ~RegistryRead() { DeviceRegistry::queries.fetch_sub(1); }
+};
+
+size_t sd_list_devices(char*, size_t) {
+    RegistryRead read;
+    static ggml_backend_device device;
+    device_registry().device = &device;
+    if (void (*hold)() = hold_query.load()) {
+        hold();
+    }
+    return 0;
+}
+
+size_t ggml_backend_dev_count(void) {
+    RegistryRead read;
+    return 1;
+}
+
+ggml_backend_dev_t ggml_backend_dev_get(size_t) {
+    RegistryRead read;
+    return device_registry().device;
+}
+
+ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
+    RegistryRead read;
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU ? device_registry().device : nullptr;
+}
+
+const char* ggml_backend_dev_name(ggml_backend_dev_t device) {
+    return device->name;
+}
+
+const char* ggml_backend_dev_description(ggml_backend_dev_t) {
+    return "a stand-in";
+}
+
+enum ggml_backend_dev_type ggml_backend_dev_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+void ggml_backend_dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
+    RegistryRead read;
+    *free  = 1;
+    *total = 2;
+}
+
+void sd_set_log_callback(sd_log_cb_t callback, void*) {
+    log_callback.store(callback);
+}
+
+void ggml_log_set(ggml_log_callback, void*) {
+}
 
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     loads_begun.fetch_add(1);
@@ -1019,7 +1339,13 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     if (bool (*hold)() = hold_load.load()) {
         hold();
     }
-    return fail_load.load() ? nullptr : new sd_ctx_t();
+    if (fail_load.load()) {
+        // Upstream's loader logs from its own threads.
+        std::thread([] { upstream_log(SD_LOG_ERROR, "model_loader.cpp:1 - tensor 'x' not in model metadata"); }).join();
+        upstream_log(SD_LOG_ERROR, "diffusion_engine.cpp:2 - new_sd_ctx_t failed");
+        return nullptr;
+    }
+    return new sd_ctx_t();
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
@@ -1030,6 +1356,7 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
     }
     contexts_freed.fetch_add(1);
     last_freed.store(sd_ctx);
+    upstream_log(SD_LOG_INFO, "diffusion_engine.cpp:4 - free_sd_ctx");
     delete sd_ctx;
 }
 
@@ -1044,6 +1371,9 @@ bool generate_image(sd_ctx_t* sd_ctx,
     bool ok = true;
     if (bool (*run)(sd_ctx_t*) = run_generation.load()) {
         ok = run(sd_ctx);
+    }
+    if (!ok) {
+        upstream_log(SD_LOG_ERROR, "diffusion_engine.cpp:3 - generate_image failed");
     }
     if (num_images_out != nullptr) {
         *num_images_out = 7;
@@ -1090,6 +1420,12 @@ int main(int argc, char** argv) {
         {"cancel", test_cancel},
         {"load-in-flight", test_load_in_flight},
         {"generate-in-flight", test_generate_in_flight},
+        {"device-memory-in-flight", test_device_memory_in_flight},
+        {"device-count-in-flight", test_device_count_in_flight},
+        {"device-query-timeout", test_device_query_timeout},
+        {"device-query-idle", test_device_query_idle},
+        {"last-error", test_last_error},
+        {"log-at-exit", test_log_at_exit},
     };
     for (const auto& candidate : scenarios) {
         if (scenario == candidate.name) {

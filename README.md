@@ -183,7 +183,7 @@ statics is destroyed.
 | `sd_dart_exit_track`, `_untrack` | For C and C++ callers: track any other object, such as an `upscaler_ctx_t`, with its free function and a stage, or stop tracking it. |
 | `sd_dart_exit_tracked_count` | Number of tracked objects. |
 | `sd_dart_exit_call_begin`, `_end` | For C and C++ callers: mark a call in flight around an upstream function that has no wrapper. |
-| `sd_dart_exit_set_wait_ms` | How long teardown waits for calls in flight: `work_wait_ms` (15000 by default) while a load or a generation is among them, `wait_ms` (2000) otherwise. |
+| `sd_dart_exit_set_wait_ms` | How long teardown waits for calls in flight: `work_wait_ms` (15000 by default) while a load, a generation or a device query is among them, `wait_ms` (2000) otherwise. |
 | `sd_dart_exit_teardown` | Runs teardown now, for native hosts on platforms where it does not run by itself. Follow it directly with `exit()`. |
 
 A Dart caller replaces `new_sd_ctx`, `generate_image`, `sd_cancel_generation`
@@ -205,12 +205,19 @@ What is guaranteed:
 - **A bounded exit, and no wait without a reason.** With no call in flight
   teardown frees once 250 ms have passed since the last one ended: at once
   when that is long ago, and after 255 ms, as measured, when the quit
-  directly follows a call. With nothing tracked and no call creating or freeing a tracked
-  object, it returns at once. Otherwise the wait ends when the calls do, at
-  the latest after 15 s while `sd_dart_new_sd_ctx` or
-  `sd_dart_generate_image` is in flight and after 2 s for any other call,
-  plus the same 250 ms, which a thread that has just left a call gets to
-  finish the short calls that follow it.
+  directly follows a call. With nothing tracked and no call creating or
+  freeing a tracked object or querying the devices, it returns at once.
+  Otherwise the wait ends when the calls do, at the latest after 15 s while
+  `sd_dart_new_sd_ctx`, `sd_dart_generate_image`, `sd_dart_gpu_device_count`
+  or `sd_dart_gpu_device_memory` is in flight and after 2 s for any other
+  call, plus the same 250 ms, which a thread that has just left a call gets
+  to finish the short calls that follow it.
+- **A device query in flight is waited for**, with the 15 s bound, also when
+  nothing is tracked, which is the state of a caller that asks for the
+  device's memory before its first load. The query reads ggml's device
+  registry, a static that `exit()` destroys. Before this wait a process that
+  exited during `sd_dart_gpu_device_memory` crashed in 2 of 200 runs with
+  four querying threads on an M4 Max, and in 0 of 300 with it.
 - **A free in flight is waited for**, with the 2 s bound, also when it is
   freeing the last tracked object and the registry is already empty.
 - **Nothing returns into freed memory.** Once teardown has begun, a thread
@@ -262,6 +269,11 @@ What is not:
   teardown runs only when a native host calls it. CI checks on Linux that a
   context left alive at exit is harmless on the CPU, and reports what the
   Vulkan backend does on Mesa lavapipe; no hardware Vulkan driver was tried.
+  A load or a generation in flight is not waited for there: `exit()` destroys
+  the library's statics under it, which crashed the worker thread on an NVIDIA
+  Vulkan driver
+  ([llamadart#949](https://github.com/leehack/llamadart/issues/949)). CI
+  reports, without failing, what such an exit does on its Linux runners.
 - **Threads that teardown blocked stay blocked.** A static destructor or
   `atexit` handler of another library that joins one hangs the exit.
 
@@ -277,6 +289,212 @@ GPU computes, so on Metal the test only loads models there and runs the
 scenarios that need a generation on the CPU. It does the same on any machine
 whose default device cannot generate and says so in one line; set
 `SD_REQUIRE_METAL_GENERATION=1` on a Mac to make that a failure instead.
+
+### GPU device memory
+
+```c
+typedef struct {
+    uint64_t total_bytes;
+    uint64_t free_bytes;
+    int32_t type;           // an sd_dart_gpu_device_type
+    char name[64];          // as in sd_list_devices() and sd_ctx_params_t.backend
+    char description[256];
+} sd_dart_gpu_device_memory_t;
+
+int32_t sd_dart_gpu_device_count(void);
+int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memory_t* out);
+```
+
+A caller that refuses a model which does not fit needs the memory of the GPU
+the model would load on, before it loads it. Upstream's API has no such
+figure, and host memory is the wrong one for a discrete GPU.
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_gpu_device_count` | Number of GPU devices, discrete and integrated, or `SD_DART_GPU_NO_BACKEND`. They are numbered from 0 in the order `sd_list_devices` lists them, which has other devices, such as the CPU, in between. |
+| `sd_dart_gpu_device_memory` | Writes the memory, type, name and description of a device to `out` and returns `SD_DART_GPU_OK`. `SD_DART_GPU_DEFAULT_DEVICE` (-1) is the device a context without a `backend` uses: the first discrete GPU, or else the first integrated one; upstream's `SD_VK_DEVICE` environment variable is not read. Any other status leaves `out` as it was. Each call asks the device again. |
+
+| Status | Value | Meaning |
+| --- | --- | --- |
+| `SD_DART_GPU_OK` | 0 | |
+| `SD_DART_GPU_INVALID_ARGUMENT` | -1 | A null `out`, or a negative index other than the default device. |
+| `SD_DART_GPU_NO_BACKEND` | -2 | The library was built without a GPU backend, as the CPU targets are. |
+| `SD_DART_GPU_NO_DEVICE` | -3 | The library has a GPU backend, but no such device: none was found, or the index is past the last one. |
+| `SD_DART_GPU_UNAVAILABLE` | -4 | The device is there, but the backend reports a total of 0 or failed to answer. |
+
+The figures are ggml's (`ggml_backend_dev_memory`), the ones
+stable-diffusion.cpp's own automatic fit works with:
+
+| Device | `total_bytes` | `free_bytes` |
+| --- | --- | --- |
+| Vulkan, discrete (`SD_DART_GPU_DEVICE_DISCRETE`) | The heaps flagged device-local, added up. | With `VK_EXT_memory_budget`, the budget of those heaps less what this process uses of them: the driver's estimate of what the process can still allocate, which reflects other processes. Without the extension, the heap sizes, so `free_bytes == total_bytes`. |
+| Vulkan, integrated (`SD_DART_GPU_DEVICE_INTEGRATED`) | Every heap, added up. | The same, over every heap. |
+| Metal (`SD_DART_GPU_DEVICE_DISCRETE`) | `recommendedMaxWorkingSetSize` | That less `currentAllocatedSize`, which counts this process only. |
+
+- **Integrated GPUs share host memory.** Their heaps are system memory, and a
+  driver that exposes it as more than one heap counts it more than once, so
+  the host's available memory is a second limit there. Apple GPUs report as
+  discrete although their memory is unified: the working set is a share of
+  physical memory, 51.8 of 64 GiB on an M4 Max.
+- **Never more free than total, never a wrapped value.** ggml-vulkan subtracts
+  use from budget per heap in unsigned arithmetic. Use above the budget reads
+  as 0 free bytes here.
+- **`free_bytes` is what is free now, not what is left once the loaded
+  contexts are in use.** stable-diffusion.cpp moves a context's weights to the
+  device when they are first used, unless `sd_ctx_params_t.eager_load` is set.
+  Measured with SDXS on Metal:
+
+  | `eager_load` | After `sd_dart_new_sd_ctx` | After the first generation | After `sd_dart_exit_free` |
+  | --- | --- | --- | --- |
+  | `false`, the default | unchanged | -650 MiB | restored |
+  | `true` | -652 MiB | -652 MiB | restored |
+
+  What a generation computes in is allocated while it runs. Upstream's API
+  reports neither what a context will take nor what it holds, and the wrapper
+  adds no such figure: a caller that admits a second model against
+  `free_bytes` sets `eager_load`, or keeps count of what it has loaded.
+- **No context and no model, but the first call initializes the devices.** It
+  registers ggml's backends, as `sd_list_devices` does. On Vulkan that creates
+  the instance. On Metal it compiles the shader libraries: about 50 ms when
+  the system has them cached, 16 s on an M4 Max and 27 to 45 s in five runs
+  on GitHub's macOS runners when it had not. Make the first call on a thread
+  that may wait that long, never on a UI thread; it can also outlast the 15 s
+  that exit teardown waits for it. A later call takes about a microsecond.
+- **The default device ignores `SD_VK_DEVICE`.** Upstream uses the Vulkan
+  device of that number for a context without a `backend`, and falls back
+  when the device does not initialize, which a query cannot know without
+  initializing it. A caller that sets the variable asks for that device by
+  its index.
+- **Any thread, any time before teardown.** [Exit teardown](#exit-teardown)
+  waits for a query in flight, also when nothing is tracked, with the bound
+  of a load (15 s by default), and a query blocks after teardown. Past the
+  bound the exit goes on under the query, as it would without the registry.
+- **Whether `free_bytes` is a live figure is not reported.** On Vulkan that
+  depends on `VK_EXT_memory_budget`, which ggml checks without exposing the
+  result. Without it the check a caller makes is against the device's size.
+
+`tests/test_device_memory.py` runs the exports against a stand-in for ggml's
+device registry, and `tools/smoke_test.py` compares them with `sd_list_devices`
+on each built runtime: CI does that on Mesa lavapipe for Vulkan, on the macOS
+runners' virtual GPU for Metal, and on the CPU targets for
+`SD_DART_GPU_NO_BACKEND`. No hardware Vulkan device was tried.
+
+### Log forwarding
+
+```c
+void sd_dart_log_enable(void);
+void sd_dart_log_set_level(int32_t level);
+uint64_t sd_dart_log_read(uint64_t after, char* text, size_t capacity,
+                          int32_t* level, size_t* length);
+uint64_t sd_dart_log_dropped(void);
+size_t sd_dart_last_error(char* text, size_t capacity);
+```
+
+Upstream's `sd_set_log_callback` calls back on whichever thread logs, the
+model loader's own threads among them, with a text that is only valid during
+the call. A managed runtime cannot take that call, for the reasons given for
+progress above. Without a callback the messages go nowhere, and a load that
+fails returns `NULL` and nothing else. So the library copies each message into
+a buffer of its own, and the caller reads the messages whenever it likes.
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_log_enable` | Records log messages for every later call in the process, ggml's included. Idempotent; when it returns the recorder is registered. |
+| `sd_dart_log_set_level` | The lowest `sd_log_level_t` recorded, `SD_LOG_INFO` by default; `SD_LOG_ERROR + 1` records nothing. A message below the level gets no sequence. |
+| `sd_dart_log_read` | Copies the oldest message with a sequence greater than `after` into `text`, at most `capacity` - 1 bytes and a NUL, and returns its sequence, or 0 if there is none. `level` and `length`, if not `NULL`, receive its `sd_log_level_t` and the bytes of the whole text. Removes nothing. |
+| `sd_dart_log_dropped` | Number of messages that left the buffer newer than every message a read had returned by then. |
+| `sd_dart_last_error` | Copies the `SD_LOG_ERROR` messages recorded, by any thread, while the calling thread's most recent `sd_dart_new_sd_ctx` or `sd_dart_generate_image` ran, joined by `\n`, and returns the bytes of the whole text: 0 when that call logged no error. |
+
+A message is the text upstream passes to its callback, without the line break
+at its end: `<file>:<line> - <text>` for stable-diffusion.cpp and
+`ggml - <text>` for ggml. For a model file that does not exist,
+`sd_dart_last_error` returns:
+
+```text
+model_loader_files.cpp:25   - cannot inspect model source '/models/missing.gguf': No such file or directory
+diffusion_engine.cpp:727  - init model loader from file failed: '/models/missing.gguf'
+diffusion_engine.cpp:992  - get sd version from file failed: '/models/missing.gguf'
+```
+
+What is guaranteed:
+
+- **Nothing changes for a process that does not enable it.** Messages are
+  dropped as before, and ggml prints its own to stderr until the first
+  context exists.
+- **Every message, in order, with its level.** Messages are numbered from 1 in
+  the order they were recorded, by whichever thread, and each is whole. A
+  buffer of `SD_DART_LOG_TEXT_SIZE` (4096) bytes holds any of them; upstream's
+  longer ones are cut to fit, between two UTF-8 sequences.
+- **Bounded memory.** The library keeps the most recent messages that fit in
+  256 KiB, about 2500 lines of 100 bytes, and the 32 most recent errors of up
+  to 511 bytes: 272 KiB of zero-filled memory, used only once enabled. A load
+  of SDXS logs 42 messages at `SD_LOG_INFO` (3.3 KB) and 74 at `SD_LOG_DEBUG`.
+- **Overflow is visible.** When the message after `after` is gone, the
+  sequence returned is not `after + 1`, which tells a reader how many it
+  missed, and `sd_dart_log_dropped` counts them. For a caller that never reads,
+  that count is everything that left the buffer.
+- **The logging thread allocates nothing and waits for nothing but one copy.**
+  The buffer is held for the copy of a single message, by a reader as by a
+  writer, and the errors that `sd_dart_last_error` returns are behind a flag
+  of their own, so a failed call's reason never waits behind the other
+  messages or their reader. A thread waits at most 100 ms for either: longer
+  than that only a holder takes that the scheduler keeps off its processor,
+  or one that died, as `ExitProcess` ends threads on Windows. A logging
+  thread then loses its message, which `sd_dart_log_dropped` counts, and the
+  ones after it do not wait.
+- **Texts are cut between two UTF-8 sequences**, by the library's limits and
+  by the caller's `capacity` alike.
+- **Nothing to undo, and valid during exit.** No call is needed when the
+  caller goes away. The state is never destroyed, so logging and reading stay
+  valid while `exit()` runs, during exit teardown and after it; reading and
+  `sd_dart_last_error` never block after teardown.
+
+What is not:
+
+- **A copy on stderr.** Once enabled, nothing recorded is printed, also not
+  what ggml used to print before the first context existed, such as the lines
+  of Metal's device initialization. A caller that wants the messages on stderr
+  prints what it reads. What a ggml backend writes to stderr itself, not
+  through ggml's log, still goes there.
+- **Which call a message belongs to.** Messages are process-wide, as upstream's
+  callback is. `sd_dart_last_error` narrows that down by time only: it includes
+  the errors that another thread's call logged while this one ran.
+- **A reason for every failure.** It is what upstream logged at `SD_LOG_ERROR`.
+  A file in the wrong role, such as a full model given as the only VAE, gets
+  one line, `get sd version from file failed: ''`. An empty last error does
+  not prove that nothing was logged either: an error whose thread could not
+  get the errors' flag within 100 ms is not kept there.
+- **A last error on another thread.** It belongs to the thread that made the
+  call: read it there, before that thread's next load or generation. A Dart
+  isolate stays on its thread between two native calls that no asynchronous
+  gap separates.
+- **A registration that survives `sd_set_log_callback`.** The first
+  `sd_dart_log_enable` call registers the recorder there and with ggml's log.
+  Neither is synchronized, so make the call before another thread starts a
+  load, a generation or a device query (`sd_list_devices`,
+  `sd_dart_gpu_device_count`, `sd_dart_gpu_device_memory`), which logs through
+  ggml for as long as it runs. A later `sd_set_log_callback` call replaces the
+  recorder, and `sd_dart_log_enable` does not register it again.
+
+To follow the log, read on a timer and once more when a call has returned:
+
+```c
+char text[SD_DART_LOG_TEXT_SIZE];
+int32_t level;
+uint64_t next;
+while ((next = sd_dart_log_read(after, text, sizeof(text), &level, NULL)) != 0) {
+    /* next - after - 1 messages were lost if next != after + 1 */
+    after = next;
+}
+```
+
+`tests/test_log.py` runs the recorder against stand-ins for upstream and ggml,
+also under AddressSanitizer and ThreadSanitizer: messages from several threads
+at once, overflow, and logging and reading while `exit()` runs.
+`tests/test_exit_teardown.py` and `tests/test_exit_teardown_runtime.py` add a
+load that fails for three reasons, a recorder that is read through exit
+teardown, and a Dart VM that polls it while worker isolates are killed.
+`tools/smoke_test.py` loads a missing model file on each built runtime.
 
 ## Build
 

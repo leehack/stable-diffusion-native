@@ -18,9 +18,17 @@ Guidance for coding agents working in `stable-diffusion-native`.
   or deadlocks VM shutdown. Record state natively and let the caller poll.
   Wrapper state has no destructor; threads still use it while `exit()` runs.
   The one wait is exit teardown's, which is bounded and frees nothing when it
-  runs out: 15 s while a load or a generation is in flight, 2 s for any other
-  call, so quitting during a large generation can delay the exit by up to
-  15 s.
+  runs out: 15 s while a load, a generation or a device query is in flight,
+  2 s for any other call, so quitting during a large generation can delay the
+  exit by up to 15 s.
+- An export that reads the library's statics without a tracked object, as a
+  device query reads ggml's registry, is an `SdDartStaticsCall`: teardown
+  returns at once when nothing is tracked, unless such a call is in flight.
+- What the library runs inside upstream's log or progress callback allocates
+  nothing, never reaches the exit registry and holds its flag only for the
+  copy of one record: it runs on upstream's threads until the process is gone.
+  The log recorder also gives up on a flag whose holder died, as `ExitProcess`
+  lets one on Windows, because whatever is destroyed afterwards may still log.
 - Whatever a Dart caller does to a tracked object begins and ends in one
   native call: tracking in the call that creates it, untracking in the call
   that frees it, and a call in flight around anything that can outlast the

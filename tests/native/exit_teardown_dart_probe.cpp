@@ -13,8 +13,6 @@
 
 namespace {
 
-void quiet_log(enum sd_log_level_t, const char*, void*) {}
-
 // Whether the model holds its TAESD decoder itself, as the one
 // exit_teardown_runtime_test writes does.
 bool holds_taesd(const char* model) {
@@ -30,10 +28,12 @@ bool holds_taesd(const char* model) {
 
 }  // namespace
 
-// Keeps the runtime off stdout and stderr without a Dart callback, and gives
-// teardown time for a call in flight on a busy machine.
+// Keeps the runtime off stdout and stderr without a Dart callback: the
+// library records its messages and its progress, and the harness reads the
+// messages. Gives teardown time for a call in flight on a busy machine.
 PROBE_API void probe_quiet(void) {
-    sd_set_log_callback(quiet_log, nullptr);
+    sd_dart_log_enable();
+    sd_dart_log_set_level(SD_LOG_DEBUG);
     sd_dart_progress_enable();
     sd_dart_exit_set_wait_ms(120000, 120000);
 }

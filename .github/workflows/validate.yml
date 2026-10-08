@@ -20,8 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The wrapper tests compile against upstream's header.
-          submodules: true
+          # The wrapper tests compile against upstream's and ggml's headers.
+          submodules: recursive
       - run: python3 -m unittest discover -s tests -v
 
   dart-vm:

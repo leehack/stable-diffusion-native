@@ -6,7 +6,9 @@ which checks that a GPU backend initialized rather than silently falling back
 to the CPU.
 
 Also checks the `sd_dart_wrapper.h` progress recorder against real progress,
-which converting a few synthetic tensors reports without needing a model.
+which converting a few synthetic tensors reports without needing a model, and
+that the GPU device memory exports agree with the device list, and that a
+load which fails leaves its reason with the log recorder.
 """
 
 from __future__ import annotations
@@ -25,6 +27,22 @@ from build import BIN_ROOT, TARGETS
 
 PROGRESS_TENSORS = 8
 PROGRESS_MODES = ("upstream", "recorded")
+LOG_TEXT_SIZE = 4096
+LOG_ERROR = 4
+MISSING_MODEL = "missing-model.safetensors"
+
+
+GPU_OK, GPU_NO_BACKEND, GPU_NO_DEVICE, GPU_UNAVAILABLE = 0, -2, -3, -4
+GPU_DEFAULT_DEVICE = -1
+GPU_STATUS_NAMES = {GPU_OK: "OK", -1: "INVALID_ARGUMENT", GPU_NO_BACKEND: "NO_BACKEND",
+                    GPU_NO_DEVICE: "NO_DEVICE", GPU_UNAVAILABLE: "UNAVAILABLE"}
+GPU_DEVICE_TYPES = {1: "discrete", 2: "integrated"}
+
+
+class GpuDeviceMemory(ctypes.Structure):
+    _fields_ = [("total_bytes", ctypes.c_uint64), ("free_bytes", ctypes.c_uint64),
+                ("type", ctypes.c_int32), ("name", ctypes.c_char * 64),
+                ("description", ctypes.c_char * 256)]
 
 
 class Progress(ctypes.Structure):
@@ -109,9 +127,173 @@ def check_progress_recording(library: Path) -> list[str]:
     return problems
 
 
+def run_log_probe(library: str, mode: str, work_dir: str) -> None:
+    """Loads a model file that does not exist, with the recorder enabled if `mode` says.
+
+    Runs in a child process, as the recorder stays enabled. Writes what the
+    load returned, the last error and every message to `log.json`.
+    """
+    lib = ctypes.CDLL(library)
+    lib.sd_dart_log_enable.restype = None
+    lib.sd_dart_log_read.restype = ctypes.c_uint64
+    lib.sd_dart_log_read.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t,
+                                     ctypes.POINTER(ctypes.c_int32),
+                                     ctypes.POINTER(ctypes.c_size_t)]
+    lib.sd_dart_log_dropped.restype = ctypes.c_uint64
+    lib.sd_dart_last_error.restype = ctypes.c_size_t
+    lib.sd_dart_last_error.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+    lib.sd_dart_new_sd_ctx.restype = ctypes.c_void_p
+    lib.sd_dart_new_sd_ctx.argtypes = [ctypes.c_void_p]
+    lib.sd_ctx_params_init.argtypes = [ctypes.c_void_p]
+
+    if mode == "recorded":
+        lib.sd_dart_log_enable()
+        lib.sd_dart_log_enable()
+    # More than an sd_ctx_params_t takes, whose first member is `model_path`.
+    params = ctypes.create_string_buffer(1 << 16)
+    lib.sd_ctx_params_init(params)
+    model = ctypes.c_char_p(os.fsencode(Path(work_dir) / MISSING_MODEL))
+    ctypes.memmove(params, ctypes.byref(model), ctypes.sizeof(model))
+    context = lib.sd_dart_new_sd_ctx(params)
+
+    text = ctypes.create_string_buffer(LOG_TEXT_SIZE)
+    error_length = lib.sd_dart_last_error(text, len(text))
+    error = text.value.decode(errors="replace")
+    messages, after = [], 0
+    level, length = ctypes.c_int32(), ctypes.c_size_t()
+    while sequence := lib.sd_dart_log_read(after, text, len(text), ctypes.byref(level),
+                                           ctypes.byref(length)):
+        messages.append([sequence, level.value, length.value, text.value.decode(errors="replace")])
+        after = sequence
+    (Path(work_dir) / "log.json").write_text(json.dumps({
+        "loaded": context is not None, "error": error, "errorLength": error_length,
+        "messages": messages, "dropped": lib.sd_dart_log_dropped()}))
+
+
+def check_log_recording(library: Path) -> list[str]:
+    problems: list[str] = []
+    for mode in PROGRESS_MODES:
+        with tempfile.TemporaryDirectory() as work_dir:
+            child = subprocess.run(
+                [sys.executable, __file__, "--log-probe", mode, str(library), work_dir],
+                stdout=subprocess.PIPE)
+            result_path = Path(work_dir) / "log.json"
+            if child.returncode != 0 or not result_path.is_file():
+                problems.append(f"log probe {mode} exited with {child.returncode}")
+                continue
+            result = json.loads(result_path.read_text())
+        error, messages = result["error"], result["messages"]
+        if result["loaded"]:
+            problems.append(f"log probe {mode} loaded a model that does not exist")
+        if mode == "upstream":
+            # Without the recorder nothing is kept.
+            if error or messages or result["dropped"]:
+                problems.append(f"log probe {mode} recorded {error!r} and {messages}")
+            continue
+        errors = [text for _, level, _, text in messages if level == LOG_ERROR]
+        if not errors or error != "\n".join(errors) or MISSING_MODEL not in error:
+            problems.append(f"log probe {mode} reports {error!r} for a missing model file, "
+                            f"and logged the errors {errors}")
+        if result["errorLength"] != len(error.encode()):
+            problems.append(f"log probe {mode} returned {result['errorLength']} "
+                            f"for an error of {len(error.encode())} bytes")
+        if ([sequence for sequence, *_ in messages] != list(range(1, len(messages) + 1))
+                or any(length != len(text.encode()) or text.endswith("\n")
+                       for _, _, length, text in messages) or result["dropped"]):
+            problems.append(f"log probe {mode} read {messages}, "
+                            f"with {result['dropped']} dropped")
+        if not problems:
+            print(f"  load error: {error.splitlines()[0]}")
+    return problems
+
+
+def host_memory() -> int:
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
+def check_gpu_device_memory(lib: ctypes.CDLL, has_gpu_backend: bool, listed: list[str],
+                            expected: list[str]) -> list[str]:
+    """Compares the GPU memory exports with `listed`, the names of `sd_list_devices`.
+
+    `expected` are the device name prefixes the caller requires: a GPU among
+    them must report its memory.
+    """
+    lib.sd_dart_gpu_device_count.restype = ctypes.c_int32
+    lib.sd_dart_gpu_device_memory.restype = ctypes.c_int32
+    lib.sd_dart_gpu_device_memory.argtypes = [ctypes.c_int32, ctypes.POINTER(GpuDeviceMemory)]
+
+    def query(index: int) -> tuple[int, GpuDeviceMemory]:
+        memory = GpuDeviceMemory()
+        return lib.sd_dart_gpu_device_memory(index, ctypes.byref(memory)), memory
+
+    def status_name(status: int) -> str:
+        return GPU_STATUS_NAMES.get(status, str(status))
+
+    problems: list[str] = []
+    count = lib.sd_dart_gpu_device_count()
+    default_status, default = query(GPU_DEFAULT_DEVICE)
+    if not has_gpu_backend:
+        if (count, default_status) != (GPU_NO_BACKEND, GPU_NO_BACKEND):
+            problems.append(f"a build without a GPU backend reported {count} GPU devices and "
+                            f"{status_name(default_status)} for the default one")
+        print("  gpu memory: no GPU backend in this build")
+        return problems
+    if lib.sd_dart_gpu_device_memory(0, None) != -1:
+        problems.append("a null result struct was not refused")
+    if count < 0:
+        problems.append(f"the GPU device count is {status_name(count)}")
+        return problems
+    if query(count)[0] != GPU_NO_DEVICE:
+        problems.append(f"device {count}, past the last one, is not NO_DEVICE")
+    names = []
+    for index in range(count):
+        status, memory = query(index)
+        if status == GPU_UNAVAILABLE:
+            print(f"  gpu memory: device {index} reports none")
+            continue
+        if status != GPU_OK:
+            problems.append(f"device {index} returned {status_name(status)}")
+            continue
+        name = memory.name.decode()
+        names.append(name)
+        print(f"  gpu memory: {name} ({GPU_DEVICE_TYPES.get(memory.type, memory.type)}, "
+              f"{memory.description.decode()}): {memory.free_bytes / 2**20:.0f} MiB free of "
+              f"{memory.total_bytes / 2**20:.0f} MiB")
+        if memory.type not in GPU_DEVICE_TYPES:
+            problems.append(f"{name} has type {memory.type}")
+        if not 0 < memory.total_bytes < 2**50 or memory.free_bytes > memory.total_bytes:
+            problems.append(f"{name} reports {memory.free_bytes} bytes free of "
+                            f"{memory.total_bytes}")
+        # Metal's working set is a share of the host's memory.
+        if name.startswith("MTL") and memory.total_bytes > host_memory():
+            problems.append(f"{name} reports more memory than the host has")
+    # GPU devices keep the order of the list, which has other devices between.
+    remaining = iter(listed)
+    if not all(name in remaining for name in names):
+        problems.append(f"GPU devices {names} are not in sd_list_devices order: {listed}")
+    if count == 0:
+        if default_status != GPU_NO_DEVICE:
+            problems.append(f"no GPU device, but the default one is "
+                            f"{status_name(default_status)}")
+        print("  gpu memory: no GPU device")
+    elif default_status == GPU_OK and default.name.decode() not in names:
+        problems.append(f"the default device {default.name.decode()} is not among {names}")
+    elif default_status not in (GPU_OK, GPU_UNAVAILABLE):
+        problems.append(f"the default device returned {status_name(default_status)}")
+    for prefix in expected:
+        if prefix.lower() == "cpu":
+            continue
+        if not any(name.lower().startswith(prefix.lower()) for name in names):
+            problems.append(f"no {prefix} device reports its memory")
+    return problems
+
+
 def main() -> None:
     if len(sys.argv) == 5 and sys.argv[1] == "--progress-probe":
         run_progress_probe(sys.argv[3], sys.argv[2], sys.argv[4])
+        return
+    if len(sys.argv) == 5 and sys.argv[1] == "--log-probe":
+        run_log_probe(sys.argv[3], sys.argv[2], sys.argv[4])
         return
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -141,12 +323,16 @@ def main() -> None:
         print(f"error: no device starting with {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
-    problems = check_progress_recording(library)
+    problems = check_gpu_device_memory(
+        lib, any(a != "cpu" for a in target.accelerators),
+        [device.split("\t")[0] for device in devices], args.expect_device)
+    problems += check_progress_recording(library)
+    problems += check_log_recording(library)
     for problem in problems:
         print(f"error: {problem}", file=sys.stderr)
     if problems:
         sys.exit(1)
-    print("  progress recording ok")
+    print("  progress and log recording ok")
 
 
 if __name__ == "__main__":

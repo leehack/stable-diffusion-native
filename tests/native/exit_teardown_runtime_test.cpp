@@ -11,8 +11,10 @@
 //
 // The other scenarios each run in their own process, as teardown runs once
 // per process, and most of them leave by returning from main: on Apple
-// platforms teardown then runs during exit(). Elsewhere it does not, and only
+// platforms teardown then runs during exit(). Elsewhere it does not, and
 // `idle-untracked` applies: a context that is alive at exit must not abort.
+// `exit-in-generation` and `exit-in-load` show what exit() does there to a
+// call in flight that nothing waits for.
 //
 // `generate` only loads, generates and frees, to tell whether the backend can
 // compute on this machine at all. Where it cannot, SD_EXIT_TEARDOWN_LOAD_ONLY
@@ -541,6 +543,166 @@ int test_late_load(const char* model, const char* backend) {
     return 0;
 }
 
+std::atomic<bool> call_began{false};
+
+// A log callback that still works while exit() destroys this program's own
+// statics, which collect_log() uses.
+void note_log(enum sd_log_level_t, const char*, void*) {
+    call_began.store(true);
+}
+
+// Returns from main while another thread generates. Where teardown runs at
+// exit it waits for the generation; elsewhere exit() destroys the library's
+// statics under it.
+int test_exit_in_generation(const char* model, const char* backend) {
+    static sd_ctx_t* context = load(model, backend);
+    sd_set_log_callback(note_log, nullptr);
+    call_began.store(false);
+    on_progress.store([](int) { call_began.store(true); });
+    std::thread([] {
+        for (;;) {
+            generate(context, 40);
+        }
+    }).detach();
+    while (!call_began.load()) {
+        sleep_ms(1);
+    }
+    std::printf("generating on %s\n", backend);
+    std::fflush(stdout);
+    return 0;
+}
+
+// The same for a load.
+int test_exit_in_load(const char* model, const char* backend) {
+    static const char* load_model   = model;
+    static const char* load_backend = backend;
+    sd_set_log_callback(note_log, nullptr);
+    std::thread([] {
+        for (;;) {
+            sd_dart_exit_free(load(load_model, load_backend));
+        }
+    }).detach();
+    while (!call_began.load()) {
+        sleep_ms(1);
+    }
+    std::printf("loading on %s\n", backend);
+    std::fflush(stdout);
+    return 0;
+}
+
+std::atomic<int> device_queries{0};
+
+// Returns from main while threads query the device memory and nothing is
+// tracked. Teardown still waits for the queries: they read ggml's device
+// registry, which exit() destroys.
+int test_query_quit() {
+    for (int i = 0; i < 4; ++i) {
+        std::thread([] {
+            sd_dart_gpu_device_memory_t memory;
+            for (;;) {
+                sd_dart_gpu_device_memory(SD_DART_GPU_DEFAULT_DEVICE, &memory);
+                device_queries.fetch_add(1);
+            }
+        }).detach();
+    }
+    while (device_queries.load() < 1000) {
+        sleep_ms(1);
+    }
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
+std::string last_error() {
+    char text[SD_DART_LOG_TEXT_SIZE];
+    const size_t length = sd_dart_last_error(text, sizeof(text));
+    CHECK(length < sizeof(text) && std::strlen(text) == length);
+    return text;
+}
+
+// Reads on from `after` and returns the sequence of the newest message.
+uint64_t read_log(uint64_t after) {
+    char text[SD_DART_LOG_TEXT_SIZE];
+    int32_t level = -1;
+    size_t length = 0;
+    for (uint64_t next = 0; (next = sd_dart_log_read(after, text, sizeof(text), &level, &length)) != 0;) {
+        CHECK(next > after && level >= SD_LOG_DEBUG && level <= SD_LOG_ERROR);
+        CHECK(length > 0 && std::strlen(text) == length && text[length - 1] != '\n');
+        after = next;
+    }
+    return after;
+}
+
+std::atomic<uint64_t> logged_before_exit{0};
+
+// A load that fails leaves upstream's reason with the recorder, and the
+// recorder goes on working while exit teardown frees a context: a thread
+// reads it for as long as the process lives, and the thread that ran
+// teardown reads what the free logged.
+int test_log(const char* model, const char* backend) {
+    sd_dart_log_enable();
+    sd_dart_log_set_level(SD_LOG_DEBUG);
+    const bool taesd = holds_taesd(model);
+
+    const std::string missing    = std::string(model) + ".missing";
+    const sd_ctx_params_t absent = context_params(missing.c_str(), backend, false);
+    CHECK(sd_dart_new_sd_ctx(&absent) == nullptr);
+    const std::string no_file = last_error();
+    CHECK(no_file.find(missing) != std::string::npos);
+
+    // The first megabyte of the model: its header names tensors that the
+    // file no longer holds.
+    const std::string truncated = std::string(model) + ".truncated";
+    {
+        std::string start(1 << 20, '\0');
+        FILE* source = std::fopen(model, "rb");
+        CHECK(source != nullptr);
+        start.resize(std::fread(&start[0], 1, start.size(), source));
+        std::fclose(source);
+        FILE* copy = std::fopen(truncated.c_str(), "wb");
+        CHECK(copy != nullptr && std::fwrite(start.data(), 1, start.size(), copy) == start.size());
+        CHECK(std::fclose(copy) == 0);
+    }
+    const sd_ctx_params_t cut = context_params(truncated.c_str(), backend, taesd);
+    CHECK(sd_dart_new_sd_ctx(&cut) == nullptr);
+    const std::string cut_file = last_error();
+    std::remove(truncated.c_str());
+    CHECK(!cut_file.empty() && cut_file != no_file && cut_file.find(missing) == std::string::npos);
+
+    // The model in the place of a VAE, with nothing to denoise.
+    sd_ctx_params_t wrong_role = context_params(model, backend, false);
+    wrong_role.model_path      = nullptr;
+    wrong_role.vae_path        = model;
+    CHECK(sd_dart_new_sd_ctx(&wrong_role) == nullptr);
+    const std::string wrong_file = last_error();
+    CHECK(!wrong_file.empty() && wrong_file != cut_file);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    std::printf("missing file: %s\ntruncated file: %s\nwrong role: %s\n", no_file.c_str(), cut_file.c_str(),
+                wrong_file.c_str());
+
+    witness.failure.store([]() -> const char* {
+        const uint64_t before = logged_before_exit.load();
+        const uint64_t after  = read_log(before);
+        std::printf("%llu messages during exit teardown\n", static_cast<unsigned long long>(after - before));
+        std::fflush(stdout);
+        last_error();
+        return before == 0 ? "no message was recorded before the exit" : nullptr;
+    });
+    expect_teardown_at_exit(1);
+    std::thread([] {
+        for (uint64_t after = 0;;) {
+            after = read_log(after);
+            sleep_ms(1);
+        }
+    }).detach();
+    sd_ctx_t* context = load(model, backend);
+    CHECK(load_only || generate(context, 2) == 1);
+    witness.engine.store(engine_of(context));
+    expect_contexts_freed_first();
+    logged_before_exit.store(read_log(0));
+    CHECK(sd_dart_log_dropped() == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -584,6 +746,18 @@ int main(int argc, char** argv) {
         }
         if (scenario == "late-load") {
             return test_late_load(model, backend);
+        }
+        if (scenario == "log") {
+            return test_log(model, backend);
+        }
+        if (scenario == "query-quit") {
+            return test_query_quit();
+        }
+        if (scenario == "exit-in-generation") {
+            return test_exit_in_generation(model, backend);
+        }
+        if (scenario == "exit-in-load") {
+            return test_exit_in_load(model, backend);
         }
     }
     std::fprintf(stderr, "usage: %s make-model <model> | <scenario> <model> <backend>|default [<size>]\n", argv[0]);
