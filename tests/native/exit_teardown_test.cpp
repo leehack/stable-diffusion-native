@@ -6,6 +6,9 @@
 
 #include "sd_dart_wrapper.h"
 
+#include "ggml.h"
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -96,6 +99,25 @@ const bool kTeardownRunsAtExit = true;
 #else
 const bool kTeardownRunsAtExit = false;
 #endif
+
+// The stand-in for upstream's log: nothing without a callback, and a text
+// that is gone when the callback returns.
+std::atomic<sd_log_cb_t> log_callback{nullptr};
+
+void upstream_log(enum sd_log_level_t level, const std::string& text) {
+    if (sd_log_cb_t callback = log_callback.load()) {
+        std::string passed = text + "\n";
+        callback(level, passed.c_str(), nullptr);
+        std::fill(passed.begin(), passed.end(), '#');
+    }
+}
+
+std::string last_error() {
+    char text[1024];
+    const size_t length = sd_dart_last_error(text, sizeof(text));
+    CHECK(length < sizeof(text) && std::strlen(text) == length);
+    return text;
+}
 
 // What the stand-ins do, set by the scenario before it calls a wrapper.
 std::atomic<bool> fail_load{false};
@@ -1010,7 +1032,127 @@ int test_generate_in_flight() {
     return 0;
 }
 
+// A call that fails leaves the reason upstream logged for it with the thread
+// that made the call, once the recorder is enabled.
+int test_last_error() {
+    sd_ctx_params_t params{};
+    sd_img_gen_params_t request{};
+    fail_load.store(true);
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    CHECK(last_error().empty());
+
+    sd_dart_log_enable();
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    const std::string reason = "model_loader.cpp:1 - tensor 'x' not in model metadata\n"
+                               "diffusion_engine.cpp:2 - new_sd_ctx_t failed";
+    CHECK(last_error() == reason);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    // Another thread's call has its own.
+    std::thread([&] {
+        CHECK(last_error().empty());
+        fail_load.store(false);
+        sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+        CHECK(context != nullptr && last_error().empty());
+        sd_dart_exit_free(context);
+    }).join();
+    CHECK(last_error() == reason);
+
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    CHECK(context != nullptr && last_error().empty());
+    run_generation.store([](sd_ctx_t*) { return false; });
+    CHECK(!sd_dart_generate_image(context, &request, nullptr, nullptr));
+    CHECK(last_error() == "diffusion_engine.cpp:3 - generate_image failed");
+    run_generation.store(nullptr);
+    CHECK(sd_dart_generate_image(context, &request, nullptr, nullptr));
+    CHECK(last_error().empty());
+    // A call that is not a load or a generation leaves it alone.
+    run_generation.store([](sd_ctx_t*) { return false; });
+    CHECK(!sd_dart_generate_image(context, &request, nullptr, nullptr));
+    sd_dart_exit_free(context);
+    CHECK(last_error() == "diffusion_engine.cpp:3 - generate_image failed");
+
+    // The messages themselves are there to read, the free's among them.
+    std::vector<std::string> messages;
+    char text[SD_DART_LOG_TEXT_SIZE];
+    int32_t level = -1;
+    for (uint64_t after = 0; (after = sd_dart_log_read(after, text, sizeof(text), &level, nullptr)) != 0;) {
+        CHECK(messages.size() + 1 == after);
+        messages.push_back(std::to_string(level) + " " + text);
+    }
+    CHECK(messages.size() == 6);
+    CHECK(messages[0] == "4 model_loader.cpp:1 - tensor 'x' not in model metadata");
+    CHECK(messages[2] == "2 diffusion_engine.cpp:4 - free_sd_ctx");
+    CHECK(messages[5] == "2 diffusion_engine.cpp:4 - free_sd_ctx");
+    sd_dart_exit_teardown();
+    return 0;
+}
+
+std::atomic<bool> log_thread_started{false};
+
+void expect_teardown_logged() {
+    // After teardown, on the thread that ran it: reading still works, and
+    // what the free of the tracked context logged during teardown is there.
+    bool freed = false;
+    char text[SD_DART_LOG_TEXT_SIZE];
+    uint64_t after = 0;
+    for (uint64_t next = 0; (next = sd_dart_log_read(after, text, sizeof(text), nullptr, nullptr)) != 0;) {
+        after = next;
+        freed = freed || std::strcmp(text, "diffusion_engine.cpp:4 - free_sd_ctx") == 0;
+    }
+    if (after == 0 || freed != kTeardownRunsAtExit || (contexts_freed.load() == 1) != kTeardownRunsAtExit) {
+        std::fprintf(stderr, "read %llu messages after teardown, the free's %s among them\n",
+                     static_cast<unsigned long long>(after), freed ? "is" : "is not");
+        std::_Exit(1);
+    }
+    last_error();
+    sd_dart_log_dropped();
+}
+
+// The process exits with the recorder enabled, a tracked context that logs
+// when teardown frees it, and threads that go on logging and reading through
+// teardown and whatever exit() does after it.
+int test_log_at_exit() {
+    // Registered first, so it runs after the teardown registered by tracking.
+    CHECK(atexit(expect_teardown_logged) == 0);
+    sd_dart_log_enable();
+    sd_dart_log_set_level(SD_LOG_DEBUG);
+    for (int i = 0; i < 2; ++i) {
+        std::thread([] {
+            for (uint64_t n = 0;; ++n) {
+                // Short, so that the free's message is still in the buffer
+                // when the check reads it.
+                upstream_log(n % 5 == 0 ? SD_LOG_ERROR : SD_LOG_DEBUG, "w");
+                log_thread_started.store(true);
+                if (n % 8 == 0) {
+                    sleep_ms(1);
+                }
+            }
+        }).detach();
+    }
+    std::thread([] {
+        char text[SD_DART_LOG_TEXT_SIZE];
+        for (uint64_t after = 0;;) {
+            const uint64_t next = sd_dart_log_read(after, text, sizeof(text), nullptr, nullptr);
+            after               = next != 0 ? next : after;
+            last_error();
+        }
+    }).detach();
+    while (!log_thread_started.load()) {
+        sleep_ms(1);
+    }
+    sd_ctx_params_t params{};
+    CHECK(sd_dart_new_sd_ctx(&params) != nullptr);
+    return 0;
+}
+
 }  // namespace
+
+void sd_set_log_callback(sd_log_cb_t callback, void*) {
+    log_callback.store(callback);
+}
+
+void ggml_log_set(ggml_log_callback, void*) {
+}
 
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     loads_begun.fetch_add(1);
@@ -1019,7 +1161,13 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     if (bool (*hold)() = hold_load.load()) {
         hold();
     }
-    return fail_load.load() ? nullptr : new sd_ctx_t();
+    if (fail_load.load()) {
+        // Upstream's loader logs from its own threads.
+        std::thread([] { upstream_log(SD_LOG_ERROR, "model_loader.cpp:1 - tensor 'x' not in model metadata"); }).join();
+        upstream_log(SD_LOG_ERROR, "diffusion_engine.cpp:2 - new_sd_ctx_t failed");
+        return nullptr;
+    }
+    return new sd_ctx_t();
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
@@ -1030,6 +1178,7 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
     }
     contexts_freed.fetch_add(1);
     last_freed.store(sd_ctx);
+    upstream_log(SD_LOG_INFO, "diffusion_engine.cpp:4 - free_sd_ctx");
     delete sd_ctx;
 }
 
@@ -1044,6 +1193,9 @@ bool generate_image(sd_ctx_t* sd_ctx,
     bool ok = true;
     if (bool (*run)(sd_ctx_t*) = run_generation.load()) {
         ok = run(sd_ctx);
+    }
+    if (!ok) {
+        upstream_log(SD_LOG_ERROR, "diffusion_engine.cpp:3 - generate_image failed");
     }
     if (num_images_out != nullptr) {
         *num_images_out = 7;
@@ -1090,6 +1242,8 @@ int main(int argc, char** argv) {
         {"cancel", test_cancel},
         {"load-in-flight", test_load_in_flight},
         {"generate-in-flight", test_generate_in_flight},
+        {"last-error", test_last_error},
+        {"log-at-exit", test_log_at_exit},
     };
     for (const auto& candidate : scenarios) {
         if (scenario == candidate.name) {

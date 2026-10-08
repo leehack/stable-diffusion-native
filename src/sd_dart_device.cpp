@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 
 // Set by the top-level CMakeLists.txt: whether a GPU backend is compiled in.

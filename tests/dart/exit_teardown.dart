@@ -24,6 +24,10 @@
 // with code 0. With api `raw` it calls new_sd_ctx, generate_image and
 // free_sd_ctx: the control, which aborts in ggml-metal where Metal residency
 // sets are live.
+//
+// Either way the library records the runtime's log messages, and the main
+// isolate reads them on a timer for as long as it lives, as a binding does:
+// through the kill of a worker, C exit() and exit teardown.
 import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
@@ -43,6 +47,22 @@ typedef GenerateDart = bool Function(
   Pointer<Pointer<Void>>,
   Pointer<Int>,
 );
+typedef LogReadNative = Uint64 Function(
+  Uint64,
+  Pointer<Void>,
+  Size,
+  Pointer<Int32>,
+  Pointer<Size>,
+);
+typedef LogReadDart = int Function(
+  int,
+  Pointer<Void>,
+  int,
+  Pointer<Int32>,
+  Pointer<Size>,
+);
+
+const logTextSize = 4096;
 
 final class Runtime {
   final Pointer<Void> Function(Pointer<Void>) load;
@@ -52,6 +72,9 @@ final class Runtime {
   final Pointer<Void> generationParams;
   final Pointer<Pointer<Void>> imagesOut;
   final Pointer<Int> countOut;
+  final LogReadDart readLog;
+  final Pointer<Void> logText;
+  int logSequence = 0;
 
   Runtime._(
     this.load,
@@ -61,6 +84,8 @@ final class Runtime {
     this.generationParams,
     this.imagesOut,
     this.countOut,
+    this.readLog,
+    this.logText,
   );
 
   factory Runtime(List<String> arguments) {
@@ -104,7 +129,29 @@ final class Runtime {
       >('probe_generation_params')(40, int.parse(size)),
       malloc(sizeOf<Pointer<Void>>()).cast(),
       malloc(sizeOf<Int>()).cast(),
+      runtime.lookupFunction<LogReadNative, LogReadDart>(
+        'sd_dart_log_read',
+        isLeaf: true,
+      ),
+      malloc(logTextSize),
     );
+  }
+
+  /// Reads the messages recorded since the last call; returns how many.
+  int drainLog() {
+    var count = 0;
+    for (;;) {
+      final next = readLog(logSequence, logText, logTextSize, nullptr, nullptr);
+      if (next == 0) {
+        return count;
+      }
+      if (next <= logSequence) {
+        stderr.writeln('exit teardown: log sequence $next after $logSequence');
+        exit(4);
+      }
+      logSequence = next;
+      count++;
+    }
   }
 
   Pointer<Void> loadContext() {
@@ -145,11 +192,19 @@ void worker((SendPort, List<String>) arguments) {
 
 Future<void> main(List<String> arguments) async {
   final scenario = arguments[3];
+  final runtime = Runtime(arguments);
   if (scenario == 'idle') {
-    final runtime = Runtime(arguments);
     runtime.generateOn(runtime.loadContext());
+    if (runtime.drainLog() == 0) {
+      stderr.writeln('exit teardown: a load and a generation logged nothing');
+      exit(4);
+    }
     return;
   }
+  final logPoll = Timer.periodic(
+    const Duration(milliseconds: 2),
+    (_) => runtime.drainLog(),
+  );
 
   final events = ReceivePort();
   final exited = ReceivePort();
@@ -182,4 +237,10 @@ Future<void> main(List<String> arguments) async {
   isolate.kill(priority: Isolate.immediate);
   await exited.first;
   exited.close();
+  logPoll.cancel();
+  runtime.drainLog();
+  if (runtime.logSequence == 0) {
+    stderr.writeln('exit teardown: the worker logged nothing');
+    exit(4);
+  }
 }

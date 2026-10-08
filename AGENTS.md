@@ -21,6 +21,11 @@ Guidance for coding agents working in `stable-diffusion-native`.
   runs out: 15 s while a load or a generation is in flight, 2 s for any other
   call, so quitting during a large generation can delay the exit by up to
   15 s.
+- What the library runs inside upstream's log or progress callback allocates
+  nothing, never reaches the exit registry and holds its flag only for the
+  copy of one record: it runs on upstream's threads until the process is gone.
+  The log recorder also gives up on a flag whose holder died, as `ExitProcess`
+  lets one on Windows, because whatever is destroyed afterwards may still log.
 - Whatever a Dart caller does to a tracked object begins and ends in one
   native call: tracking in the call that creates it, untracking in the call
   that frees it, and a call in flight around anything that can outlast the

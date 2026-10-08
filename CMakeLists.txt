@@ -22,6 +22,8 @@ add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 target_sources(stable-diffusion PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_device.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_exit.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_internal.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.h")
 

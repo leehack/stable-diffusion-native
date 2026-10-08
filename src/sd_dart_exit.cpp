@@ -1,3 +1,4 @@
+#include "sd_dart_internal.h"
 #include "sd_dart_wrapper.h"
 
 #include <algorithm>
@@ -204,6 +205,15 @@ struct Call {
     bool counted;
 };
 
+// The errors logged between its construction and its destruction are what
+// sd_dart_last_error() reports to this thread.
+struct ErrorWindow {
+    ErrorWindow() { sd_dart_log_call_begin(); }
+    ~ErrorWindow() { sd_dart_log_call_end(); }
+    ErrorWindow(const ErrorWindow&)            = delete;
+    ErrorWindow& operator=(const ErrorWindow&) = delete;
+};
+
 void free_context(void* object) {
     free_sd_ctx(static_cast<sd_ctx_t*>(object));
 }
@@ -376,6 +386,7 @@ void sd_dart_exit_teardown(void) {
 
 sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     Call call(kObjectCall | kWorkCall);
+    ErrorWindow errors;
     sd_ctx_t* context = new_sd_ctx(sd_ctx_params);
     insert(context, free_context, cancel_context, SD_DART_EXIT_STAGE_CONTEXT);
     return context;
@@ -386,6 +397,7 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                             sd_image_t** images_out,
                             int* num_images_out) {
     Call call(kWorkCall);
+    ErrorWindow errors;
     return generate_image(sd_ctx, sd_img_gen_params, images_out, num_images_out);
 }
 

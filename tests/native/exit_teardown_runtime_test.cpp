@@ -541,6 +541,97 @@ int test_late_load(const char* model, const char* backend) {
     return 0;
 }
 
+std::string last_error() {
+    char text[SD_DART_LOG_TEXT_SIZE];
+    const size_t length = sd_dart_last_error(text, sizeof(text));
+    CHECK(length < sizeof(text) && std::strlen(text) == length);
+    return text;
+}
+
+// Reads on from `after` and returns the sequence of the newest message.
+uint64_t read_log(uint64_t after) {
+    char text[SD_DART_LOG_TEXT_SIZE];
+    int32_t level = -1;
+    size_t length = 0;
+    for (uint64_t next = 0; (next = sd_dart_log_read(after, text, sizeof(text), &level, &length)) != 0;) {
+        CHECK(next > after && level >= SD_LOG_DEBUG && level <= SD_LOG_ERROR);
+        CHECK(length > 0 && std::strlen(text) == length && text[length - 1] != '\n');
+        after = next;
+    }
+    return after;
+}
+
+std::atomic<uint64_t> logged_before_exit{0};
+
+// A load that fails leaves upstream's reason with the recorder, and the
+// recorder goes on working while exit teardown frees a context: a thread
+// reads it for as long as the process lives, and the thread that ran
+// teardown reads what the free logged.
+int test_log(const char* model, const char* backend) {
+    sd_dart_log_enable();
+    sd_dart_log_set_level(SD_LOG_DEBUG);
+    const bool taesd = holds_taesd(model);
+
+    const std::string missing    = std::string(model) + ".missing";
+    const sd_ctx_params_t absent = context_params(missing.c_str(), backend, false);
+    CHECK(sd_dart_new_sd_ctx(&absent) == nullptr);
+    const std::string no_file = last_error();
+    CHECK(no_file.find(missing) != std::string::npos);
+
+    // The first megabyte of the model: its header names tensors that the
+    // file no longer holds.
+    const std::string truncated = std::string(model) + ".truncated";
+    {
+        std::string start(1 << 20, '\0');
+        FILE* source = std::fopen(model, "rb");
+        CHECK(source != nullptr);
+        start.resize(std::fread(&start[0], 1, start.size(), source));
+        std::fclose(source);
+        FILE* copy = std::fopen(truncated.c_str(), "wb");
+        CHECK(copy != nullptr && std::fwrite(start.data(), 1, start.size(), copy) == start.size());
+        CHECK(std::fclose(copy) == 0);
+    }
+    const sd_ctx_params_t cut = context_params(truncated.c_str(), backend, taesd);
+    CHECK(sd_dart_new_sd_ctx(&cut) == nullptr);
+    const std::string cut_file = last_error();
+    std::remove(truncated.c_str());
+    CHECK(!cut_file.empty() && cut_file != no_file && cut_file.find(missing) == std::string::npos);
+
+    // The model in the place of a VAE, with nothing to denoise.
+    sd_ctx_params_t wrong_role = context_params(model, backend, false);
+    wrong_role.model_path      = nullptr;
+    wrong_role.vae_path        = model;
+    CHECK(sd_dart_new_sd_ctx(&wrong_role) == nullptr);
+    const std::string wrong_file = last_error();
+    CHECK(!wrong_file.empty() && wrong_file != cut_file);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    std::printf("missing file: %s\ntruncated file: %s\nwrong role: %s\n", no_file.c_str(), cut_file.c_str(),
+                wrong_file.c_str());
+
+    witness.failure.store([]() -> const char* {
+        const uint64_t before = logged_before_exit.load();
+        const uint64_t after  = read_log(before);
+        std::printf("%llu messages during exit teardown\n", static_cast<unsigned long long>(after - before));
+        std::fflush(stdout);
+        last_error();
+        return before == 0 ? "no message was recorded before the exit" : nullptr;
+    });
+    expect_teardown_at_exit(1);
+    std::thread([] {
+        for (uint64_t after = 0;;) {
+            after = read_log(after);
+            sleep_ms(1);
+        }
+    }).detach();
+    sd_ctx_t* context = load(model, backend);
+    CHECK(load_only || generate(context, 2) == 1);
+    witness.engine.store(engine_of(context));
+    expect_contexts_freed_first();
+    logged_before_exit.store(read_log(0));
+    CHECK(sd_dart_log_dropped() == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -584,6 +675,9 @@ int main(int argc, char** argv) {
         }
         if (scenario == "late-load") {
             return test_late_load(model, backend);
+        }
+        if (scenario == "log") {
+            return test_log(model, backend);
         }
     }
     std::fprintf(stderr, "usage: %s make-model <model> | <scenario> <model> <backend>|default [<size>]\n", argv[0]);

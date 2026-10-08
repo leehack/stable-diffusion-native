@@ -60,7 +60,8 @@ SANITIZER = os.environ.get("SD_EXIT_TEARDOWN_SANITIZER", "")
 RUNS = int(os.environ.get("SD_EXIT_TEARDOWN_RUNS", "1"))
 REAL_MODEL = os.environ.get("SD_EXIT_TEARDOWN_MODEL", "")
 REAL_MODEL_SIZE = os.environ.get("SD_EXIT_TEARDOWN_MODEL_SIZE", "256")
-SCENARIOS = ("idle", "dispose", "free-quit", "cancel", "generate-wait", "load-wait", "late-load")
+SCENARIOS = ("idle", "dispose", "free-quit", "cancel", "generate-wait", "load-wait", "late-load",
+             "log")
 # What the others do on a device that cannot compute is load, and free.
 GENERATING_SCENARIOS = ("cancel", "generate-wait")
 # `default` lets the runtime pick its device, which is Metal where there is one.

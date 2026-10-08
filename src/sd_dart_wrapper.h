@@ -288,6 +288,96 @@ SD_API int32_t sd_dart_gpu_device_count(void);
 // Each call asks the device again.
 SD_API int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memory_t* out);
 
+// Log forwarding
+//
+// sd_set_log_callback() calls back on whichever thread logs, the model
+// loader's own threads among them, with a text that is only valid during the
+// call. A managed runtime cannot take that call, for the reasons given for
+// progress above, and without a callback stable-diffusion.cpp's messages go
+// nowhere: a load that fails returns NULL and nothing else. Here the library
+// copies each message into a buffer of its own, and the caller reads the
+// messages, in order, whenever it likes.
+//
+// A message is the text upstream passes to its callback, "<file>:<line> -
+// <text>" for stable-diffusion.cpp and "ggml - <text>" for ggml, without the
+// line break at its end. Messages are numbered from 1 in the order they were
+// recorded.
+
+enum {
+    // A buffer of this size holds any message and its terminating NUL.
+    // Upstream's longer messages are cut to fit, between two UTF-8 sequences.
+    SD_DART_LOG_TEXT_SIZE = 4096,
+};
+
+// Records log messages instead of dropping them, for every later call in the
+// process. Idempotent, and when it returns the recorder is registered
+// whichever thread registered it.
+//
+// Nothing changes for a process that does not call it. Once it is called,
+// ggml's messages are recorded as well, which until the first context exists
+// ggml would print to stderr, such as the lines of a device's
+// initialization. Nothing recorded is printed: a caller that wants the
+// messages on stderr prints what it reads. What ggml's backends write to
+// stderr themselves, not through ggml's log, still goes there.
+//
+// The first call registers the recorder with sd_set_log_callback() and
+// ggml's log, neither of which is synchronized: make it before another thread
+// starts a load or generation. Do not call sd_set_log_callback() afterwards;
+// it replaces the recorder, and this function does not register it again.
+SD_API void sd_dart_log_enable(void);
+
+// Sets the lowest sd_log_level_t that is recorded, SD_LOG_INFO by default.
+// SD_LOG_ERROR + 1 records nothing. A message below the level gets no
+// sequence, and sd_dart_last_error() does not depend on the level.
+SD_API void sd_dart_log_set_level(int32_t level);
+
+// Reads the oldest message whose sequence is greater than `after` and returns
+// its sequence, or returns 0 when there is none. Copies the text to `text`,
+// at most `capacity` - 1 bytes of it, and terminates it. `level` receives the
+// message's sd_log_level_t and `length` the bytes of the whole text, also
+// when fewer were copied; either may be NULL, and so may `text` with a
+// `capacity` of 0. Reading removes nothing: read on with the sequence
+// returned.
+//
+// - The library keeps the most recent messages that fit in 256 KiB, about
+//   2500 lines of 100 bytes. If the message after `after` is gone, the
+//   sequence returned is not `after + 1`: that is how a caller sees that it
+//   fell behind, and by how many messages.
+// - Callable from any thread at any time, also before sd_dart_log_enable(),
+//   during exit teardown and after it. It allocates nothing, and waits only
+//   for the copy of one message by another thread. Should that thread have
+//   died during the copy, which only the end of the process can cause, it
+//   gives up after 65536 attempts and returns 0.
+//
+// Messages are process-wide, as upstream's callback is: every context's go
+// into the one sequence, and a message does not say which call made it.
+SD_API uint64_t sd_dart_log_read(uint64_t after, char* text, size_t capacity, int32_t* level, size_t* length);
+
+// The number of messages that left the buffer newer than every message a
+// read had returned by then: what was lost to a caller that reads in order,
+// and everything that left for a caller that never reads. It also counts a
+// message that could not be recorded because the thread holding the buffer
+// had died.
+SD_API uint64_t sd_dart_log_dropped(void);
+
+// Copies the SD_LOG_ERROR messages that were recorded, by any thread, while
+// the calling thread's most recent sd_dart_new_sd_ctx() or
+// sd_dart_generate_image() ran: the reason stable-diffusion.cpp gave for a
+// call that failed. They are joined by '\n', oldest first, and terminated; at
+// most `capacity` - 1 bytes are copied. Returns the bytes of the whole text,
+// 0 when that call logged no error, when the thread has made no such call or
+// when sd_dart_log_enable() was not called before it.
+//
+// - Read it on the thread that made the call, before that thread makes
+//   another one. A Dart isolate stays on its thread between two native calls
+//   that no asynchronous gap separates.
+// - Of one call, the 32 most recent error messages are kept, each cut to 511
+//   bytes, and only until 32 later ones have replaced them.
+// - Errors are process-wide: those that another thread's call logs in the
+//   meantime are included.
+// - Never blocks, also after teardown, and allocates nothing.
+SD_API size_t sd_dart_last_error(char* text, size_t capacity);
+
 #ifdef __cplusplus
 }
 #endif

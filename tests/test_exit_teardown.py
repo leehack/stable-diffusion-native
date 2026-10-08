@@ -1,7 +1,8 @@
 """Builds and runs `tests/native/exit_teardown_test.cpp`.
 
-The test links `src/sd_dart_exit.cpp` against stand-ins for the upstream
-functions it wraps, so it needs the submodule's header but no built runtime.
+The test links `src/sd_dart_exit.cpp` and `src/sd_dart_log.cpp` against
+stand-ins for the upstream functions they wrap, so it needs the submodules'
+headers but no built runtime.
 Each scenario runs in its own process, as teardown runs once per process.
 """
 
@@ -17,11 +18,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [
     REPO_ROOT / "src" / "sd_dart_exit.cpp",
+    REPO_ROOT / "src" / "sd_dart_log.cpp",
     REPO_ROOT / "tests" / "native" / "exit_teardown_test.cpp",
 ]
 INCLUDE_DIRS = [
     REPO_ROOT / "src",
     REPO_ROOT / "third_party" / "stable-diffusion.cpp" / "include",
+    REPO_ROOT / "third_party" / "stable-diffusion.cpp" / "ggml" / "include",
 ]
 COMPILER = os.environ.get("CXX") or shutil.which("c++")
 SANITIZERS = ("address", "thread")
@@ -57,6 +60,9 @@ class ExitTeardownTest(unittest.TestCase):
         self.require(COMPILER is not None, "no C++ compiler; set CXX")
         self.require((INCLUDE_DIRS[1] / "stable-diffusion.h").is_file(),
                      "third_party/stable-diffusion.cpp is not checked out")
+        self.require((INCLUDE_DIRS[2] / "ggml.h").is_file(),
+                     "third_party/stable-diffusion.cpp/ggml is not checked out; run "
+                     "`git submodule update --init --recursive`")
 
     def build_and_run(self, *flags: str) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -65,6 +71,7 @@ class ExitTeardownTest(unittest.TestCase):
             scenarios = subprocess.run([str(binary), "list"], check=True, capture_output=True,
                                        text=True).stdout.split()
             self.assertIn("generate-in-flight", scenarios)
+            self.assertIn("log-at-exit", scenarios)
 
             def run(scenario: str) -> subprocess.CompletedProcess:
                 return subprocess.run(

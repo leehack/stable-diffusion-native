@@ -342,6 +342,113 @@ on each built runtime: CI does that on Mesa lavapipe for Vulkan, on the macOS
 runners' virtual GPU for Metal, and on the CPU targets for
 `SD_DART_GPU_NO_BACKEND`. No hardware Vulkan device was tried.
 
+### Log forwarding
+
+```c
+void sd_dart_log_enable(void);
+void sd_dart_log_set_level(int32_t level);
+uint64_t sd_dart_log_read(uint64_t after, char* text, size_t capacity,
+                          int32_t* level, size_t* length);
+uint64_t sd_dart_log_dropped(void);
+size_t sd_dart_last_error(char* text, size_t capacity);
+```
+
+Upstream's `sd_set_log_callback` calls back on whichever thread logs, the
+model loader's own threads among them, with a text that is only valid during
+the call. A managed runtime cannot take that call, for the reasons given for
+progress above. Without a callback the messages go nowhere, and a load that
+fails returns `NULL` and nothing else. So the library copies each message into
+a buffer of its own, and the caller reads the messages whenever it likes.
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_log_enable` | Records log messages for every later call in the process, ggml's included. Idempotent; when it returns the recorder is registered. |
+| `sd_dart_log_set_level` | The lowest `sd_log_level_t` recorded, `SD_LOG_INFO` by default; `SD_LOG_ERROR + 1` records nothing. A message below the level gets no sequence. |
+| `sd_dart_log_read` | Copies the oldest message with a sequence greater than `after` into `text`, at most `capacity` - 1 bytes and a NUL, and returns its sequence, or 0 if there is none. `level` and `length`, if not `NULL`, receive its `sd_log_level_t` and the bytes of the whole text. Removes nothing. |
+| `sd_dart_log_dropped` | Number of messages that left the buffer newer than every message a read had returned by then. |
+| `sd_dart_last_error` | Copies the `SD_LOG_ERROR` messages recorded, by any thread, while the calling thread's most recent `sd_dart_new_sd_ctx` or `sd_dart_generate_image` ran, joined by `\n`, and returns the bytes of the whole text: 0 when that call logged no error. |
+
+A message is the text upstream passes to its callback, without the line break
+at its end: `<file>:<line> - <text>` for stable-diffusion.cpp and
+`ggml - <text>` for ggml. For a model file that does not exist,
+`sd_dart_last_error` returns:
+
+```text
+model_loader_files.cpp:25   - cannot inspect model source '/models/missing.gguf': No such file or directory
+diffusion_engine.cpp:727  - init model loader from file failed: '/models/missing.gguf'
+diffusion_engine.cpp:992  - get sd version from file failed: '/models/missing.gguf'
+```
+
+What is guaranteed:
+
+- **Nothing changes for a process that does not enable it.** Messages are
+  dropped as before, and ggml prints its own to stderr until the first
+  context exists.
+- **Every message, in order, with its level.** Messages are numbered from 1 in
+  the order they were recorded, by whichever thread, and each is whole. A
+  buffer of `SD_DART_LOG_TEXT_SIZE` (4096) bytes holds any of them; upstream's
+  longer ones are cut to fit, between two UTF-8 sequences.
+- **Bounded memory.** The library keeps the most recent messages that fit in
+  256 KiB, about 2500 lines of 100 bytes, and the 32 most recent errors of up
+  to 511 bytes: 272 KiB of zero-filled memory, used only once enabled. A load
+  of SDXS logs 42 messages at `SD_LOG_INFO` (3.3 KB) and 74 at `SD_LOG_DEBUG`.
+- **Overflow is visible.** When the message after `after` is gone, the
+  sequence returned is not `after + 1`, which tells a reader how many it
+  missed, and `sd_dart_log_dropped` counts them. For a caller that never reads,
+  that count is everything that left the buffer.
+- **The logging thread allocates nothing and waits for nothing but one copy.**
+  The buffer is held for the copy of a single message, by a reader as by a
+  writer. A thread can only die holding it when the process ends, as
+  `ExitProcess` ends threads on Windows: a logging thread then gives up after
+  65536 attempts and loses its message, and the ones after it do not wait.
+- **Nothing to undo, and valid during exit.** No call is needed when the
+  caller goes away. The state is never destroyed, so logging and reading stay
+  valid while `exit()` runs, during exit teardown and after it; reading and
+  `sd_dart_last_error` never block after teardown.
+
+What is not:
+
+- **A copy on stderr.** Once enabled, nothing recorded is printed, also not
+  what ggml used to print before the first context existed, such as the lines
+  of Metal's device initialization. A caller that wants the messages on stderr
+  prints what it reads. What a ggml backend writes to stderr itself, not
+  through ggml's log, still goes there.
+- **Which call a message belongs to.** Messages are process-wide, as upstream's
+  callback is. `sd_dart_last_error` narrows that down by time only: it includes
+  the errors that another thread's call logged while this one ran.
+- **A reason for every failure.** It is what upstream logged at `SD_LOG_ERROR`.
+  A file in the wrong role, such as a full model given as the only VAE, gets
+  one line, `get sd version from file failed: ''`.
+- **A last error on another thread.** It belongs to the thread that made the
+  call: read it there, before that thread's next load or generation. A Dart
+  isolate stays on its thread between two native calls that no asynchronous
+  gap separates.
+- **A registration that survives `sd_set_log_callback`.** The first
+  `sd_dart_log_enable` call registers the recorder there and with ggml's log.
+  Neither is synchronized, so make the call before another thread starts a
+  load or generation. A later `sd_set_log_callback` call replaces the
+  recorder, and `sd_dart_log_enable` does not register it again.
+
+To follow the log, read on a timer and once more when a call has returned:
+
+```c
+char text[SD_DART_LOG_TEXT_SIZE];
+int32_t level;
+uint64_t next;
+while ((next = sd_dart_log_read(after, text, sizeof(text), &level, NULL)) != 0) {
+    /* next - after - 1 messages were lost if next != after + 1 */
+    after = next;
+}
+```
+
+`tests/test_log.py` runs the recorder against stand-ins for upstream and ggml,
+also under AddressSanitizer and ThreadSanitizer: messages from several threads
+at once, overflow, and logging and reading while `exit()` runs.
+`tests/test_exit_teardown.py` and `tests/test_exit_teardown_runtime.py` add a
+load that fails for three reasons, a recorder that is read through exit
+teardown, and a Dart VM that polls it while worker isolates are killed.
+`tools/smoke_test.py` loads a missing model file on each built runtime.
+
 ## Build
 
 ```bash
