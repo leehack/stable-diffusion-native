@@ -39,6 +39,7 @@ namespace {
 
 std::vector<ggml_backend_device> devices;
 int registrations  = 0;
+bool registry_fails = false;
 int calls_begun    = 0;
 int calls_ended    = 0;
 int memory_queries = 0;
@@ -145,6 +146,14 @@ int test_backend() {
     devices[1].fails = false;
     CHECK(status_of(0) == SD_DART_GPU_OK);
 
+    // So is a registry that fails, for the count as for the memory.
+    registry_fails = true;
+    CHECK(sd_dart_gpu_device_count() == SD_DART_GPU_UNAVAILABLE);
+    CHECK(status_of(0) == SD_DART_GPU_UNAVAILABLE);
+    CHECK(status_of(SD_DART_GPU_DEFAULT_DEVICE) == SD_DART_GPU_UNAVAILABLE);
+    registry_fails = false;
+    CHECK(sd_dart_gpu_device_count() == 1);
+
     // Names are cut to fit, and what follows them is cleared.
     devices[1].name        = std::string(200, 'n');
     devices[1].description = std::string(600, 'd');
@@ -173,6 +182,9 @@ int test_backend() {
 
 size_t ggml_backend_dev_count(void) {
     CHECK(calls_begun == calls_ended + 1);
+    if (registry_fails) {
+        throw std::runtime_error("the registry failed");
+    }
     return devices.size();
 }
 
@@ -183,6 +195,9 @@ ggml_backend_dev_t ggml_backend_dev_get(size_t index) {
 
 ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
     CHECK(calls_begun == calls_ended + 1);
+    if (registry_fails) {
+        throw std::runtime_error("the registry failed");
+    }
     for (ggml_backend_device& device : devices) {
         if (device.type == type) {
             return &device;

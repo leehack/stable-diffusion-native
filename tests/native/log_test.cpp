@@ -486,6 +486,26 @@ void test_last_error() {
     sd_dart_log_call_end();
     CHECK(last_error() == std::string(kErrorBytes - 1, 'e') + "\n" + std::string(kErrorBytes, 'f'));
 
+    // So is one of ggml's, whose prefix counts toward the limit: the error
+    // kept next to it stays what it was.
+    sd_dart_log_call_begin();
+    log(SD_LOG_ERROR, "before");
+    ggml_callback.load()(GGML_LOG_LEVEL_ERROR, std::string(2000, 'g').c_str(), nullptr);
+    log(SD_LOG_ERROR, "after");
+    sd_dart_log_call_end();
+    CHECK(last_error() == "before\nggml - " + std::string(kErrorBytes - 7, 'g') + "\nafter");
+    // Enough of them to go around every slot.
+    sd_dart_log_call_begin();
+    for (size_t n = 0; n < kErrorsKept; n++) {
+        ggml_callback.load()(GGML_LOG_LEVEL_ERROR, std::string(600 + n, static_cast<char>('a' + n % 26)).c_str(), nullptr);
+    }
+    sd_dart_log_call_end();
+    std::string all;
+    for (size_t n = 0; n < kErrorsKept; n++) {
+        all += (n == 0 ? "ggml - " : "\nggml - ") + std::string(kErrorBytes - 7, static_cast<char>('a' + n % 26));
+    }
+    CHECK(last_error() == all);
+
     // The call in progress has none yet.
     sd_dart_log_call_begin();
     log(SD_LOG_ERROR, "during");
