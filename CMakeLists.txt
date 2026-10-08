@@ -20,6 +20,18 @@ add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.
 target_sources(stable-diffusion PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_device.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_exit.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.h")
+
+# sd_dart_gpu_device_count() tells a build without a GPU backend from one
+# whose backend found no device, which ggml's registry cannot.
+set(SD_DART_GPU_BACKEND 0)
+foreach(backend CUDA HIPBLAS METAL VULKAN OPENCL SYCL MUSA)
+    if(SD_${backend})
+        set(SD_DART_GPU_BACKEND 1)
+    endif()
+endforeach()
+target_compile_definitions(stable-diffusion PRIVATE
+    SD_DART_GPU_BACKEND=${SD_DART_GPU_BACKEND})

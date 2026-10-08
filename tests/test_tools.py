@@ -50,7 +50,7 @@ class ApiSymbolsTest(unittest.TestCase):
                 ["generate_image", "new_sd_ctx", "sample_method_to_str", "sd_dart_added"],
             )
 
-    def test_wrapper_header_adds_only_the_progress_and_exit_teardown_exports(self):
+    def test_wrapper_header_adds_only_the_documented_exports(self):
         self.assertEqual(
             api_symbols(WRAPPER_HEADER),
             [
@@ -64,6 +64,8 @@ class ApiSymbolsTest(unittest.TestCase):
                 "sd_dart_exit_tracked_count",
                 "sd_dart_exit_untrack",
                 "sd_dart_generate_image",
+                "sd_dart_gpu_device_count",
+                "sd_dart_gpu_device_memory",
                 "sd_dart_new_sd_ctx",
                 "sd_dart_progress_enable",
                 "sd_dart_progress_read",

@@ -206,6 +206,88 @@ SD_API bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
 // Never blocks, also after teardown.
 SD_API void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
 
+// GPU device memory
+//
+// The total and the free memory of the GPU a model would load on, so that a
+// caller can refuse a model that does not fit before it loads it. The figures
+// are ggml's (ggml_backend_dev_memory), the ones stable-diffusion.cpp's own
+// automatic fit works with:
+//
+// - Vulkan, discrete GPU: the heaps flagged device-local, added up. With
+//   VK_EXT_memory_budget, `free_bytes` is the budget of those heaps less what
+//   this process uses of them, which is the driver's estimate of what the
+//   process can still allocate and so reflects other processes. Without the
+//   extension it is the heap sizes: `free_bytes == total_bytes`.
+// - Vulkan, integrated GPU: every heap, added up, in the same way. The heaps
+//   are host memory that the device shares with the system, and a driver that
+//   exposes that memory as more than one heap counts it more than once, so the
+//   host's available memory is a second limit there.
+// - Metal: `total_bytes` is the device's recommendedMaxWorkingSetSize, and
+//   `free_bytes` is that less the device's currentAllocatedSize, which counts
+//   the allocations of this process only. Apple GPUs report as
+//   SD_DART_GPU_DEVICE_DISCRETE although their memory is unified.
+//
+// A budget that the driver reports below the current use reads as 0 free
+// bytes, and `free_bytes` never exceeds `total_bytes`.
+//
+// The functions create no context and load no model. The first call registers
+// ggml's backends, as sd_list_devices() does, which on Vulkan creates the
+// instance and can take hundreds of milliseconds. They are callable from any
+// thread, also while another one loads or generates, and each is a call in
+// flight for exit teardown, so it blocks after teardown.
+
+enum sd_dart_gpu_status {
+    SD_DART_GPU_OK = 0,
+    // A null `out`, or a negative `device_index` other than
+    // SD_DART_GPU_DEFAULT_DEVICE.
+    SD_DART_GPU_INVALID_ARGUMENT = -1,
+    // The library was built without a GPU backend, as the CPU targets are.
+    SD_DART_GPU_NO_BACKEND = -2,
+    // The library has a GPU backend, but no such device: none was found, or
+    // `device_index` is past the last one.
+    SD_DART_GPU_NO_DEVICE = -3,
+    // The device is there but its memory is not known: the backend reports a
+    // total of 0, or it failed to answer.
+    SD_DART_GPU_UNAVAILABLE = -4,
+};
+
+enum sd_dart_gpu_device_type {
+    // A GPU with memory of its own.
+    SD_DART_GPU_DEVICE_DISCRETE = 1,
+    // A GPU that uses host memory.
+    SD_DART_GPU_DEVICE_INTEGRATED = 2,
+};
+
+enum {
+    // The device stable-diffusion.cpp uses when sd_ctx_params_t.backend names
+    // none: the first discrete GPU, or else the first integrated one.
+    SD_DART_GPU_DEFAULT_DEVICE = -1,
+};
+
+typedef struct {
+    uint64_t total_bytes;
+    uint64_t free_bytes;
+    // An sd_dart_gpu_device_type.
+    int32_t type;
+    // The device name of sd_list_devices(), which sd_ctx_params_t.backend
+    // accepts, such as "Vulkan0" or "MTL0", and its description. Both are
+    // NUL-terminated and cut to fit.
+    char name[64];
+    char description[256];
+} sd_dart_gpu_device_memory_t;
+
+// The number of GPU devices, discrete and integrated, or
+// SD_DART_GPU_NO_BACKEND. They are numbered from 0 in the order
+// sd_list_devices() lists them, which has other devices, such as the CPU, in
+// between.
+SD_API int32_t sd_dart_gpu_device_count(void);
+
+// Writes the memory of GPU device `device_index`, or of the default device
+// for SD_DART_GPU_DEFAULT_DEVICE, to `out` and returns SD_DART_GPU_OK.
+// Otherwise returns another sd_dart_gpu_status and leaves `out` as it was.
+// Each call asks the device again.
+SD_API int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memory_t* out);
+
 #ifdef __cplusplus
 }
 #endif

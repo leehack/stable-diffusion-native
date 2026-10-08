@@ -278,6 +278,70 @@ scenarios that need a generation on the CPU. It does the same on any machine
 whose default device cannot generate and says so in one line; set
 `SD_REQUIRE_METAL_GENERATION=1` on a Mac to make that a failure instead.
 
+### GPU device memory
+
+```c
+typedef struct {
+    uint64_t total_bytes;
+    uint64_t free_bytes;
+    int32_t type;           // an sd_dart_gpu_device_type
+    char name[64];          // as in sd_list_devices() and sd_ctx_params_t.backend
+    char description[256];
+} sd_dart_gpu_device_memory_t;
+
+int32_t sd_dart_gpu_device_count(void);
+int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memory_t* out);
+```
+
+A caller that refuses a model which does not fit needs the memory of the GPU
+the model would load on, before it loads it. Upstream's API has no such
+figure, and host memory is the wrong one for a discrete GPU.
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_gpu_device_count` | Number of GPU devices, discrete and integrated, or `SD_DART_GPU_NO_BACKEND`. They are numbered from 0 in the order `sd_list_devices` lists them, which has other devices, such as the CPU, in between. |
+| `sd_dart_gpu_device_memory` | Writes the memory, type, name and description of a device to `out` and returns `SD_DART_GPU_OK`. `SD_DART_GPU_DEFAULT_DEVICE` (-1) is the device a context without a `backend` uses: the first discrete GPU, or else the first integrated one. Any other status leaves `out` as it was. Each call asks the device again. |
+
+| Status | Value | Meaning |
+| --- | --- | --- |
+| `SD_DART_GPU_OK` | 0 | |
+| `SD_DART_GPU_INVALID_ARGUMENT` | -1 | A null `out`, or a negative index other than the default device. |
+| `SD_DART_GPU_NO_BACKEND` | -2 | The library was built without a GPU backend, as the CPU targets are. |
+| `SD_DART_GPU_NO_DEVICE` | -3 | The library has a GPU backend, but no such device: none was found, or the index is past the last one. |
+| `SD_DART_GPU_UNAVAILABLE` | -4 | The device is there, but the backend reports a total of 0 or failed to answer. |
+
+The figures are ggml's (`ggml_backend_dev_memory`), the ones
+stable-diffusion.cpp's own automatic fit works with:
+
+| Device | `total_bytes` | `free_bytes` |
+| --- | --- | --- |
+| Vulkan, discrete (`SD_DART_GPU_DEVICE_DISCRETE`) | The heaps flagged device-local, added up. | With `VK_EXT_memory_budget`, the budget of those heaps less what this process uses of them: the driver's estimate of what the process can still allocate, which reflects other processes. Without the extension, the heap sizes, so `free_bytes == total_bytes`. |
+| Vulkan, integrated (`SD_DART_GPU_DEVICE_INTEGRATED`) | Every heap, added up. | The same, over every heap. |
+| Metal (`SD_DART_GPU_DEVICE_DISCRETE`) | `recommendedMaxWorkingSetSize` | That less `currentAllocatedSize`, which counts this process only. |
+
+- **Integrated GPUs share host memory.** Their heaps are system memory, and a
+  driver that exposes it as more than one heap counts it more than once, so
+  the host's available memory is a second limit there. Apple GPUs report as
+  discrete although their memory is unified: the working set is a share of
+  physical memory, 51.8 of 64 GiB on an M4 Max.
+- **Never more free than total, never a wrapped value.** ggml-vulkan subtracts
+  use from budget per heap in unsigned arithmetic. Use above the budget reads
+  as 0 free bytes here.
+- **No context and no model.** The first call registers ggml's backends, as
+  `sd_list_devices` does; on Vulkan that creates the instance and can take
+  hundreds of milliseconds. A later call takes microseconds on Metal.
+- **Any thread, any time before teardown.** Each function is a call in flight
+  for [exit teardown](#exit-teardown), so it blocks after teardown.
+- **Whether `free_bytes` is a live figure is not reported.** On Vulkan that
+  depends on `VK_EXT_memory_budget`, which ggml checks without exposing the
+  result. Without it the check a caller makes is against the device's size.
+
+`tests/test_device_memory.py` runs the exports against a stand-in for ggml's
+device registry, and `tools/smoke_test.py` compares them with `sd_list_devices`
+on each built runtime: CI does that on Mesa lavapipe for Vulkan, on the macOS
+runners' virtual GPU for Metal, and on the CPU targets for
+`SD_DART_GPU_NO_BACKEND`. No hardware Vulkan device was tried.
+
 ## Build
 
 ```bash
