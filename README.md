@@ -312,7 +312,7 @@ figure, and host memory is the wrong one for a discrete GPU.
 | Function | Behavior |
 | --- | --- |
 | `sd_dart_gpu_device_count` | Number of GPU devices, discrete and integrated, or `SD_DART_GPU_NO_BACKEND`. They are numbered from 0 in the order `sd_list_devices` lists them, which has other devices, such as the CPU, in between. |
-| `sd_dart_gpu_device_memory` | Writes the memory, type, name and description of a device to `out` and returns `SD_DART_GPU_OK`. `SD_DART_GPU_DEFAULT_DEVICE` (-1) is the device a context without a `backend` uses: the first discrete GPU, or else the first integrated one. Any other status leaves `out` as it was. Each call asks the device again. |
+| `sd_dart_gpu_device_memory` | Writes the memory, type, name and description of a device to `out` and returns `SD_DART_GPU_OK`. `SD_DART_GPU_DEFAULT_DEVICE` (-1) is the device a context without a `backend` uses: the first discrete GPU, or else the first integrated one; upstream's `SD_VK_DEVICE` environment variable is not read. Any other status leaves `out` as it was. Each call asks the device again. |
 
 | Status | Value | Meaning |
 | --- | --- | --- |
@@ -339,9 +339,32 @@ stable-diffusion.cpp's own automatic fit works with:
 - **Never more free than total, never a wrapped value.** ggml-vulkan subtracts
   use from budget per heap in unsigned arithmetic. Use above the budget reads
   as 0 free bytes here.
-- **No context and no model.** The first call registers ggml's backends, as
-  `sd_list_devices` does; on Vulkan that creates the instance and can take
-  hundreds of milliseconds. A later call takes microseconds on Metal.
+- **`free_bytes` is what is free now, not what is left once the loaded
+  contexts are in use.** stable-diffusion.cpp moves a context's weights to the
+  device when they are first used, unless `sd_ctx_params_t.eager_load` is set.
+  Measured with SDXS on Metal:
+
+  | `eager_load` | After `sd_dart_new_sd_ctx` | After the first generation | After `sd_dart_exit_free` |
+  | --- | --- | --- | --- |
+  | `false`, the default | unchanged | -650 MiB | restored |
+  | `true` | -652 MiB | -652 MiB | restored |
+
+  What a generation computes in is allocated while it runs. Upstream's API
+  reports neither what a context will take nor what it holds, and the wrapper
+  adds no such figure: a caller that admits a second model against
+  `free_bytes` sets `eager_load`, or keeps count of what it has loaded.
+- **No context and no model, but the first call initializes the devices.** It
+  registers ggml's backends, as `sd_list_devices` does. On Vulkan that creates
+  the instance. On Metal it compiles the shader libraries: about 50 ms when
+  the system has them cached, 16 s on an M4 Max and 27 to 42 s on GitHub's
+  macOS runners when it had not. Make the first call on a thread that may
+  wait that long, never on a UI thread; it can also outlast the 15 s that
+  exit teardown waits for it. A later call takes about a microsecond.
+- **The default device ignores `SD_VK_DEVICE`.** Upstream uses the Vulkan
+  device of that number for a context without a `backend`, and falls back
+  when the device does not initialize, which a query cannot know without
+  initializing it. A caller that sets the variable asks for that device by
+  its index.
 - **Any thread, any time before teardown.** [Exit teardown](#exit-teardown)
   waits for a query in flight, also when nothing is tracked, with the bound
   of a load (15 s by default), and a query blocks after teardown. Past the
@@ -448,7 +471,9 @@ What is not:
 - **A registration that survives `sd_set_log_callback`.** The first
   `sd_dart_log_enable` call registers the recorder there and with ggml's log.
   Neither is synchronized, so make the call before another thread starts a
-  load or generation. A later `sd_set_log_callback` call replaces the
+  load, a generation or a device query (`sd_list_devices`,
+  `sd_dart_gpu_device_count`, `sd_dart_gpu_device_memory`), which logs through
+  ggml for as long as it runs. A later `sd_set_log_callback` call replaces the
   recorder, and `sd_dart_log_enable` does not register it again.
 
 To follow the log, read on a timer and once more when a call has returned:

@@ -235,10 +235,24 @@ SD_API void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mo
 // A budget that the driver reports below the current use reads as 0 free
 // bytes, and `free_bytes` never exceeds `total_bytes`.
 //
+// `free_bytes` is what the device has free now, not what is left once the
+// loaded contexts are in use. stable-diffusion.cpp moves a context's weights
+// to the device when they are first used, unless sd_ctx_params_t.eager_load
+// is set: without it `free_bytes` is the same after sd_dart_new_sd_ctx() as
+// before and drops with the first generation, with it at the load (SDXS on
+// Metal: by 650 MiB either way). What a generation computes in is allocated
+// while it runs. Upstream's API reports neither what a context will take nor
+// what it holds, so a caller that admits a second model against `free_bytes`
+// sets eager_load, or keeps count of what it has loaded itself.
+//
 // The functions create no context and load no model. The first call registers
-// ggml's backends, as sd_list_devices() does, which on Vulkan creates the
-// instance and can take hundreds of milliseconds. They are callable from any
-// thread, also while another one loads or generates.
+// ggml's backends, as sd_list_devices() does, and with that initializes the
+// devices: on Vulkan it creates the instance, and on Metal it compiles the
+// shader libraries, which takes about 50 ms when the system has them cached
+// and took 16 s on an M4 Max and 27 to 42 s on GitHub's macOS runners when it
+// had not. Make the first call on a thread that may wait that long, never on
+// a UI thread. A later call returns within microseconds. They are callable
+// from any thread, also while another one loads or generates.
 //
 // A query reads ggml's device registry, which exit() destroys, so exit
 // teardown waits for one that is in flight, also when nothing is tracked,
@@ -246,6 +260,7 @@ SD_API void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mo
 // unless sd_dart_exit_set_wait_ms() changed it. Past that bound teardown
 // frees nothing and the exit goes on under the query, as it would without
 // the registry: the registry may then be destroyed while the query reads it.
+// A first query on Metal that compiles its libraries can outlast the bound.
 
 enum sd_dart_gpu_status {
     SD_DART_GPU_OK = 0,
@@ -271,7 +286,10 @@ enum sd_dart_gpu_device_type {
 
 enum {
     // The device stable-diffusion.cpp uses when sd_ctx_params_t.backend names
-    // none: the first discrete GPU, or else the first integrated one.
+    // none: the first discrete GPU, or else the first integrated one. The
+    // SD_VK_DEVICE environment variable, with which upstream uses the Vulkan
+    // device of that number for such a context if it initializes, is not
+    // read: a caller that sets it asks for that device by its index.
     SD_DART_GPU_DEFAULT_DEVICE = -1,
 };
 
@@ -333,8 +351,11 @@ enum {
 //
 // The first call registers the recorder with sd_set_log_callback() and
 // ggml's log, neither of which is synchronized: make it before another thread
-// starts a load or generation. Do not call sd_set_log_callback() afterwards;
-// it replaces the recorder, and this function does not register it again.
+// starts a load, a generation or a device query, that is sd_list_devices(),
+// sd_dart_gpu_device_count() or sd_dart_gpu_device_memory(), which logs
+// through ggml for as long as it runs. Do not call sd_set_log_callback()
+// afterwards; it replaces the recorder, and this function does not register
+// it again.
 SD_API void sd_dart_log_enable(void);
 
 // Sets the lowest sd_log_level_t that is recorded, SD_LOG_INFO by default.
