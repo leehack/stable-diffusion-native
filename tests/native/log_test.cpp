@@ -68,11 +68,13 @@ Message read(uint64_t after, size_t capacity = SD_DART_LOG_TEXT_SIZE) {
     }
     CHECK(message.sequence > after);
     CHECK(length < SD_DART_LOG_TEXT_SIZE);
-    // Nothing is written past the capacity, and the text is terminated.
+    // Nothing is written past the capacity, and the text is terminated: as
+    // much of it as fits, less at most the start of one UTF-8 sequence.
     CHECK(text[capacity] == '\x7f');
     if (capacity > 0) {
-        const size_t copied = length < capacity - 1 ? length : capacity - 1;
-        CHECK(std::strlen(text.data()) == copied);
+        const size_t fits   = length < capacity - 1 ? length : capacity - 1;
+        const size_t copied = std::strlen(text.data());
+        CHECK(copied <= fits && copied + 3 >= fits);
         message.text.assign(text.data(), copied);
     }
     if (capacity > length) {
@@ -102,7 +104,9 @@ std::string last_error(size_t capacity = 1 << 16) {
     if (capacity == 0) {
         return std::string(length, '?');
     }
-    CHECK(std::strlen(text.data()) == (length < capacity - 1 ? length : capacity - 1));
+    const size_t fits   = length < capacity - 1 ? length : capacity - 1;
+    const size_t copied = std::strlen(text.data());
+    CHECK(copied <= fits && copied + 3 >= fits);
     CHECK(sd_dart_last_error(nullptr, 0) == length);
     return std::string(text.data());
 }
@@ -268,6 +272,35 @@ void test_long_messages_are_cut() {
 
     ggml_callback.load()(GGML_LOG_LEVEL_INFO, std::string(100000, 'g').c_str(), nullptr);
     CHECK(read(messages[7].sequence).text == "ggml - " + std::string(longest - 7, 'g'));
+}
+
+// A caller's buffer that is too small for a message gets whole UTF-8
+// sequences, as the library's own limits do.
+void test_small_buffers_keep_utf8_sequences_whole() {
+    const uint64_t before  = newest_sequence();
+    const std::string text = "ab\xE2\x82\xAC\xC3\xA9z";
+    log(SD_LOG_INFO, text);
+    const std::string expected[] = {"", "", "a", "ab", "ab", "ab", "ab\xE2\x82\xAC", "ab\xE2\x82\xAC",
+                                    "ab\xE2\x82\xAC\xC3\xA9", text, text};
+    for (size_t capacity = 1; capacity <= 10; capacity++) {
+        const Message message = read(before, capacity);
+        CHECK(message.sequence == before + 1 && message.text == expected[capacity]);
+    }
+    // Bytes that are no UTF-8 at all are not eaten up: at most three go.
+    log(SD_LOG_INFO, std::string(20, '\x80'));
+    CHECK(read(before + 1, 11).text == std::string(7, '\x80'));
+    log(SD_LOG_INFO, "\xE2\x82\xAC");
+    CHECK(read(before + 2, 3).text.empty());
+
+    sd_dart_log_call_begin();
+    log(SD_LOG_ERROR, "a\xC3\xA9");
+    log(SD_LOG_ERROR, "\xE2\x82\xAC");
+    sd_dart_log_call_end();
+    const std::string errors   = "a\xC3\xA9\n\xE2\x82\xAC";
+    const std::string whole[] = {"", "", "a", "a", "a\xC3\xA9", "a\xC3\xA9\n", "a\xC3\xA9\n", "a\xC3\xA9\n", errors, errors};
+    for (size_t capacity = 1; capacity <= 9; capacity++) {
+        CHECK(last_error(capacity) == whole[capacity]);
+    }
 }
 
 // More than the buffer holds: the oldest messages go, whole, and are counted.
@@ -570,6 +603,7 @@ int main(int argc, char** argv) {
     test_level();
     test_ggml_messages();
     test_long_messages_are_cut();
+    test_small_buffers_keep_utf8_sequences_whole();
     test_overflow_drops_the_oldest_and_counts_them();
     test_concurrent_logging_and_reading();
     test_a_reader_that_keeps_up_loses_nothing();

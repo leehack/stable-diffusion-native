@@ -344,7 +344,8 @@ SD_API void sd_dart_log_set_level(int32_t level);
 
 // Reads the oldest message whose sequence is greater than `after` and returns
 // its sequence, or returns 0 when there is none. Copies the text to `text`,
-// at most `capacity` - 1 bytes of it, and terminates it. `level` receives the
+// at most `capacity` - 1 bytes of it, ending between two UTF-8 sequences,
+// and terminates it. `level` receives the
 // message's sd_log_level_t and `length` the bytes of the whole text, also
 // when fewer were copied; either may be NULL, and so may `text` with a
 // `capacity` of 0. Reading removes nothing: read on with the sequence
@@ -376,9 +377,10 @@ SD_API uint64_t sd_dart_log_dropped(void);
 // the calling thread's most recent sd_dart_new_sd_ctx() or
 // sd_dart_generate_image() ran: the reason stable-diffusion.cpp gave for a
 // call that failed. They are joined by '\n', oldest first, and terminated; at
-// most `capacity` - 1 bytes are copied. Returns the bytes of the whole text,
-// 0 when that call logged no error, when the thread has made no such call or
-// when sd_dart_log_enable() was not called before it.
+// most `capacity` - 1 bytes are copied, ending between two UTF-8 sequences.
+// Returns the bytes of the whole text, 0 when that call logged no error, when
+// the thread has made no such call or when sd_dart_log_enable() was not
+// called before it.
 //
 // - An empty result does not prove that the call logged no error. The errors
 //   are kept behind a flag of their own, which only another error or a read

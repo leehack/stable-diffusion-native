@@ -419,6 +419,8 @@ What is guaranteed:
   or one that died, as `ExitProcess` ends threads on Windows. A logging
   thread then loses its message, which `sd_dart_log_dropped` counts, and the
   ones after it do not wait.
+- **Texts are cut between two UTF-8 sequences**, by the library's limits and
+  by the caller's `capacity` alike.
 - **Nothing to undo, and valid during exit.** No call is needed when the
   caller goes away. The state is never destroyed, so logging and reading stay
   valid while `exit()` runs, during exit teardown and after it; reading and

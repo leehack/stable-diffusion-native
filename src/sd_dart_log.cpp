@@ -144,17 +144,19 @@ void get(size_t offset, void* destination, size_t length) {
     std::memcpy(static_cast<char*>(destination) + first, state.buffer, length - first);
 }
 
+// The longest length up to `end` at which `text` ends between two UTF-8
+// sequences, given the byte that follows `end`.
+size_t whole_sequences(const char* text, size_t end, char next) {
+    for (int i = 0; i < 3 && end > 0 && (static_cast<unsigned char>(next) & 0xC0) == 0x80; ++i) {
+        next = text[--end];
+    }
+    return end;
+}
+
 // `length`, or the longest length up to `limit` that does not split a UTF-8
 // sequence.
 size_t cut(const char* text, size_t length, size_t limit) {
-    if (length <= limit) {
-        return length;
-    }
-    size_t end = limit;
-    for (int i = 0; i < 3 && end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80; ++i) {
-        --end;
-    }
-    return end;
+    return length <= limit ? length : whole_sequences(text, limit, text[limit]);
 }
 
 void store(int32_t level, const char* origin, size_t origin_length, const char* text, size_t length) {
@@ -243,14 +245,19 @@ void record_ggml(enum ggml_log_level level, const char* text, void*) {
     record(sd_level, "ggml - ", text);
 }
 
-// Copies the `length` bytes at `offset`, or as many as fit, and terminates
-// them.
+// Copies the `length` bytes at `offset`, or as many whole UTF-8 sequences of
+// them as fit, and terminates them.
 void copy_out(char* text, size_t capacity, size_t offset, size_t length) {
     if (text == nullptr || capacity == 0) {
         return;
     }
-    const size_t copied = std::min(length, capacity - 1);
+    size_t copied = std::min(length, capacity - 1);
     get(offset, text, copied);
+    if (copied < length) {
+        char next;
+        get(offset + copied, &next, 1);
+        copied = whole_sequences(text, copied, next);
+    }
     text[copied] = '\0';
 }
 
@@ -328,7 +335,10 @@ uint64_t sd_dart_log_dropped(void) {
 }
 
 size_t sd_dart_last_error(char* text, size_t capacity) {
-    size_t length = 0;
+    const size_t limit = text != nullptr && capacity > 0 ? capacity - 1 : 0;
+    size_t length      = 0;
+    // The first byte that did not fit.
+    char next = '\0';
     if (window_end > window_begin && acquire(state.errors_flag)) {
         const uint64_t recorded = state.errors_recorded.load();
         const uint64_t kept     = recorded > kErrors ? recorded - kErrors : 0;
@@ -336,15 +346,18 @@ size_t sd_dart_last_error(char* text, size_t capacity) {
             const Error& error = state.errors[number % kErrors];
             // One message per line.
             for (size_t i = 0; i < error.length + (number < window_end ? 1u : 0u); ++i, ++length) {
-                if (length + 1 < capacity && text != nullptr) {
-                    text[length] = i < error.length ? error.text[i] : '\n';
+                const char byte = i < error.length ? error.text[i] : '\n';
+                if (length < limit) {
+                    text[length] = byte;
+                } else if (length == limit) {
+                    next = byte;
                 }
             }
         }
         release(state.errors_flag);
     }
     if (text != nullptr && capacity > 0) {
-        text[std::min(length, capacity - 1)] = '\0';
+        text[length <= limit ? length : whole_sequences(text, limit, next)] = '\0';
     }
     return length;
 }
