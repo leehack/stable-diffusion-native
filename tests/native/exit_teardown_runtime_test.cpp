@@ -11,8 +11,10 @@
 //
 // The other scenarios each run in their own process, as teardown runs once
 // per process, and most of them leave by returning from main: on Apple
-// platforms teardown then runs during exit(). Elsewhere it does not, and only
+// platforms teardown then runs during exit(). Elsewhere it does not, and
 // `idle-untracked` applies: a context that is alive at exit must not abort.
+// `exit-in-generation` and `exit-in-load` show what exit() does there to a
+// call in flight that nothing waits for.
 //
 // `generate` only loads, generates and frees, to tell whether the backend can
 // compute on this machine at all. Where it cannot, SD_EXIT_TEARDOWN_LOAD_ONLY
@@ -541,6 +543,53 @@ int test_late_load(const char* model, const char* backend) {
     return 0;
 }
 
+std::atomic<bool> call_began{false};
+
+// A log callback that still works while exit() destroys this program's own
+// statics, which collect_log() uses.
+void note_log(enum sd_log_level_t, const char*, void*) {
+    call_began.store(true);
+}
+
+// Returns from main while another thread generates. Where teardown runs at
+// exit it waits for the generation; elsewhere exit() destroys the library's
+// statics under it.
+int test_exit_in_generation(const char* model, const char* backend) {
+    static sd_ctx_t* context = load(model, backend);
+    sd_set_log_callback(note_log, nullptr);
+    call_began.store(false);
+    on_progress.store([](int) { call_began.store(true); });
+    std::thread([] {
+        for (;;) {
+            generate(context, 40);
+        }
+    }).detach();
+    while (!call_began.load()) {
+        sleep_ms(1);
+    }
+    std::printf("generating on %s\n", backend);
+    std::fflush(stdout);
+    return 0;
+}
+
+// The same for a load.
+int test_exit_in_load(const char* model, const char* backend) {
+    static const char* load_model   = model;
+    static const char* load_backend = backend;
+    sd_set_log_callback(note_log, nullptr);
+    std::thread([] {
+        for (;;) {
+            sd_dart_exit_free(load(load_model, load_backend));
+        }
+    }).detach();
+    while (!call_began.load()) {
+        sleep_ms(1);
+    }
+    std::printf("loading on %s\n", backend);
+    std::fflush(stdout);
+    return 0;
+}
+
 std::string last_error() {
     char text[SD_DART_LOG_TEXT_SIZE];
     const size_t length = sd_dart_last_error(text, sizeof(text));
@@ -678,6 +727,12 @@ int main(int argc, char** argv) {
         }
         if (scenario == "log") {
             return test_log(model, backend);
+        }
+        if (scenario == "exit-in-generation") {
+            return test_exit_in_generation(model, backend);
+        }
+        if (scenario == "exit-in-load") {
+            return test_exit_in_load(model, backend);
         }
     }
     std::fprintf(stderr, "usage: %s make-model <model> | <scenario> <model> <backend>|default [<size>]\n", argv[0]);

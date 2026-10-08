@@ -262,6 +262,11 @@ What is not:
   teardown runs only when a native host calls it. CI checks on Linux that a
   context left alive at exit is harmless on the CPU, and reports what the
   Vulkan backend does on Mesa lavapipe; no hardware Vulkan driver was tried.
+  A load or a generation in flight is not waited for there: `exit()` destroys
+  the library's statics under it, which crashed the worker thread on an NVIDIA
+  Vulkan driver
+  ([llamadart#949](https://github.com/leehack/llamadart/issues/949)). CI
+  reports, without failing, what such an exit does on its Linux runners.
 - **Threads that teardown blocked stay blocked.** A static destructor or
   `atexit` handler of another library that joins one hangs the exit.
 
