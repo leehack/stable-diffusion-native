@@ -34,7 +34,7 @@ private:
     // False on the teardown thread once teardown has begun.
     bool counted_;
 #if SD_DART_EXIT_ON_LINUX
-    bool refused_;
+    bool refused_ = false;
 #endif
 };
 
