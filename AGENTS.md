@@ -21,6 +21,18 @@ Guidance for coding agents working in `stable-diffusion-native`.
   runs out: 15 s while a load, a generation or a device query is in flight,
   2 s for any other call, so quitting during a large generation can delay the
   exit by up to 15 s.
+- On Linux, Android excepted, `exit()` frees nothing and no static of the
+  library is ever destroyed (README, "Exit on Linux"): `__cxa_atexit` in
+  `src/sd_dart_exit.cpp` registers the library's exit handler in the place of
+  whatever it is given, so code in `src/` cannot rely on a destructor or an
+  `atexit()` handler running there. That handler never waits and never takes
+  time: a Dart VM aborts when `exit()` is held up while an isolate runs Dart
+  code. With a call in flight it ends the process with `_exit()` instead of
+  letting the rest of `exit()` run under the call. It blocks no thread: a
+  wrapper function called once the exit has begun returns at once with its
+  failure value and reaches neither upstream nor a driver. A change to any of
+  this needs the exit matrix of the README again, natively and under a Dart
+  VM, with no row worse than the release before.
 - An export that reads the library's statics without a tracked object, as a
   device query reads ggml's registry, is an `SdDartStaticsCall`: teardown
   returns at once when nothing is tracked, unless such a call is in flight.
@@ -56,16 +68,20 @@ python3 tools/validate_artifacts.py <target>
   bump, run it against the release build and again with
   `SD_EXIT_TEARDOWN_SANITIZER=address`, on a Mac where its control reports the
   Metal abort, with `SD_REQUIRE_METAL_GENERATION=1`: GitHub's runners reach
-  neither the abort nor a generation on Metal.
+  neither the abort nor a generation on Metal. Run it on Linux as well, with
+  `SD_EXIT_TEARDOWN_TARGET` set to a built Linux target, both ways.
 - Every shipped library must pass `validate_artifacts.py`: it exports exactly
   the `SD_API` symbols in `stable-diffusion.h` and `src/sd_dart_wrapper.h`, and
   links only allowlisted system libraries. Never export an upstream-internal
   or ggml symbol to fix a consumer; a leaked ggml symbol can collide with
   llama.cpp's ggml in the same process.
-- An Apple library must not import `__cxa_atexit`: exit teardown depends on
-  the hidden definition in `src/sd_dart_exit.cpp` receiving every static
-  destructor of the image. Keep that definition hidden; libllamadart has its
-  own.
+- An Apple or Linux library must not import `__cxa_atexit`: exit teardown
+  depends on the hidden definition in `src/sd_dart_exit.cpp` receiving every
+  static destructor of the image. Keep that definition hidden; libllamadart
+  has its own. Android libraries are left as they were and import it. A Linux
+  library must not import `std::ios_base::Init::Init()` either: build it with
+  GCC 13 or later, where `<iostream>` no longer puts a stream initializer,
+  whose destructor would be dropped, into every source.
 - The Apple XCFramework must pass `apple_xcframework.py validate` and
   `consumer`. Its Info.plist minimum OS is read from each binary's
   `LC_BUILD_VERSION`; never hard-code it, since a mismatch fails App Store

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
@@ -12,8 +13,11 @@
 #include <utility>
 #include <vector>
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || SD_DART_EXIT_ON_LINUX
 #include <dlfcn.h>
+#endif
+#if SD_DART_EXIT_ON_LINUX
+#include <unistd.h>
 #endif
 
 namespace {
@@ -51,6 +55,12 @@ struct Registry {
     int32_t work_wait_ms = 15000;
     std::atomic<bool> armed{false};
     std::atomic<bool> torn_down{false};
+#if SD_DART_EXIT_ON_LINUX
+    // The process whose threads the counts above are of.
+    pid_t process = getpid();
+    // Set once exit() has begun.
+    std::atomic<bool> exiting{false};
+#endif
 };
 
 Registry& state() {
@@ -84,6 +94,13 @@ enum CallKind : int {
 // its caller.
 bool admit(Registry& registry, std::unique_lock<std::mutex>& lock) {
     if (!registry.torn_down) {
+#if SD_DART_EXIT_ON_LINUX
+        // exit() frees nothing, so no thread has to be kept from what it
+        // holds: one that arrives once it has begun is refused, not blocked.
+        if (registry.exiting) {
+            return call_depth > 0;
+        }
+#endif
         return true;
     }
     if (teardown_thread) {
@@ -110,10 +127,93 @@ void destroy_static(void* argument) {
     sd_dart_exit_teardown();
     destructor.destroy(destructor.object);
 }
+#endif
 
+#if defined(__APPLE__) || SD_DART_EXIT_ON_LINUX
 using RegisterDestructor = int (*)(void (*)(void*), void*, void*);
 
 std::atomic<RegisterDestructor> system_cxa_atexit{nullptr};
+#endif
+
+#if SD_DART_EXIT_ON_LINUX
+#if defined(__GLIBC__)
+// Ends the process with the status exit() was given, without the handlers
+// that exit() has not run yet. Buffered stdio output is written first.
+void terminate_at_exit(int status, void*) {
+    fflush(nullptr);
+    _exit(status);
+}
+#endif
+
+// What C exit() runs on Linux. It frees nothing: nothing on Linux needs the
+// objects freed, and by then the exit handlers of a GPU driver may have run.
+// An exit with a context left alive is known to be clean, a free among those
+// handlers is not. From here on every call is refused.
+//
+// With no call in flight that is all, and exit() goes on. With one in
+// flight, the rest of exit() would run under it: the exit handlers and static
+// destructors of the libraries the call uses, a GPU driver's among them, and
+// then the host's. Waiting for the call instead holds exit() up, and a Dart
+// VM aborts when that happens while one of its isolates runs Dart code
+// (https://github.com/leehack/llamadart/issues/977); an image call cannot be
+// ended early either. So the process ends here, as dart:io's exit() ends it
+// on Linux: glibc runs a handler that is registered during exit() next and
+// gives one registered with on_exit() the status, and that handler flushes
+// stdio and calls _exit(). Where there is no on_exit(), the generations are
+// asked to cancel and exit() goes on under the calls, whose statics stay.
+void begin_exit(void*) {
+    Registry& registry = state();
+    // A child of fork() has none of the threads whose calls the registry
+    // counts.
+    if (getpid() != registry.process) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(registry.mutex);
+    if (registry.torn_down || registry.exiting.exchange(true)) {
+        return;
+    }
+    // A call in flight on this thread is exit() called from inside it.
+    if (registry.calls == (call_depth > 0 ? 1 : 0)) {
+        return;
+    }
+#if defined(__GLIBC__)
+    if (on_exit(terminate_at_exit, nullptr) == 0) {
+        return;
+    }
+#endif
+    for (const auto& [object, entry] : registry.objects) {
+        if (entry.cancel_fn != nullptr) {
+            entry.cancel_fn(object);
+        }
+    }
+}
+
+void begin_exit_handler() {
+    begin_exit(nullptr);
+}
+
+// exit() runs its handlers latest first, and this one has to run before the
+// handlers of whatever the calls in flight use. A GPU driver registers its
+// own when a device query or a load first opens it, so the handler is
+// registered again after those: once after the first device query, since
+// queries repeat, and after every load. A handler costs the C library a few
+// words and returns at once after the first.
+void register_exit_handler() {
+    if (!state().torn_down.load() && !state().exiting.load()) {
+        atexit(begin_exit_handler);
+    }
+}
+
+// Before the first load or device query begins, for an exit that arrives
+// during it: the handlers that __cxa_atexit below has registered until then
+// are as old as the library's first statics, and run after everything the
+// host registered since it loaded the library.
+void arm_first_call() {
+    static std::atomic<bool> armed{false};
+    if (!armed.exchange(true)) {
+        register_exit_handler();
+    }
+}
 #endif
 
 // Registers teardown to run at exit once something is tracked, so that it
@@ -124,6 +224,10 @@ void arm() {
 #if defined(__APPLE__)
     if (!state().armed.exchange(true)) {
         atexit(sd_dart_exit_teardown);
+    }
+#elif SD_DART_EXIT_ON_LINUX
+    if (!state().armed.exchange(true)) {
+        register_exit_handler();
     }
 #endif
 }
@@ -192,6 +296,9 @@ struct Call {
         if (counted) {
             enter_call(registry, kind);
         }
+#if SD_DART_EXIT_ON_LINUX
+        refused = !counted && !registry.torn_down;
+#endif
     }
     ~Call() {
         if (counted) {
@@ -206,6 +313,11 @@ struct Call {
     int kind;
     // False on the teardown thread once teardown has begun.
     bool counted;
+#if SD_DART_EXIT_ON_LINUX
+    // Whether exit() has begun, and the call must not begin: the exit
+    // handlers of what it would use may have run.
+    bool refused;
+#endif
 };
 
 // The errors logged between its construction and its destruction are what
@@ -227,7 +339,7 @@ void cancel_context(void* object) {
 
 }  // namespace
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || SD_DART_EXIT_ON_LINUX
 extern "C" {
 // The C++ runtime registers the destructor of every static in this library
 // through __cxa_atexit, and the linker binds those calls to this definition.
@@ -236,15 +348,37 @@ extern "C" {
 // first of them is destroyed: each destructor is registered behind a call to
 // teardown. A plain atexit handler cannot do that, as it only precedes the
 // statics that exist when it is registered.
+//
+// On Linux the exit handler above is registered in the place of the
+// destructor, and the static is never destroyed. exit() frees nothing there,
+// so nothing needs the statics gone, and the threads that are inside the
+// library while the process exits go on reading them
+// (https://github.com/leehack/llamadart/issues/949). What code in this
+// library passes to atexit() is dropped the same way where the C library
+// links atexit() into the calling image, as glibc does.
 __attribute__((visibility("hidden"))) int __cxa_atexit(void (*destroy)(void*), void* object, void* dso_handle) {
     RegisterDestructor system_register = system_cxa_atexit.load();
     if (system_register == nullptr) {
         system_register = reinterpret_cast<RegisterDestructor>(dlsym(RTLD_NEXT, "__cxa_atexit"));
+#if SD_DART_EXIT_ON_LINUX
+        // Not found, as from a library that musl opened RTLD_LOCAL: the
+        // static stays alive all the same, and the exit handler is registered
+        // through atexit() alone, which musl does not link into the image.
+        if (system_register == nullptr) {
+            return 0;
+        }
+#else
         if (system_register == nullptr) {
             return -1;
         }
+#endif
         system_cxa_atexit.store(system_register);
     }
+#if SD_DART_EXIT_ON_LINUX
+    (void)destroy;
+    (void)object;
+    return system_register(begin_exit, nullptr, dso_handle);
+#else
     auto* destructor = static_cast<StaticDestructor*>(malloc(sizeof(StaticDestructor)));
     if (destructor == nullptr) {
         return -1;
@@ -255,6 +389,7 @@ __attribute__((visibility("hidden"))) int __cxa_atexit(void (*destroy)(void*), v
         free(destructor);
     }
     return status;
+#endif
 }
 }
 #endif
@@ -391,15 +526,27 @@ void sd_dart_exit_teardown(void) {
 // The first query initializes the device, which a load would otherwise do,
 // so it gets the bound of a load.
 SdDartStaticsCall::SdDartStaticsCall() {
+#if SD_DART_EXIT_ON_LINUX
+    arm_first_call();
+#endif
     Registry& registry = state();
     std::unique_lock<std::mutex> lock(registry.mutex);
     counted_ = admit(registry, lock);
     if (counted_) {
         enter_call(registry, kObjectCall | kWorkCall);
     }
+#if SD_DART_EXIT_ON_LINUX
+    refused_ = !counted_ && !registry.torn_down;
+#endif
 }
 
 SdDartStaticsCall::~SdDartStaticsCall() {
+#if SD_DART_EXIT_ON_LINUX
+    static std::atomic<bool> armed{false};
+    if (counted_ && !armed.exchange(true)) {
+        register_exit_handler();
+    }
+#endif
     if (counted_) {
         Registry& registry = state();
         std::unique_lock<std::mutex> lock(registry.mutex);
@@ -408,9 +555,20 @@ SdDartStaticsCall::~SdDartStaticsCall() {
 }
 
 sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+#if SD_DART_EXIT_ON_LINUX
+    arm_first_call();
+#endif
     Call call(kObjectCall | kWorkCall);
     ErrorWindow errors;
+#if SD_DART_EXIT_ON_LINUX
+    if (call.refused) {
+        return nullptr;
+    }
+#endif
     sd_ctx_t* context = new_sd_ctx(sd_ctx_params);
+#if SD_DART_EXIT_ON_LINUX
+    register_exit_handler();
+#endif
     insert(context, free_context, cancel_context, SD_DART_EXIT_STAGE_CONTEXT);
     return context;
 }
@@ -421,6 +579,11 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                             int* num_images_out) {
     Call call(kWorkCall);
     ErrorWindow errors;
+#if SD_DART_EXIT_ON_LINUX
+    if (call.refused) {
+        return false;
+    }
+#endif
     return generate_image(sd_ctx, sd_img_gen_params, images_out, num_images_out);
 }
 

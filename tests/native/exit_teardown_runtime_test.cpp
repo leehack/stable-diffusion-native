@@ -10,11 +10,14 @@
 // loaded as it is; give the image size it needs.
 //
 // The other scenarios each run in their own process, as teardown runs once
-// per process, and most of them leave by returning from main: on Apple
-// platforms teardown then runs during exit(). Elsewhere it does not, and
-// `idle-untracked` applies: a context that is alive at exit must not abort.
-// `exit-in-generation` and `exit-in-load` show what exit() does there to a
-// call in flight that nothing waits for.
+// per process, and most of them leave by returning from main. On Apple
+// platforms teardown then runs during exit(). On Linux exit() frees nothing:
+// there the scenarios check that every tracked object is still tracked, and
+// `generate-wait`, `load-wait` and `free-quit`, which are about an exit that
+// waits and frees, do not apply. `exit-in-generation`, `exit-in-load` and
+// `exit-status` exit with a call in flight, which ends the process on Linux
+// before the host's own exit handlers. `generate-through-exit` and
+// `join-idle` are what a Linux exit goes on to with no call in flight.
 //
 // `generate` only loads, generates and frees, to tell whether the backend can
 // compute on this machine at all. Where it cannot, SD_EXIT_TEARDOWN_LOAD_ONLY
@@ -67,20 +70,33 @@ int64_t elapsed_ms(std::chrono::steady_clock::time_point since) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
 }
 
-// Whether the heap block that began at `object` has been freed.
-// AddressSanitizer poisons a freed block, and the macOS allocator reports no
-// size for one until it hands the block out again. No scenario that asks
-// runs anywhere else.
-bool is_freed(const void* object) {
+// Whether the heap block that began at `object` has been freed, for a build
+// that can tell: AddressSanitizer poisons a freed block, and the macOS
+// allocator reports no size for one until it hands the block out again.
 #if defined(SD_TEST_ADDRESS_SANITIZER)
+const bool kSeesFreedBlocks = true;
+bool is_freed(const void* object) {
     return __asan_address_is_poisoned(object) != 0;
-#elif defined(__APPLE__)
-    return malloc_size(object) == 0;
-#else
-    (void)object;
-    return false;
-#endif
 }
+#elif defined(__APPLE__)
+const bool kSeesFreedBlocks = true;
+bool is_freed(const void* object) {
+    return malloc_size(object) == 0;
+}
+#else
+const bool kSeesFreedBlocks = false;
+bool is_freed(const void*) {
+    return false;
+}
+#endif
+
+// Whether exit() frees the tracked objects. Where it does not, it blocks no
+// thread, and ends the process when a call is in flight.
+#if defined(__APPLE__)
+const bool kExitFrees = true;
+#else
+const bool kExitFrees = false;
+#endif
 
 // The object that owns the weights, runners and backends of a context: the
 // only member of upstream's sd_ctx_t. Unlike the 8-byte sd_ctx_t itself it is
@@ -303,6 +319,20 @@ bool wait_for_teardown() {
     return false;
 }
 
+// What a scenario returns when it leaves its verdict to a check that runs
+// during exit(). Where exit() frees nothing it can end the process before the
+// host's handlers, so there the check ends it with 0, and this status says
+// that the exit never reached the check. Where exit() frees, the process has
+// to go on from the check to the static destructors, ggml-metal's among them.
+const int kNotChecked = kExitFrees ? 0 : 3;
+
+void end_checked_exit() {
+    if (kNotChecked != 0) {
+        std::fflush(stdout);
+        std::_Exit(0);
+    }
+}
+
 // What the two objects tracked around the contexts saw during teardown.
 struct Witness {
     std::atomic<const void*> engine{nullptr};
@@ -311,6 +341,9 @@ struct Witness {
     std::atomic<bool> after_ran{false};
     // What else the scenario expects once teardown is over; null if nothing.
     std::atomic<const char* (*)()> failure{nullptr};
+    // Set by a scenario that returns from main with nothing in flight.
+    std::atomic<bool> idle{false};
+    std::chrono::steady_clock::time_point main_returned;
 };
 Witness witness;
 char witness_before[] = "before";
@@ -335,13 +368,24 @@ void free_after_contexts(void*) {
 void expect_teardown_ran() {
     const char* (*failure)() = witness.failure.load();
     const char* message      = failure != nullptr ? failure() : nullptr;
-    if (!witness.before_ran.load() || !witness.after_ran.load()) {
-        message = "exit teardown did not free the tracked objects";
+    if (kExitFrees) {
+        if (!witness.before_ran.load() || !witness.after_ran.load()) {
+            message = "exit teardown did not free the tracked objects";
+        }
+    } else if (witness.before_ran.load() || witness.after_ran.load() ||
+               sd_dart_exit_tracked_count() <= witness.expected_contexts.load()) {
+        message = "exit freed tracked objects";
+    } else if (sd_dart_exit_untrack(witness_before)) {
+        // Every thread that arrives once the exit has begun is refused.
+        message = "exit did not begin in the library";
+    } else if (witness.idle.load() && elapsed_ms(witness.main_returned) >= 100) {
+        message = "an exit with nothing in flight took time";
     }
     if (message != nullptr) {
         std::fprintf(stderr, "%s\n", message);
         std::_Exit(1);
     }
+    end_checked_exit();
 }
 
 // Call before anything is tracked: the check then runs after the teardown
@@ -374,7 +418,11 @@ int test_idle(const char* model, const char* backend, bool tracked) {
     // Tells the caller that whatever follows happened during exit().
     std::printf("%s on %s\n", load_only ? "loaded" : "generated", backend);
     std::fflush(stdout);
-    return 0;
+    // Right after a generation: where exit() frees nothing, it has nothing
+    // to give the thread time for.
+    witness.main_returned = std::chrono::steady_clock::now();
+    witness.idle.store(true);
+    return tracked ? kNotChecked : 0;
 }
 
 int test_generate(const char* model, const char* backend) {
@@ -395,7 +443,7 @@ int test_dispose(const char* model, const char* backend) {
         CHECK(sd_get_model_version_name(context) != nullptr);
         CHECK(sd_dart_exit_tracked_count() == 1);
         sd_dart_exit_free(context);
-        CHECK(is_freed(engine));
+        CHECK(!kSeesFreedBlocks || is_freed(engine));
         CHECK(sd_dart_exit_tracked_count() == 0);
         sd_dart_exit_free(context);
         sd_dart_cancel_generation(context, SD_CANCEL_ALL);
@@ -464,7 +512,7 @@ int test_generate_wait(const char* model, const char* backend) {
         sleep_ms(1);
     }
     teardown_requested.store(true);
-    return 0;
+    return kNotChecked;
 }
 
 // A load in flight when the process exits: teardown waits for it, and the
@@ -495,7 +543,7 @@ int test_load_wait(const char* model, const char* backend) {
         sleep_ms(1);
     }
     teardown_requested.store(true);
-    return 0;
+    return kNotChecked;
 }
 
 std::atomic<bool> freeing{false};
@@ -540,7 +588,7 @@ int test_late_load(const char* model, const char* backend) {
     // witness looks at it.
     witness.engine.store(engine_of(first));
     expect_contexts_freed_first();
-    return 0;
+    return kNotChecked;
 }
 
 std::atomic<bool> call_began{false};
@@ -551,43 +599,107 @@ void note_log(enum sd_log_level_t, const char*, void*) {
     call_began.store(true);
 }
 
-// Returns from main while another thread generates. Where teardown runs at
-// exit it waits for the generation; elsewhere exit() destroys the library's
-// statics under it.
-int test_exit_in_generation(const char* model, const char* backend) {
+// The host's own exit handler, registered before the first call into the
+// library, so it would run after the library's. Where exit() frees nothing,
+// it must not run at all once the process exits with a call in flight: the
+// rest of exit() would run under that call.
+void expect_exit_ends_process() {
+    CHECK(atexit([] {
+        std::fprintf(stderr, "exit went on to the host's handlers under a call in flight\n");
+        std::_Exit(1);
+    }) == 0);
+}
+
+void stay_in_call() {
+    call_began.store(true);
+    for (;;) {
+        sleep_ms(1000);
+    }
+}
+
+// Exits with `status` while another thread is inside a generation that does
+// not end. The process ends with that status and what it wrote to stdout.
+int test_exit_in_generation(const char* model, const char* backend, int status) {
+    expect_exit_ends_process();
     static sd_ctx_t* context = load(model, backend);
+    call_began.store(false);
+    on_progress.store([](int) { stay_in_call(); });
+    std::thread([] { generate(context, 40); }).detach();
+    while (!call_began.load()) {
+        sleep_ms(1);
+    }
+    std::printf("generating on %s\n", backend);
+    std::exit(status);
+}
+
+// The same for a load, the first of the process, with nothing tracked yet.
+int test_exit_in_load(const char* model, const char* backend) {
+    expect_exit_ends_process();
+    static const char* load_model   = model;
+    static const char* load_backend = backend;
+    call_began.store(false);
+    sd_set_log_callback([](enum sd_log_level_t, const char*, void*) { stay_in_call(); }, nullptr);
+    std::thread([] { load(load_model, load_backend); }).detach();
+    while (!call_began.load()) {
+        sleep_ms(1);
+    }
+    std::printf("loading on %s\n", backend);
+    return 0;
+}
+
+// Returns from main while another thread generates through upstream's own
+// functions, which the library does not see as a call in flight. exit() goes
+// on, the generation runs on through the rest of it, and on Linux, where
+// exit() destroys no static of the library, it finds everything it reads.
+int test_generate_through_exit(const char* model, const char* backend) {
+    CHECK(atexit([] {
+        sleep_ms(300);
+        end_checked_exit();
+    }) == 0);
+    static sd_ctx_t* context = load(model, backend, false);
     sd_set_log_callback(note_log, nullptr);
     call_began.store(false);
     on_progress.store([](int) { call_began.store(true); });
     std::thread([] {
         for (;;) {
-            generate(context, 40);
+            generate(context, 40, false);
         }
     }).detach();
     while (!call_began.load()) {
         sleep_ms(1);
     }
+    CHECK(sd_dart_exit_tracked_count() == 0);
     std::printf("generating on %s\n", backend);
     std::fflush(stdout);
-    return 0;
+    return kNotChecked;
 }
 
-// The same for a load.
-int test_exit_in_load(const char* model, const char* backend) {
-    static const char* load_model   = model;
-    static const char* load_backend = backend;
-    sd_set_log_callback(note_log, nullptr);
-    std::thread([] {
-        for (;;) {
-            sd_dart_exit_free(load(load_model, load_backend));
+std::atomic<bool> host_exiting{false};
+std::thread* host_worker = nullptr;
+
+// What a host's own exit handler does when it stops and joins its worker.
+// Call before anything else, so that it runs after the wait of exit().
+void join_worker_at_exit() {
+    CHECK(atexit([] {
+        host_exiting.store(true);
+        host_worker->join();
+        end_checked_exit();
+    }) == 0);
+}
+
+// A worker that the host joins at exit frees its context then. Where exit()
+// frees nothing, the free returns at once and the worker is not blocked.
+int test_join_idle(const char* model, const char* backend) {
+    join_worker_at_exit();
+    static sd_ctx_t* context = load(model, backend);
+    CHECK(load_only || generate(context, 1) == 1);
+    host_worker = new std::thread([] {
+        while (!host_exiting.load()) {
+            sleep_ms(1);
         }
-    }).detach();
-    while (!call_began.load()) {
-        sleep_ms(1);
-    }
-    std::printf("loading on %s\n", backend);
-    std::fflush(stdout);
-    return 0;
+        sd_dart_exit_free(context);
+    });
+    return kNotChecked;
 }
 
 std::atomic<int> device_queries{0};
@@ -700,7 +812,7 @@ int test_log(const char* model, const char* backend) {
     expect_contexts_freed_first();
     logged_before_exit.store(read_log(0));
     CHECK(sd_dart_log_dropped() == 0);
-    return 0;
+    return kNotChecked;
 }
 
 }  // namespace
@@ -754,10 +866,19 @@ int main(int argc, char** argv) {
             return test_query_quit();
         }
         if (scenario == "exit-in-generation") {
-            return test_exit_in_generation(model, backend);
+            return test_exit_in_generation(model, backend, 0);
+        }
+        if (scenario == "exit-status") {
+            return test_exit_in_generation(model, backend, 37);
         }
         if (scenario == "exit-in-load") {
             return test_exit_in_load(model, backend);
+        }
+        if (scenario == "generate-through-exit") {
+            return test_generate_through_exit(model, backend);
+        }
+        if (scenario == "join-idle") {
+            return test_join_idle(model, backend);
         }
     }
     std::fprintf(stderr, "usage: %s make-model <model> | <scenario> <model> <backend>|default [<size>]\n", argv[0]);

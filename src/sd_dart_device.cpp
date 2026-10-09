@@ -59,6 +59,11 @@ int32_t sd_dart_gpu_device_count(void) {
     }
     // ggml's device registry is a static that exit() destroys.
     SdDartStaticsCall call;
+#if SD_DART_EXIT_ON_LINUX
+    if (call.refused()) {
+        return SD_DART_GPU_UNAVAILABLE;
+    }
+#endif
     try {
         register_backends();
         int32_t devices    = 0;
@@ -81,6 +86,11 @@ int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memor
     }
     // ggml's device registry is a static that exit() destroys.
     SdDartStaticsCall call;
+#if SD_DART_EXIT_ON_LINUX
+    if (call.refused()) {
+        return SD_DART_GPU_UNAVAILABLE;
+    }
+#endif
     try {
         register_backends();
         ggml_backend_dev_t device = find_device(device_index);

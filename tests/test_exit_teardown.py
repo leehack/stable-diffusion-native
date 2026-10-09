@@ -3,7 +3,8 @@
 The test links `src/sd_dart_exit.cpp`, `src/sd_dart_log.cpp` and
 `src/sd_dart_device.cpp` against stand-ins for the upstream functions they
 wrap and for ggml's device registry, so it needs the submodules' headers but
-no built runtime.
+no built runtime. On Linux it also runs the scenarios of an exit that frees
+nothing and destroys no static.
 Each scenario runs in its own process, as teardown runs once per process.
 """
 
@@ -35,6 +36,12 @@ SANITIZERS = ("address", "thread")
 # bookkeeping in separate critical sections, 2 to 5 runs in 100 failed. A
 # sanitized build runs them once; it is slower and looks for something else.
 REPEATED = {"load-race": 400}
+# What only Linux does at exit: free nothing, destroy no static, block no
+# thread, and end the process where a call is in flight.
+LINUX_SCENARIOS = ("exit-ends-process-in-generation", "exit-ends-process-in-load",
+                   "exit-ends-process-in-query", "exit-ends-process-in-marked-call",
+                   "exit-from-own-call", "exit-after-driver-load", "exit-after-driver-query",
+                   "exit-in-fork-child", "exit-idle-after-call", "exit-refuses-late-calls")
 SANITIZER_ENV = {
     # The scenarios leave contexts and blocked threads behind on purpose.
     "ASAN_OPTIONS": "detect_leaks=0",
@@ -44,8 +51,10 @@ SANITIZER_ENV = {
 
 def compile_command(output: Path, sources: list[Path], *flags: str) -> list[str]:
     includes = [f"-I{directory}" for directory in INCLUDE_DIRS]
+    # dlsym() is in libdl before glibc 2.34.
+    libraries = ["-ldl"] if sys.platform == "linux" else []
     return [COMPILER, "-std=c++17", "-O1", "-g", "-pthread", "-DSD_DART_GPU_BACKEND=1", *flags,
-            *includes, *map(str, sources), "-o", str(output)]
+            *includes, *map(str, sources), "-o", str(output), *libraries]
 
 
 @unittest.skipIf(sys.platform == "win32", "uses a GCC or Clang command line")
@@ -75,6 +84,8 @@ class ExitTeardownTest(unittest.TestCase):
             self.assertIn("generate-in-flight", scenarios)
             self.assertIn("log-at-exit", scenarios)
             self.assertIn("device-memory-in-flight", scenarios)
+            for scenario in LINUX_SCENARIOS if sys.platform == "linux" else ("exit-in-flight",):
+                self.assertIn(scenario, scenarios)
 
             def run(scenario: str) -> subprocess.CompletedProcess:
                 return subprocess.run(

@@ -71,8 +71,42 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // or hot restart does. ggml-metal aborts in its static destructor while any
 // Metal buffer is still allocated, so teardown has to run before that
 // destructor. On Apple platforms it runs during exit(), before the first
-// static of this library is destroyed. Elsewhere, where that abort does not
-// exist, it runs only when sd_dart_exit_teardown() is called.
+// static of this library is destroyed.
+//
+// On Linux, Android excepted, exit() frees nothing, destroys no static of the
+// library and blocks no thread. Before, it destroyed the statics of the
+// library under the threads that were still inside a load or a generation
+// (https://github.com/leehack/llamadart/issues/949).
+// - The statics of the library are never destroyed, so a call that is still
+//   running while the process exits goes on finding them.
+// - With no call in flight, exit() goes on as in any process and takes no
+//   time in the library, also right after a call.
+// - With a call in flight, the rest of exit() would run under it: the exit
+//   handlers and static destructors of what the call uses, a GPU driver's
+//   among them. Waiting for the call instead would hold exit() up, and a Dart
+//   VM aborts when that happens while one of its isolates runs Dart code
+//   (https://github.com/leehack/llamadart/issues/977). So with glibc the
+//   process ends there, as after dart:io's exit(): buffered stdio output is
+//   written and _exit() is called with the status exit() was given. Exit
+//   handlers and static destructors that had not run by then do not run,
+//   the host's among them. Without glibc's on_exit(), exit() asks the
+//   generations to cancel and goes on under the calls.
+// - A function below that is called once the exit has begun returns at once
+//   and does nothing, so a thread that the host joins at exit is not held:
+//   sd_dart_new_sd_ctx() returns NULL, sd_dart_generate_image() false, a
+//   device query SD_DART_GPU_UNAVAILABLE, sd_dart_exit_track() and
+//   sd_dart_exit_untrack() false, and sd_dart_exit_free() frees nothing.
+//   Nothing on Linux needs the objects freed, and an exit with a context
+//   left alive is clean, which a free among the exit handlers of a GPU
+//   driver may not be.
+// - The library registers its exit handler with each static it creates,
+//   before the first load or device query, after the first device query and
+//   after every load. An exit handler that another library registers later
+//   than those runs before it.
+// quick_exit() and _exit() run nothing.
+//
+// On other platforms nothing runs at exit. sd_dart_exit_teardown() runs
+// teardown, frees included, on every platform.
 //
 // Objects are tracked by sd_dart_new_sd_ctx(), before it returns, and by
 // sd_dart_exit_track().
@@ -125,10 +159,12 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // allows a thread 250 ms after its last call in flight to finish what follows
 // it, which covers short calls such as sd_get_model_version_name() after a
 // load. A longer call on a tracked context that is not a call in flight, such
-// as generate_image() or generate_video(), is a use after free at exit, also
-// where exiting with the context alive was harmless. Contexts created by
-// new_sd_ctx() are not tracked, and exiting with one alive behaves as it did
-// before this registry existed.
+// as generate_image() or generate_video(), is a use after free wherever
+// teardown frees, also where exiting with the context alive was harmless.
+// Contexts created by new_sd_ctx() are not tracked, and exiting with one
+// alive behaves as it did before this registry existed, except that on Linux
+// exit() no longer destroys the statics of the library under a thread that
+// is using one.
 
 // Order in which exit teardown frees tracked objects: every object of a lower
 // stage before any object of a higher one, so an object goes before the
@@ -182,12 +218,13 @@ SD_API void sd_dart_exit_call_end(void);
 // abort in ggml-metal than exit late passes one value for both.
 SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms);
 
-// Runs exit teardown now; later runs do nothing. Afterwards tracked objects
-// are unusable and other threads that reach the functions above stay blocked,
-// so call it only as the last step before the process exits and follow it
-// directly with exit() or _exit() on the same thread. It is meant for native
-// hosts. Do not bind it from Dart: a Dart program that returns from main
-// after it waits forever for its blocked isolates.
+// Runs exit teardown now, frees included on every platform; later runs do
+// nothing. Afterwards tracked objects are unusable and other threads that
+// reach the functions above stay blocked, so call it only as the last step
+// before the process exits and follow it directly with exit() or _exit() on
+// the same thread. It is meant for native hosts. Do not bind it from Dart: a
+// Dart program that returns from main after it waits forever for its blocked
+// isolates.
 SD_API void sd_dart_exit_teardown(void);
 
 // new_sd_ctx() that tracks the context in the CONTEXT stage before it
