@@ -3,8 +3,8 @@
 
 Checks that each library exports exactly the `SD_API` symbols of the shipped
 headers (so no ggml symbol leaks) and, except on Windows, links only against
-allowlisted system libraries. An Apple library must also register its static
-destructors through its own `__cxa_atexit`.
+allowlisted system libraries. An Apple or Linux library must also register its
+static destructors through its own `__cxa_atexit`.
 """
 
 from __future__ import annotations
@@ -37,6 +37,18 @@ APPLE_DEPENDENCIES = re.compile(
 # the definition is there. That it wraps each destructor is what
 # `tests/test_exit_teardown.py` and `tests/test_exit_teardown_runtime.py` show.
 APPLE_STATIC_DESTRUCTOR_IMPORT = "___cxa_atexit"
+# The same definition is in a Linux library, where it registers the wait of
+# exit teardown in the place of each destructor. A library that imports the C
+# library's function has its statics destroyed by exit() under the threads that
+# are still inside it (leehack/llamadart#949). Android libraries are left as
+# they were and import it.
+ELF_STATIC_DESTRUCTOR_IMPORT = "__cxa_atexit"
+# `std::ios_base::Init::Init()`. Before GCC 13 every source that includes
+# <iostream> holds an object of that class, whose destructor flushes the
+# standard streams when the last one goes. A Linux library drops that
+# destructor with the others, and a host that writes to `std::cout` after
+# `std::ios::sync_with_stdio(false)` then loses what it had not flushed.
+ELF_STREAM_INIT_IMPORT = "_ZNSt8ios_base4InitC1Ev"
 ELF_DEPENDENCIES = {
     "android": {"libc.so", "libm.so", "libdl.so", "liblog.so"},
     "linux": {
@@ -99,6 +111,23 @@ def imports_symbol(library: Path, symbol: str, arch: str | None = None) -> bool:
     return symbol in output(["nm", "-uj", *select, str(library)]).split()
 
 
+def elf_undefined_symbols(dynamic_symbols: str) -> set[str]:
+    """The names a `readelf --dyn-syms -W` listing leaves undefined, without versions."""
+    names = set()
+    for line in dynamic_symbols.splitlines():
+        # Num: Value Size Type Bind Vis Ndx Name, and GNU readelf may add the
+        # version's index in brackets.
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].rstrip(":").isdigit() and fields[6] == "UND":
+            names.add(fields[7].split("@")[0])
+    return names
+
+
+def elf_imports_symbol(library: Path, symbol: str, readelf: str = "readelf") -> bool:
+    """Whether an ELF file imports `symbol` from another library."""
+    return symbol in elf_undefined_symbols(output([readelf, "--dyn-syms", "-W", str(library)]))
+
+
 def dependencies(target: Target, library: Path) -> list[str]:
     if target.os in ("macos", "ios"):
         lines = output(["otool", "-L", str(library)]).splitlines()[1:]
@@ -147,6 +176,18 @@ def validate(target: Target) -> list[str]:
         problems.append(
             f"imports {APPLE_STATIC_DESTRUCTOR_IMPORT}: static destructors bypass exit teardown"
         )
+
+    if target.os == "linux":
+        imports = elf_undefined_symbols(output(["readelf", "--dyn-syms", "-W", str(library)]))
+        if ELF_STATIC_DESTRUCTOR_IMPORT in imports:
+            problems.append(
+                f"imports {ELF_STATIC_DESTRUCTOR_IMPORT}: exit() destroys statics under calls in flight"
+            )
+        if ELF_STREAM_INIT_IMPORT in imports:
+            problems.append(
+                f"imports {ELF_STREAM_INIT_IMPORT}: built with a compiler older than GCC 13, "
+                "so the host's unflushed std::cout is lost at exit"
+            )
 
     if target.os == "android":
         small = [a for a in load_alignments(target, library) if a < ANDROID_PAGE_SIZE]

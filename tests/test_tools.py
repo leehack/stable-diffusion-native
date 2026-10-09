@@ -11,7 +11,14 @@ import apple_xcframework  # noqa: E402
 from build import HEADERS, TARGETS, WRAPPER_HEADER  # noqa: E402
 from package_release import TAG_PATTERN  # noqa: E402
 from sd_api import api_symbols  # noqa: E402
-from validate_artifacts import APPLE_STATIC_DESTRUCTOR_IMPORT, imports_symbol  # noqa: E402
+from validate_artifacts import (  # noqa: E402
+    APPLE_STATIC_DESTRUCTOR_IMPORT,
+    ELF_STATIC_DESTRUCTOR_IMPORT,
+    ELF_STREAM_INIT_IMPORT,
+    elf_imports_symbol,
+    elf_undefined_symbols,
+    imports_symbol,
+)
 
 HEADER = """
 #if __GNUC__ >= 4
@@ -113,6 +120,63 @@ class StaticDestructorImportTest(unittest.TestCase):
             system = self.build(tmp, "system", STATIC_WITH_DESTRUCTOR, "arm64", "x86_64")
             for arch in ("arm64", "x86_64"):
                 self.assertTrue(imports_symbol(system, APPLE_STATIC_DESTRUCTOR_IMPORT, arch))
+
+
+# `readelf --dyn-syms -W` of GNU binutils and of LLVM: the first appends the
+# index of a symbol's version, the second does not.
+GNU_DYNAMIC_SYMBOLS = """
+Symbol table '.dynsym' contains 5 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+     1: 0000000000000000     0 FUNC    WEAK   DEFAULT  UND __cxa_finalize@GLIBC_2.17 (3)
+     2: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND __cxa_atexit@GLIBC_2.17 (3)
+     3: 0000000000000000     0 FUNC    GLOBAL DEFAULT  UND dlsym@GLIBC_2.34 (9)
+     4: 00000000005d0a40   128 FUNC    GLOBAL DEFAULT   12 new_sd_ctx
+"""
+LLVM_DYNAMIC_SYMBOLS = """
+Symbol table '.dynsym' contains 4 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND
+     1: 0000000000000000     0 FUNC    GLOBAL DEFAULT   UND dlsym@GLIBC_2.34
+     2: 0000000000000000     0 FUNC    GLOBAL DEFAULT   UND __cxa_finalize
+     3: 00000000005d0a40   128 FUNC    GLOBAL DEFAULT    12 __cxa_atexit
+"""
+
+
+class ElfUndefinedSymbolsTest(unittest.TestCase):
+    def test_names_the_imports_without_their_versions(self):
+        self.assertEqual(elf_undefined_symbols(GNU_DYNAMIC_SYMBOLS),
+                         {"__cxa_finalize", "__cxa_atexit", "dlsym"})
+
+    def test_a_definition_of_the_name_is_not_an_import(self):
+        self.assertEqual(elf_undefined_symbols(LLVM_DYNAMIC_SYMBOLS), {"dlsym", "__cxa_finalize"})
+
+
+@unittest.skipUnless(sys.platform == "linux" and shutil.which("readelf") and shutil.which("c++"),
+                     "reads ELF imports with readelf")
+class ElfStaticDestructorImportTest(unittest.TestCase):
+    def build(self, directory: str, name: str, source: str) -> Path:
+        path = Path(directory) / f"{name}.cpp"
+        path.write_text(source)
+        library = Path(directory) / f"lib{name}.so"
+        subprocess.run([shutil.which("c++"), "-std=c++17", "-shared", "-fPIC", str(path),
+                        "-o", str(library)], check=True)
+        return library
+
+    def test_tells_the_system_registration_from_the_library_s_own(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self.build(tmp, "system", STATIC_WITH_DESTRUCTOR)
+            own = self.build(tmp, "own", STATIC_WITH_DESTRUCTOR + OWN_REGISTRATION)
+            self.assertTrue(elf_imports_symbol(system, ELF_STATIC_DESTRUCTOR_IMPORT))
+            self.assertFalse(elf_imports_symbol(own, ELF_STATIC_DESTRUCTOR_IMPORT))
+
+    def test_finds_the_stream_initializer_of_an_older_compiler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # What <iostream> defines in every source before GCC 13.
+            older = self.build(tmp, "older", "#include <ios>\nstatic std::ios_base::Init init;\n")
+            plain = self.build(tmp, "plain", STATIC_WITH_DESTRUCTOR)
+            self.assertTrue(elf_imports_symbol(older, ELF_STREAM_INIT_IMPORT))
+            self.assertFalse(elf_imports_symbol(plain, ELF_STREAM_INIT_IMPORT))
 
 
 class ReleaseTagTest(unittest.TestCase):
