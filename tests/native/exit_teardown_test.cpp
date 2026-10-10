@@ -37,6 +37,17 @@
 #include <malloc/malloc.h>
 #endif
 
+// Where exit() runs the wait of teardown and nothing else, as in
+// src/sd_dart_exit.cpp.
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <dlfcn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#define SD_TEST_EXIT_ON_LINUX 1
+#else
+#define SD_TEST_EXIT_ON_LINUX 0
+#endif
+
 #define CHECK(condition)                                                                       \
     do {                                                                                       \
         if (!(condition)) {                                                                    \
@@ -96,11 +107,70 @@ bool is_freed(const void*) {
 }
 #endif
 
+// What exit() does with the registry: teardown on Apple platforms, which
+// frees. On Linux it frees nothing, destroys no static and blocks no thread:
+// with no call in flight it only refuses the calls that arrive later, and
+// with one in flight it ends the process.
 #if defined(__APPLE__)
-const bool kTeardownRunsAtExit = true;
+const bool kExitRuns  = true;
+const bool kExitFrees = true;
+#elif SD_TEST_EXIT_ON_LINUX
+const bool kExitRuns  = false;
+const bool kExitFrees = false;
 #else
-const bool kTeardownRunsAtExit = false;
+const bool kExitRuns  = false;
+const bool kExitFrees = false;
 #endif
+
+// Runs `handler` during exit(), after whatever is registered later. This
+// program is one image with the registry, whose __cxa_atexit stands in for the
+// C library's. On Linux that definition registers the wait in the place of
+// what it is given, and glibc's atexit() is linked into the calling image and
+// reaches it, so there the handler goes to the C library itself.
+bool at_exit(void (*handler)()) {
+#if SD_TEST_EXIT_ON_LINUX
+    // As atexit() itself registers a handler; ThreadSanitizer's __cxa_atexit
+    // passes no argument on.
+    using Register             = int (*)(void (*)(void*), void*, void*);
+    const auto system_register = reinterpret_cast<Register>(dlsym(RTLD_DEFAULT, "__cxa_atexit"));
+    return system_register != nullptr &&
+           system_register(reinterpret_cast<void (*)(void*)>(handler), nullptr, nullptr) == 0;
+#else
+    return atexit(handler) == 0;
+#endif
+}
+
+// What a scenario returns when it leaves its verdict to a check that runs
+// during exit(). On Linux, where exit() can end the process before the
+// host's handlers, the check ends it with 0, and this status says that the
+// exit never reached the check.
+#if SD_TEST_EXIT_ON_LINUX
+const int kNotChecked = 3;
+#else
+const int kNotChecked = 0;
+#endif
+void (*exit_check)() = nullptr;
+
+bool check_at_exit(void (*check)()) {
+    exit_check = check;
+    return at_exit([] {
+        exit_check();
+        if (kNotChecked != 0) {
+            std::_Exit(0);
+        }
+    });
+}
+
+// Whether teardown or exit() has begun, for a thread that it does not block:
+// the one that ran teardown, and any thread where exit() frees nothing.
+bool teardown_refuses_this_thread() {
+    static char probe[] = "probe";
+    if (sd_dart_exit_track(probe, [](void*) {}, SD_DART_EXIT_STAGE_RESOURCE)) {
+        sd_dart_exit_untrack(probe);
+        return false;
+    }
+    return true;
+}
 
 // The stand-in for upstream's log: nothing without a callback, and a text
 // that is gone when the callback returns.
@@ -709,18 +779,28 @@ int test_blocked() {
 }
 
 void expect_freed_at_exit() {
-    const std::vector<std::string> expected = kTeardownRunsAtExit ? kStageOrder : std::vector<std::string>();
+    const std::vector<std::string> expected = kExitFrees ? kStageOrder : std::vector<std::string>();
     if (recorded() != expected) {
         std::fprintf(stderr, "exit teardown freed %zu objects, expected %zu\n", recorded().size(), expected.size());
+        std::_Exit(1);
+    }
+    if (teardown_refuses_this_thread() != kExitRuns) {
+        std::fprintf(stderr, "exit %s teardown\n", kExitRuns ? "did not run" : "ran");
+        std::_Exit(1);
+    }
+    const size_t tracked = kExitFrees ? 0 : kStageOrder.size();
+    if (sd_dart_exit_tracked_count() != static_cast<int32_t>(tracked)) {
+        std::fprintf(stderr, "%d objects are tracked after the exit, expected %zu\n", sd_dart_exit_tracked_count(),
+                     tracked);
         std::_Exit(1);
     }
 }
 
 int test_exit() {
     // Registered first, so it runs after the teardown registered by tracking.
-    CHECK(atexit(expect_freed_at_exit) == 0);
+    CHECK(check_at_exit(expect_freed_at_exit));
     track_out_of_stage_order();
-    return 0;
+    return kNotChecked;
 }
 
 struct LateStatic {
@@ -746,20 +826,24 @@ void free_and_read_late_static(void*) {
 }
 
 void expect_late_static_read() {
-    if (late_static_read.load() != kTeardownRunsAtExit) {
+    if (late_static_read.load() != kExitFrees) {
         std::fprintf(stderr, "exit teardown did not run before the statics were destroyed\n");
+        std::_Exit(1);
+    }
+    if (SD_TEST_EXIT_ON_LINUX && !LateStatic::alive.load()) {
+        std::fprintf(stderr, "exit destroyed a static of the library\n");
         std::_Exit(1);
     }
 }
 
 // A static that is created after the first object was tracked is also
-// destroyed only after teardown.
+// destroyed only after teardown, and where exit() frees nothing, not at all.
 int test_late_static() {
     static char reader[] = "reader";
-    CHECK(atexit(expect_late_static_read) == 0);
+    CHECK(check_at_exit(expect_late_static_read));
     CHECK(sd_dart_exit_track(reader, free_and_read_late_static, SD_DART_EXIT_STAGE_RESOURCE));
     CHECK(late_static().text.size() == 256);
-    return 0;
+    return kNotChecked;
 }
 
 // The context is tracked by the time the creating call returns, freed once
@@ -1077,12 +1161,12 @@ void hold_query_through_teardown() {
 int query_in_flight(void (*query)()) {
     // Registered before the registry exists, so it runs after the registry's
     // destructor, and with that after teardown.
-    CHECK(atexit([] {
+    CHECK(check_at_exit([] {
         if (recorded() != std::vector<std::string>({"query-finished"}) || query_returned.load()) {
             std::fprintf(stderr, "exit teardown did not wait for the device query\n");
             std::_Exit(1);
         }
-    }) == 0);
+    }));
     sd_dart_exit_set_wait_ms(30000, 30000);
     start_heartbeat();
     hold_query.store(hold_query_through_teardown);
@@ -1096,11 +1180,11 @@ int query_in_flight(void (*query)()) {
     }
     CHECK(sd_dart_exit_tracked_count() == 0);
     teardown_requested.store(true);
-    if (!kTeardownRunsAtExit) {
+    if (!kExitFrees) {
         sd_dart_exit_teardown();
         CHECK(recorded() == std::vector<std::string>({"query-finished"}));
     }
-    return 0;
+    return kNotChecked;
 }
 
 int test_device_memory_in_flight() {
@@ -1221,7 +1305,7 @@ void expect_teardown_logged() {
         after = next;
         freed = freed || std::strcmp(text, "diffusion_engine.cpp:4 - free_sd_ctx") == 0;
     }
-    if (after == 0 || freed != kTeardownRunsAtExit || (contexts_freed.load() == 1) != kTeardownRunsAtExit) {
+    if (after == 0 || freed != kExitFrees || (contexts_freed.load() == 1) != kExitFrees) {
         std::fprintf(stderr, "read %llu messages after teardown, the free's %s among them\n",
                      static_cast<unsigned long long>(after), freed ? "is" : "is not");
         std::_Exit(1);
@@ -1235,7 +1319,7 @@ void expect_teardown_logged() {
 // teardown and whatever exit() does after it.
 int test_log_at_exit() {
     // Registered first, so it runs after the teardown registered by tracking.
-    CHECK(atexit(expect_teardown_logged) == 0);
+    CHECK(check_at_exit(expect_teardown_logged));
     sd_dart_log_enable();
     sd_dart_log_set_level(SD_LOG_DEBUG);
     for (int i = 0; i < 2; ++i) {
@@ -1264,8 +1348,298 @@ int test_log_at_exit() {
     }
     sd_ctx_params_t params{};
     CHECK(sd_dart_new_sd_ctx(&params) != nullptr);
+    return kNotChecked;
+}
+
+#if defined(__APPLE__)
+std::atomic<bool> exit_call_returned{false};
+
+// A generation in flight when main returns: exit() cancels it and waits for
+// it, as teardown called by hand does, and frees the tracked objects.
+int test_exit_in_flight() {
+    CHECK(check_at_exit([] {
+        std::vector<std::string> expected = {"generation-finished"};
+        expected.insert(expected.end(), kStageOrder.begin(), kStageOrder.end());
+        if (recorded() != expected || contexts_freed.load() != 1 || exit_call_returned.load()) {
+            std::fprintf(stderr, "exit did not wait for the generation, or did not free\n");
+            std::_Exit(1);
+        }
+    }));
+    track_out_of_stage_order();
+    sd_dart_exit_set_wait_ms(30000, 30000);
+    start_heartbeat();
+    sd_ctx_params_t params{};
+    static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    run_generation.store([](sd_ctx_t* generating) {
+        CHECK(wait_for_teardown());
+        while (generating->cancel.load() != SD_CANCEL_ALL) {
+            sleep_ms(1);
+        }
+        sleep_ms(50);
+        CHECK(recorded().empty() && contexts_freed.load() == 0);
+        record("generation-finished");
+        return false;
+    });
+    std::thread([] {
+        sd_img_gen_params_t request{};
+        sd_dart_generate_image(context, &request, nullptr, nullptr);
+        exit_call_returned.store(true);
+    }).detach();
+    while (!context->generating.load()) {
+        sleep_ms(1);
+    }
+    teardown_requested.store(true);
+    return kNotChecked;
+}
+#endif
+
+#if SD_TEST_EXIT_ON_LINUX
+// The host's own exit handler, registered before the library has anything to
+// register, so it would run after it. It must not run at all once the
+// process exits with a call in flight.
+void host_handler_under_call() {
+    std::printf(";host callback");
+}
+
+const int kExitStatus = 37;
+
+// Runs `begin_call`, which leaves a thread inside a call in flight, in a
+// child process and exits there with kExitStatus and text in stdio's buffer.
+// The child has to end with that status and that text written, without
+// reaching its own exit handler: with a call in flight exit() ends the
+// process where the library's handler runs.
+int exit_ends_process(void (*begin_call)()) {
+    int out[2];
+    CHECK(pipe(out) == 0);
+    const pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        close(out[0]);
+        CHECK(dup2(out[1], STDOUT_FILENO) >= 0);
+        CHECK(at_exit(host_handler_under_call));
+        begin_call();
+        std::printf("buffered");
+        std::exit(kExitStatus);
+    }
+    close(out[1]);
+    char text[32] = {};
+    size_t length = 0;
+    for (ssize_t count = 0; (count = read(out[0], text + length, sizeof(text) - 1 - length)) > 0;) {
+        length += static_cast<size_t>(count);
+    }
+    int status = -1;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == kExitStatus);
+    CHECK(std::string(text) == "buffered;host callback");
     return 0;
 }
+
+std::atomic<bool> call_in_flight{false};
+
+bool stay_in_call() {
+    call_in_flight.store(true);
+    for (;;) {
+        sleep_ms(1000);
+    }
+}
+
+void wait_for_call_in_flight() {
+    while (!call_in_flight.load()) {
+        sleep_ms(1);
+    }
+}
+
+// A generation in flight when the process exits.
+int test_exit_ends_process_in_generation() {
+    return exit_ends_process([] {
+        sd_ctx_params_t params{};
+        static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+        run_generation.store([](sd_ctx_t*) { return stay_in_call(); });
+        std::thread([] {
+            sd_img_gen_params_t request{};
+            sd_dart_generate_image(context, &request, nullptr, nullptr);
+        }).detach();
+        wait_for_call_in_flight();
+    });
+}
+
+// The first load of the process in flight, with nothing tracked.
+int test_exit_ends_process_in_load() {
+    return exit_ends_process([] {
+        hold_load.store(stay_in_call);
+        std::thread([] {
+            sd_ctx_params_t params{};
+            sd_dart_new_sd_ctx(&params);
+        }).detach();
+        wait_for_call_in_flight();
+    });
+}
+
+// The first device query in flight, with nothing tracked.
+int test_exit_ends_process_in_query() {
+    return exit_ends_process([] {
+        hold_query.store([] { stay_in_call(); });
+        std::thread([] { sd_dart_gpu_device_count(); }).detach();
+        wait_for_call_in_flight();
+    });
+}
+
+// A call that a native caller marked itself, on an object it tracks.
+int test_exit_ends_process_in_marked_call() {
+    return exit_ends_process([] {
+        CHECK(sd_dart_exit_track(name("object"), free_named, SD_DART_EXIT_STAGE_CONTEXT));
+        std::thread([] {
+            sd_dart_exit_call_begin();
+            stay_in_call();
+        }).detach();
+        wait_for_call_in_flight();
+    });
+}
+
+// exit() called from inside a call in flight, as from a callback of that
+// call, with no other call in flight: exit() goes on to the host's handlers.
+int test_exit_from_own_call() {
+    CHECK(at_exit([] { std::_Exit(0); }));
+    sd_ctx_params_t params{};
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    run_generation.store([](sd_ctx_t*) -> bool { std::exit(kExitStatus); });
+    sd_img_gen_params_t request{};
+    sd_dart_generate_image(context, &request, nullptr, nullptr);
+    return 1;
+}
+
+std::atomic<int> driver_handlers_run{0};
+
+// The stand-in for what a GPU driver registers when a call first opens it.
+void driver_exit_handler() {
+    if (teardown_refuses_this_thread()) {
+        std::fprintf(stderr, "Linux exit incorrectly refused a host call\n");
+        std::_Exit(1);
+    }
+    driver_handlers_run.fetch_add(1);
+}
+
+void expect_driver_handlers(int count) {
+    static int expected = count;
+    CHECK(check_at_exit([] {
+        if (driver_handlers_run.load() != expected) {
+            std::fprintf(stderr, "%d of %d driver exit handlers ran\n", driver_handlers_run.load(), expected);
+            std::_Exit(1);
+        }
+    }));
+}
+
+// A load that is not the first one opens a driver. exit() runs its handlers
+// latest first, and the wait still runs before the driver's.
+int test_exit_after_driver_load() {
+    expect_driver_handlers(1);
+    sd_ctx_params_t params{};
+    CHECK(sd_dart_new_sd_ctx(&params) != nullptr);
+    hold_load.store([] {
+        CHECK(at_exit(driver_exit_handler));
+        return true;
+    });
+    CHECK(sd_dart_new_sd_ctx(&params) != nullptr);
+    return kNotChecked;
+}
+
+// The same for the first device query, with nothing tracked.
+int test_exit_after_driver_query() {
+    expect_driver_handlers(1);
+    hold_query.store([] { CHECK(at_exit(driver_exit_handler)); });
+    CHECK(sd_dart_gpu_device_count() == 1);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return kNotChecked;
+}
+
+std::chrono::steady_clock::time_point main_returned;
+
+// An exit with a context idle takes no time, also right after a call: with
+// nothing freed there is nothing to give a thread time for. It goes on to the
+// host's handlers, where this is checked.
+int test_exit_idle_after_call() {
+    CHECK(check_at_exit([] {
+        const int64_t waited = elapsed_ms(main_returned);
+        if (waited >= 100 || teardown_refuses_this_thread() || contexts_freed.load() != 0) {
+            std::fprintf(stderr, "an exit with nothing in flight took %lld ms\n", static_cast<long long>(waited));
+            std::_Exit(1);
+        }
+    }));
+    sd_ctx_params_t params{};
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    sd_img_gen_params_t request{};
+    CHECK(sd_dart_generate_image(context, &request, nullptr, nullptr));
+    main_returned = std::chrono::steady_clock::now();
+    return kNotChecked;
+}
+
+std::atomic<bool> host_exiting{false};
+std::thread* host_worker = nullptr;
+
+// What a host's own exit handler does when it stops and joins its worker.
+// Registered first, so it runs after the wait.
+void join_host_worker() {
+    host_exiting.store(true);
+    host_worker->join();
+    CHECK(contexts_freed.load() == 1);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+}
+
+// A worker that the host joins at exit frees its context and makes other
+// calls then. Each returns at once and does nothing: the worker is not
+// blocked, and nothing reaches upstream or a driver after the wait.
+int test_exit_refuses_late_calls() {
+    alarm(30);
+    CHECK(check_at_exit(join_host_worker));
+    sd_ctx_params_t params{};
+    static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    CHECK(sd_dart_gpu_device_count() == 1);
+    static char other[] = "other";
+    host_worker = new std::thread([] {
+        while (!host_exiting.load()) {
+            sleep_ms(1);
+        }
+        sd_dart_exit_call_begin();
+        sd_dart_exit_call_end();
+        CHECK(sd_dart_exit_track(other, free_named, SD_DART_EXIT_STAGE_RESOURCE));
+        CHECK(sd_dart_exit_untrack(other));
+        sd_dart_exit_free(context);
+    });
+    return kNotChecked;
+}
+
+// A child of fork() that calls exit() while the parent generates exits as any
+// process does, its own handlers included: the thread that generates is not
+// in the child.
+int test_exit_in_fork_child() {
+    // The child's own exit handler, older than the library's: registered here
+    // and copied by fork(). It runs when the child's exit() goes on.
+    CHECK(at_exit([] { std::_Exit(kExitStatus); }));
+    sd_ctx_params_t params{};
+    static sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    run_generation.store([](sd_ctx_t*) -> bool {
+        for (;;) {
+            sleep_ms(1000);
+        }
+    });
+    std::thread([] {
+        sd_img_gen_params_t request{};
+        sd_dart_generate_image(context, &request, nullptr, nullptr);
+    }).detach();
+    while (!context->generating.load()) {
+        sleep_ms(1);
+    }
+    const pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        std::exit(0);
+    }
+    int status = -1;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == kExitStatus);
+    std::_Exit(0);
+}
+#endif
 
 }  // namespace
 
@@ -1426,6 +1800,21 @@ int main(int argc, char** argv) {
         {"device-query-idle", test_device_query_idle},
         {"last-error", test_last_error},
         {"log-at-exit", test_log_at_exit},
+#if defined(__APPLE__)
+        {"exit-in-flight", test_exit_in_flight},
+#endif
+#if SD_TEST_EXIT_ON_LINUX
+        {"exit-preserves-host-in-generation", test_exit_ends_process_in_generation},
+        {"exit-preserves-host-in-load", test_exit_ends_process_in_load},
+        {"exit-preserves-host-in-query", test_exit_ends_process_in_query},
+        {"exit-preserves-host-in-marked-call", test_exit_ends_process_in_marked_call},
+        {"exit-from-own-call", test_exit_from_own_call},
+        {"exit-after-driver-load", test_exit_after_driver_load},
+        {"exit-after-driver-query", test_exit_after_driver_query},
+        {"exit-in-fork-child", test_exit_in_fork_child},
+        {"exit-idle-after-call", test_exit_idle_after_call},
+        {"exit-host-cleanup", test_exit_refuses_late_calls},
+#endif
     };
     for (const auto& candidate : scenarios) {
         if (scenario == candidate.name) {

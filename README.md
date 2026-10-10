@@ -172,7 +172,8 @@ Dart isolates down, a hot restart drops them without running finalizers, and
 an isolate that is killed during `new_sd_ctx` never sees the context that
 call returns. So the library keeps a registry of live objects and, on Apple
 platforms, frees what is left of it during `exit()`, before the first of its
-statics is destroyed.
+statics is destroyed. On Linux `exit()` frees nothing and keeps the statics
+alive; see [Exit on Linux](#exit-on-linux).
 
 | Function | Behavior |
 | --- | --- |
@@ -184,7 +185,7 @@ statics is destroyed.
 | `sd_dart_exit_tracked_count` | Number of tracked objects. |
 | `sd_dart_exit_call_begin`, `_end` | For C and C++ callers: mark a call in flight around an upstream function that has no wrapper. |
 | `sd_dart_exit_set_wait_ms` | How long teardown waits for calls in flight: `work_wait_ms` (15000 by default) while a load, a generation or a device query is among them, `wait_ms` (2000) otherwise. |
-| `sd_dart_exit_teardown` | Runs teardown now, for native hosts on platforms where it does not run by itself. Follow it directly with `exit()`. |
+| `sd_dart_exit_teardown` | Runs teardown now, frees included on every platform, for native hosts. Follow it directly with `exit()`. |
 
 A Dart caller replaces `new_sd_ctx`, `generate_image`, `sd_cancel_generation`
 and `free_sd_ctx` with the first four and binds nothing else: the remaining
@@ -265,23 +266,61 @@ What is not:
   `sd_dart_new_sd_ctx` is a use after free at exit. Native callers bracket
   such a call with `sd_dart_exit_call_begin` and `_end`; Dart callers cannot,
   because a killed isolate never reaches the end.
-- **Platforms other than Apple's.** The abort is ggml-metal's, so elsewhere
-  teardown runs only when a native host calls it. CI checks on Linux that a
-  context left alive at exit is harmless on the CPU, and reports what the
-  Vulkan backend does on Mesa lavapipe; no hardware Vulkan driver was tried.
-  A load or a generation in flight is not waited for there: `exit()` destroys
-  the library's statics under it, which crashed the worker thread on an NVIDIA
-  Vulkan driver
-  ([llamadart#949](https://github.com/leehack/llamadart/issues/949)). CI
-  reports, without failing, what such an exit does on its Linux runners.
+- **Frees at exit anywhere but on Apple platforms.** The abort is
+  ggml-metal's. On Linux `exit()` frees nothing, and on Android and Windows
+  nothing runs at exit: there teardown runs only when a native host calls it.
 - **Threads that teardown blocked stay blocked.** A static destructor or
   `atexit` handler of another library that joins one hangs the exit.
+
+#### Exit on Linux
+
+Linux, Android excepted, retains the library's owned statics through a hidden
+`__cxa_atexit` that drops their destructors. It registers no Linux wrapper exit
+handler. C exit runs normal host callbacks, dependency destructors and libc
+stream flushing: no forced `_exit`, early flush, wait, automatic free or
+late-call refusal. The host remains responsible for freeing its contexts.
+
+Before C exit, the native host stops new work, stops and joins workers, and
+shuts down its Dart isolates or Flutter engine. Await each isolate's exit and
+native finalizers; requesting a kill is insufficient. A native call in progress
+must complete before its isolate stops. Do not invoke explicit teardown before
+worker joins: it parks later guarded calls and can deadlock them.
+
+Direct C exit with live Dart isolates can abort the VM independently of this
+library ([#977](https://github.com/leehack/llamadart/issues/977)). Owned static
+retention cannot protect external GPU-driver or BLAS destructors. C exit while
+those dependency-using workers remain alive is outside this contract. A timeout
+does not establish quiescence; normal exit must wait or the host must explicitly
+choose its own abrupt termination policy. Apple automatic teardown, explicit
+teardown, Android and Windows are unchanged. musl and hardware GPU exit behavior
+remain unqualified.
+
+The rejected Linux candidate skipped earlier host callbacks and deadlocked
+when its unconditional `fflush(NULL)` met a worker's FILE lock that an earlier
+host callback would release. Removing only that flush lost buffered output.
+Neither behavior is part of this revision. Native preservation tests keep the
+FILE-lock scenario, earlier callback, status37 and buffered-output assertions.
+The maintained Dart runtime harness adds cooperative shutdown scenarios that
+await isolate exit before C exit. Raw exit scenarios are diagnostics and do not
+qualify the cooperative contract.
+
+Pre-implementation lifecycle proof in the llama.cpp owner used Dart3.13.1 /
+Linuxarm64 GCC14/glibc2.41 / stories15M CPU.60/60 cooperative model exits and
+15/15 no-model controls retained callbacks and output;15/15 raw no-model exits
+VM-aborted. This is host-lifecycle evidence, not qualification of this image
+runtime. Fresh image CPU/Metal/Vulkan runtime, sanitizers and driver qualification
+are still required on this exact revision. No prior result obtained by skipping
+host callbacks is current readiness evidence.
 
 `tests/test_exit_teardown.py` runs the registry against stand-ins for
 upstream, also under AddressSanitizer and ThreadSanitizer.
 `tests/test_exit_teardown_runtime.py` runs it against a built macOS runtime
 and a real `sd_ctx_t`, on Metal and on the CPU: the test writes a 12 MB
-PixArt model itself, so CI needs no download. Where no Metal residency set is
+PixArt model itself, so CI needs no download. Against a built Linux runtime
+(`SD_EXIT_TEARDOWN_TARGET`) the same supported scenarios must preserve host callbacks and native cleanup
+ordering on the CPU; raw exits with a call in flight remain diagnostic; what a Vulkan
+target does on its first Vulkan device, Mesa lavapipe in CI, is reported and
+not failed. Where no Metal residency set is
 live, as on GitHub's macOS runners, an untracked context exits cleanly and the
 Metal abort is not exercised; there the test shows each free through the
 allocator instead. Those runners also crash in ggml-metal when their virtual

@@ -71,8 +71,21 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // or hot restart does. ggml-metal aborts in its static destructor while any
 // Metal buffer is still allocated, so teardown has to run before that
 // destructor. On Apple platforms it runs during exit(), before the first
-// static of this library is destroyed. Elsewhere, where that abort does not
-// exist, it runs only when sd_dart_exit_teardown() is called.
+// static of this library is destroyed.
+//
+// On Linux, Android excepted, owned statics stay alive until the process is
+// gone. C exit() runs no wrapper handler, wait, automatic free, forced _exit
+// or late-call refusal. Host callbacks and libc stream flushing run normally.
+//
+// Before C exit(), stop and join workers and shut down Dart isolates / the
+// Flutter engine. Await isolate exit and native finalizers, not just a kill
+// request. A direct C exit() with live Dart isolates can abort the VM without
+// this library (llamadart#977). Retained owned statics do not protect driver
+// or BLAS destructors. Do not invoke explicit teardown before worker joins:
+// it parks later guarded calls and can deadlock those joins.
+//
+// quick_exit() and _exit() run nothing. Apple automatic teardown and explicit
+// sd_dart_exit_teardown() on every platform are unchanged.
 //
 // Objects are tracked by sd_dart_new_sd_ctx(), before it returns, and by
 // sd_dart_exit_track().
@@ -125,10 +138,12 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // allows a thread 250 ms after its last call in flight to finish what follows
 // it, which covers short calls such as sd_get_model_version_name() after a
 // load. A longer call on a tracked context that is not a call in flight, such
-// as generate_image() or generate_video(), is a use after free at exit, also
-// where exiting with the context alive was harmless. Contexts created by
-// new_sd_ctx() are not tracked, and exiting with one alive behaves as it did
-// before this registry existed.
+// as generate_image() or generate_video(), is a use after free wherever
+// teardown frees, also where exiting with the context alive was harmless.
+// Contexts created by new_sd_ctx() are not tracked, and exiting with one
+// alive behaves as it did before this registry existed, except that on Linux
+// exit() no longer destroys the statics of the library under a thread that
+// is using one.
 
 // Order in which exit teardown frees tracked objects: every object of a lower
 // stage before any object of a higher one, so an object goes before the
@@ -182,12 +197,13 @@ SD_API void sd_dart_exit_call_end(void);
 // abort in ggml-metal than exit late passes one value for both.
 SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms);
 
-// Runs exit teardown now; later runs do nothing. Afterwards tracked objects
-// are unusable and other threads that reach the functions above stay blocked,
-// so call it only as the last step before the process exits and follow it
-// directly with exit() or _exit() on the same thread. It is meant for native
-// hosts. Do not bind it from Dart: a Dart program that returns from main
-// after it waits forever for its blocked isolates.
+// Runs exit teardown now, frees included on every platform; later runs do
+// nothing. Afterwards tracked objects are unusable and other threads that
+// reach the functions above stay blocked, so call it only as the last step
+// before the process exits and follow it directly with exit() or _exit() on
+// the same thread. It is meant for native hosts. Do not bind it from Dart: a
+// Dart program that returns from main after it waits forever for its blocked
+// isolates.
 SD_API void sd_dart_exit_teardown(void);
 
 // new_sd_ctx() that tracks the context in the CONTEXT stage before it

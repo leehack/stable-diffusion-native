@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
@@ -110,11 +111,14 @@ void destroy_static(void* argument) {
     sd_dart_exit_teardown();
     destructor.destroy(destructor.object);
 }
+#endif
 
+#if defined(__APPLE__)
 using RegisterDestructor = int (*)(void (*)(void*), void*, void*);
 
 std::atomic<RegisterDestructor> system_cxa_atexit{nullptr};
 #endif
+
 
 // Registers teardown to run at exit once something is tracked, so that it
 // does not wait for the first static of this library to be destroyed. atexit
@@ -227,34 +231,31 @@ void cancel_context(void* object) {
 
 }  // namespace
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || SD_DART_EXIT_ON_LINUX
 extern "C" {
-// The C++ runtime registers the destructor of every static in this library
-// through __cxa_atexit, and the linker binds those calls to this definition.
-// Tracked objects use such statics, some of which stable-diffusion.cpp and
-// ggml create on first use at any time, so teardown has to run before the
-// first of them is destroyed: each destructor is registered behind a call to
-// teardown. A plain atexit handler cannot do that, as it only precedes the
-// statics that exist when it is registered.
+// Keep the definition hidden and owned by this image. Linux drops owned
+// static destructors without registering an exit callback. Host callbacks
+// and dependency destructors retain their normal libc ordering.
 __attribute__((visibility("hidden"))) int __cxa_atexit(void (*destroy)(void*), void* object, void* dso_handle) {
+#if SD_DART_EXIT_ON_LINUX
+    (void)destroy;
+    (void)object;
+    (void)dso_handle;
+    return 0;
+#else
     RegisterDestructor system_register = system_cxa_atexit.load();
     if (system_register == nullptr) {
         system_register = reinterpret_cast<RegisterDestructor>(dlsym(RTLD_NEXT, "__cxa_atexit"));
-        if (system_register == nullptr) {
-            return -1;
-        }
+        if (system_register == nullptr) return -1;
         system_cxa_atexit.store(system_register);
     }
     auto* destructor = static_cast<StaticDestructor*>(malloc(sizeof(StaticDestructor)));
-    if (destructor == nullptr) {
-        return -1;
-    }
-    *destructor      = {destroy, object};
+    if (destructor == nullptr) return -1;
+    *destructor = {destroy, object};
     const int status = system_register(destroy_static, destructor, dso_handle);
-    if (status != 0) {
-        free(destructor);
-    }
+    if (status != 0) free(destructor);
     return status;
+#endif
 }
 }
 #endif

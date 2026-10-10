@@ -1,3 +1,7 @@
+#include <chrono>
+#include <thread>
+#include <cstdio>
+#include <cstdlib>
 // Native side of tests/dart/exit_teardown.dart, linked against a built
 // runtime: it fills in the parameter structs, so that the harness can call
 // the runtime's own functions without mirroring those structs in Dart.
@@ -60,4 +64,15 @@ PROBE_API sd_img_gen_params_t* probe_generation_params(int steps, int size) {
     params->sample_params.sample_steps     = steps;
     params->sample_params.guidance.txt_cfg = 1.0f;
     return params;
+}
+
+// Registered by the host harness before creating any context. This callback
+// must complete, then normal libc exit must flush its buffered payload.
+extern "C" void probe_register_host_exit() {
+    atexit([] {
+        fprintf(stderr, "HOST_HANDLER_STARTED\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        fprintf(stderr, "HOST_HANDLER_COMPLETED\n");
+        fputs("C_BUFFERED_PAYLOAD\n", stdout);
+    });
 }

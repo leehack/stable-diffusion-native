@@ -21,6 +21,15 @@ Guidance for coding agents working in `stable-diffusion-native`.
   runs out: 15 s while a load, a generation or a device query is in flight,
   2 s for any other call, so quitting during a large generation can delay the
   exit by up to 15 s.
+- On Linux, Android excepted, owned statics are retained without a wrapper
+  exit handler (README, "Exit on Linux"). A native host must stop/join its
+  workers and shut down Dart isolates / its Flutter engine before C exit,
+  awaiting exit notifications and native finalizers. A kill request alone is
+  insufficient. Preserve normal host callbacks and libc flushing: never
+  flush early or force `_exit` from a wrapper exit callback. Owned static
+  retention does not protect driver/BLAS destructors or a live Dart VM.
+  Changes need the native and Dart host-shutdown matrix again; raw live-isolate
+  C exit is diagnostic and outside the accepted host contract.
 - An export that reads the library's statics without a tracked object, as a
   device query reads ggml's registry, is an `SdDartStaticsCall`: teardown
   returns at once when nothing is tracked, unless such a call is in flight.
@@ -56,16 +65,20 @@ python3 tools/validate_artifacts.py <target>
   bump, run it against the release build and again with
   `SD_EXIT_TEARDOWN_SANITIZER=address`, on a Mac where its control reports the
   Metal abort, with `SD_REQUIRE_METAL_GENERATION=1`: GitHub's runners reach
-  neither the abort nor a generation on Metal.
+  neither the abort nor a generation on Metal. Run it on Linux as well, with
+  `SD_EXIT_TEARDOWN_TARGET` set to a built Linux target, both ways.
 - Every shipped library must pass `validate_artifacts.py`: it exports exactly
   the `SD_API` symbols in `stable-diffusion.h` and `src/sd_dart_wrapper.h`, and
   links only allowlisted system libraries. Never export an upstream-internal
   or ggml symbol to fix a consumer; a leaked ggml symbol can collide with
   llama.cpp's ggml in the same process.
-- An Apple library must not import `__cxa_atexit`: exit teardown depends on
-  the hidden definition in `src/sd_dart_exit.cpp` receiving every static
-  destructor of the image. Keep that definition hidden; libllamadart has its
-  own.
+- An Apple or Linux library must not import `__cxa_atexit`: exit teardown
+  depends on the hidden definition in `src/sd_dart_exit.cpp` receiving every
+  static destructor of the image. Keep that definition hidden; libllamadart
+  has its own. Android libraries are left as they were and import it. A Linux
+  library must not import `std::ios_base::Init::Init()` either: build it with
+  GCC 13 or later, where `<iostream>` no longer puts a stream initializer,
+  whose destructor would be dropped, into every source.
 - The Apple XCFramework must pass `apple_xcframework.py validate` and
   `consumer`. Its Info.plist minimum OS is read from each binary's
   `LC_BUILD_VERSION`; never hard-code it, since a mismatch fails App Store

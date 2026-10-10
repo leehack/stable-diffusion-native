@@ -4,10 +4,10 @@ Needs the macOS runtime of this host under `bin/` (`tools/build.py build
 --target macos-arm64`) and skips without it. The test binary writes its own
 12 MB model, so nothing is downloaded.
 
-On Linux, where teardown does not run at exit, it checks that a context left
-alive at exit does not need it, and reports what an exit does to a load or a
-generation in flight, which nothing waits for there: set
-`SD_EXIT_TEARDOWN_TARGET` to a built Linux target.
+On Linux, where the host stops workers before ordinary exit(), it runs
+cooperative shutdown scenarios against a built Linux target: set
+`SD_EXIT_TEARDOWN_TARGET` to its name. They have to pass on the CPU. What a
+Vulkan target does on its first Vulkan device is reported and not failed.
 
     SD_REQUIRE_RUNTIME=1            fail instead of skipping
     SD_REQUIRE_DART=1               fail when no Dart SDK is on PATH; the
@@ -17,7 +17,8 @@ generation in flight, which nothing waits for there: set
                                     models on it; set it on a Mac
     SD_EXIT_TEARDOWN_SANITIZER=address
                                     build the runtime with AddressSanitizer
-                                    under build/ and test that one instead
+                                    under build/ and test that one instead,
+                                    on macOS or Linux
     SD_EXIT_TEARDOWN_RUNS=5         runs per scenario and backend
     SD_EXIT_TEARDOWN_MODEL=<file>   also run the scenarios on this model
     SD_EXIT_TEARDOWN_MODEL_SIZE=256 the image size that model needs
@@ -49,7 +50,7 @@ SOURCE = REPO_ROOT / "tests" / "native" / "exit_teardown_runtime_test.cpp"
 DART_PROBE = REPO_ROOT / "tests" / "native" / "exit_teardown_dart_probe.cpp"
 DART_HARNESS = REPO_ROOT / "tests" / "dart" / "exit_teardown.dart"
 DART_SCENARIOS = ("idle", "leaked", "killed-in-load", "killed-in-run", "exit-in-run",
-                  "exit-in-free")
+                  "exit-in-free", "host-shutdown", "host-shutdown-load")
 # How long after telling a worker to free its context `exit-in-free` exits.
 DART_FREE_DELAYS_US = (0, 2000, 6000)
 COMPILER = os.environ.get("CXX") or shutil.which("c++")
@@ -67,24 +68,35 @@ SCENARIOS = ("idle", "dispose", "free-quit", "cancel", "generate-wait", "load-wa
 GENERATING_SCENARIOS = ("cancel", "generate-wait")
 # `default` lets the runtime pick its device, which is Metal where there is one.
 BACKENDS = ("default", "cpu")
-# What Linux reports of an exit during a call, and how often it tries each.
-EXIT_IN_CALL_SCENARIOS = {"exit-in-load": "loading", "exit-in-generation": "generating"}
-EXIT_IN_CALL_RUNS = 5
+# On Linux exit() frees nothing and does not wait, so the scenarios of an exit
+# that does are left out. Added: a context that upstream's own functions
+# created and use, an exit with a call in flight, and a host whose exit handler
+# joins its worker.
+# Raw exit with live dependency-using workers is outside the host contract.
+# Keep those cases in the native probe for diagnostics, not release readiness.
+LINUX_SCENARIOS = ("idle", "dispose", "log", "idle-untracked", "join-idle",
+                   "host-shutdown-generation", "host-shutdown-load")
+# The status a scenario passes to exit(), where it is not 0, and what it
+# leaves in stdio's buffer when it exits with a call in flight.
+EXIT_STATUS = {"exit-status": 37}
+BUFFERED_OUTPUT = {"host-shutdown-generation": "COOPERATIVE_BUFFERED_OUTPUT",
+                   "host-shutdown-load": "COOPERATIVE_BUFFERED_OUTPUT", "exit-in-generation": "generating on", "exit-status": "generating on",
+                   "exit-in-load": "loading on"}
 METAL_ABORT = "[rsets->data count] == 0"
 SCENARIO_ENV = {"ASAN_OPTIONS": "detect_leaks=0"}
 
 
-def sanitized_library(sanitizer: str) -> Path:
+def sanitized_library(sanitizer: str, target: build.Target = TARGET) -> Path:
     """Builds the runtime as `tools/build.py` does, plus the sanitizer."""
-    work_dir = build.BUILD_ROOT / f"{TARGET.name}-{sanitizer}"
+    work_dir = build.BUILD_ROOT / f"{target.name}-{sanitizer}"
     work_dir.mkdir(parents=True, exist_ok=True)
     flags = f"-fsanitize={sanitizer} -fno-omit-frame-pointer -g"
     args = [f"{arg} {flags}" if arg.startswith("-DCMAKE_SHARED_LINKER_FLAGS=") else arg
-            for arg in build.configure_args(TARGET, work_dir)]
+            for arg in build.configure_args(target, work_dir)]
     args += [f"-DCMAKE_C_FLAGS={flags}", f"-DCMAKE_CXX_FLAGS={flags}"]
     build.run(["cmake", "-S", str(REPO_ROOT), "-B", str(work_dir), *args])
     build.run(["cmake", "--build", str(work_dir), "-j", str(os.cpu_count() or 4)])
-    return build.find_library(work_dir, TARGET.library)
+    return build.find_library(work_dir, target.library)
 
 
 def build_test(library: Path, output: Path, *flags: str, source: Path = SOURCE) -> None:
@@ -102,84 +114,93 @@ def annotate(level: str, message: str) -> None:
 
 @unittest.skipUnless(sys.platform == "linux" and LINUX_TARGET,
                      "set SD_EXIT_TEARDOWN_TARGET to a built Linux target")
-class LiveContextAtExitTest(unittest.TestCase):
-    """Nothing frees a context at exit here, so exiting with one must be harmless.
+class ExitWaitRuntimeTest(unittest.TestCase):
+    """On Linux exit() frees nothing and ends the process under a call in flight.
 
-    Checked on the CPU and, for a Vulkan target, on its first Vulkan device.
-    What happens on Vulkan is reported, not failed: it is a property of the
-    driver at hand, which CI only has in software (Mesa lavapipe).
+    The scenarios have to pass on the CPU. For a Vulkan target they also run
+    on its first Vulkan device, where the outcome is reported, not failed: it
+    is a property of the driver at hand, which CI only has in software (Mesa
+    lavapipe).
     """
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.target = build.TARGETS[LINUX_TARGET]
         library = build.BIN_ROOT / cls.target.name / "lib" / cls.target.library
-        if not library.is_file():
+        if SANITIZER:
+            library = sanitized_library(SANITIZER, cls.target)
+        elif not library.is_file():
             raise AssertionError(f"no runtime at {library}")
         cls.directory = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.directory.cleanup)
         cls.binary = Path(cls.directory.name) / "exit_teardown_runtime_test"
         cls.model = Path(cls.directory.name) / "model.safetensors"
-        build_test(library, cls.binary)
-        subprocess.run([str(cls.binary), "make-model", str(cls.model)], check=True, timeout=600)
+        build_test(library, cls.binary, *([f"-fsanitize={SANITIZER}"] if SANITIZER else []))
+        subprocess.run([str(cls.binary), "make-model", str(cls.model)], check=True, timeout=600,
+                       env={**os.environ, **SCENARIO_ENV})
         cls.backends = ["cpu"] + (["Vulkan0"] if "vulkan" in cls.target.accelerators else [])
 
-    def test_exits_cleanly_with_a_context_alive(self) -> None:
-        for backend in self.backends:
-            with self.subTest(backend=backend):
-                result = subprocess.run(
-                    [str(self.binary), "idle-untracked", str(self.model), backend],
-                    capture_output=True, text=True, timeout=600, errors="replace")
-                generated = f"generated on {backend}" in result.stdout
-                lines = result.stderr.strip().splitlines()
-                outcome = (f"{self.target.name} on {backend}: "
-                           + ("exit with a live context" if generated
-                              else "no context to exit with; the run")
-                           + f" returned {result.returncode}"
-                           + (f": {lines[-1]}" if result.returncode != 0 and lines else ""))
-                annotate("notice" if generated and result.returncode == 0 else "warning", outcome)
-                if backend == "cpu":
-                    self.assertTrue(generated, result.stderr)
-                    self.assertEqual(0, result.returncode, result.stderr)
+    def outcome(self, scenario: str, backend: str) -> tuple[str, str]:
+        """How one run ended, and its last line on stderr."""
+        try:
+            result = subprocess.run(
+                [str(self.binary), scenario, str(self.model), backend], capture_output=True,
+                text=True, timeout=600, errors="replace", env={**os.environ, **SCENARIO_ENV})
+        except subprocess.TimeoutExpired:
+            return "hung", ""
+        lines = result.stderr.strip().splitlines()
+        if result.returncode == EXIT_STATUS.get(scenario, 0):
+            if BUFFERED_OUTPUT.get(scenario, "") in result.stdout:
+                return "clean", ""
+            return "lost its buffered output", ""
+        ended = (signal.Signals(-result.returncode).name if result.returncode < 0
+                 else f"exit code {result.returncode}")
+        return ended, lines[-1][:200] if lines else ""
 
-    def test_reports_what_an_exit_during_a_call_does(self) -> None:
-        """Measured, never failed: nothing waits for a call in flight at exit here.
+    def test_cooperative_dart_host_shutdown(self) -> None:
+        if SANITIZER:
+            self.skipTest("the Dart VM cannot load a sanitized runtime")
+        if DART is None:
+            if os.environ.get("SD_REQUIRE_DART"):
+                self.fail("needs a Dart SDK on PATH")
+            self.skipTest("needs a Dart SDK on PATH")
+        library = build.BIN_ROOT / self.target.name / "lib" / self.target.library
+        probe = Path(self.directory.name) / "libexit_teardown_dart_probe.so"
+        build_test(library, probe, "-shared", "-fPIC", source=DART_PROBE)
+        for scenario in ("host-shutdown", "host-shutdown-load"):
+            for attempt in range(RUNS):
+                with self.subTest(scenario=scenario, run=attempt):
+                    result = subprocess.run(
+                        [DART, str(DART_HARNESS), str(library), str(probe), str(self.model),
+                         scenario, "tracked", "cpu", "64", "0"],
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    self.assertIn("HOST_WORKER_EXITED", result.stdout)
+                    self.assertIn("HOST_HANDLER_COMPLETED", result.stderr)
+                    self.assertIn("C_BUFFERED_PAYLOAD", result.stdout)
 
-        A thread that is inside a load or a generation when main returns goes
-        on using statics that exit() destroys (leehack/llamadart#949). The
-        counts say whether a runner reproduces that.
-        """
+    def test_cooperative_host_shutdown_preserves_normal_exit(self) -> None:
         for backend in self.backends:
-            for scenario, began in EXIT_IN_CALL_SCENARIOS.items():
+            for scenario in LINUX_SCENARIOS:
                 outcomes: dict[str, int] = {}
                 detail = ""
-                for _ in range(EXIT_IN_CALL_RUNS):
-                    try:
-                        result = subprocess.run(
-                            [str(self.binary), scenario, str(self.model), backend],
-                            capture_output=True, text=True, timeout=120, errors="replace")
-                    except subprocess.TimeoutExpired:
-                        outcome = "hung"
-                    else:
-                        lines = result.stderr.strip().splitlines()
-                        if f"{began} on {backend}" not in result.stdout:
-                            outcome = "never began the call"
-                        elif result.returncode == 0:
-                            outcome = "clean"
-                        elif result.returncode < 0:
-                            outcome = signal.Signals(-result.returncode).name
-                        else:
-                            outcome = f"exit code {result.returncode}"
-                        if outcome != "clean" and lines:
-                            detail = f"; last line: {lines[-1][:200]}"
-                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
-                summary = ", ".join(f"{count} {outcome}" for outcome, count in sorted(outcomes.items()))
-                annotate("notice" if set(outcomes) == {"clean"} else "warning",
-                         f"{self.target.name} on {backend}: {scenario}, "
-                         f"{EXIT_IN_CALL_RUNS} runs: {summary}{detail}")
+                for _ in range(RUNS):
+                    ended, last_line = self.outcome(scenario, backend)
+                    outcomes[ended] = outcomes.get(ended, 0) + 1
+                    detail = last_line or detail
+                summary = ", ".join(f"{count} {ended}" for ended, count in sorted(outcomes.items()))
+                message = (f"{self.target.name} on {backend}: {scenario}, {RUNS} runs: {summary}"
+                           + (f"; last line: {detail}" if detail else ""))
+                if backend == "cpu":
+                    with self.subTest(scenario=scenario):
+                        self.assertEqual({"clean"}, set(outcomes), message)
+                elif set(outcomes) != {"clean"}:
+                    annotate("warning", message)
+            if backend != "cpu":
+                annotate("notice", f"{self.target.name} ran the exit scenarios on {backend}")
 
 
-@unittest.skipUnless(sys.platform == "darwin", "exit teardown runs at exit on Apple platforms only")
+@unittest.skipUnless(sys.platform == "darwin", "exit frees the tracked objects on Apple platforms only")
 class ExitTeardownRuntimeTest(unittest.TestCase):
     binary: Path
     model: Path
@@ -309,7 +330,8 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
     def test_shares_a_process_with_libllamadart(self) -> None:
         """Each library tears down its own registry, whichever was loaded first."""
         binary = Path(self.directory.name) / "exit_teardown_two_libraries_test"
-        subprocess.run([COMPILER, "-std=c++17", "-O1", "-g", f"-I{REPO_ROOT / 'src'}",
+        sanitize = [f"-fsanitize={SANITIZER}"] if SANITIZER else []
+        subprocess.run([COMPILER, "-std=c++17", "-O1", "-g", *sanitize, f"-I{REPO_ROOT / 'src'}",
                         f"-I{build.HEADER.parent}", str(TWO_LIBRARIES), "-o", str(binary)],
                        check=True)
         for first in ("sd", "llama"):
