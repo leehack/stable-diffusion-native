@@ -73,40 +73,19 @@ SD_API size_t sd_dart_progress_read(uint64_t after,
 // destructor. On Apple platforms it runs during exit(), before the first
 // static of this library is destroyed.
 //
-// On Linux, Android excepted, exit() frees nothing, destroys no static of the
-// library and blocks no thread. Before, it destroyed the statics of the
-// library under the threads that were still inside a load or a generation
-// (https://github.com/leehack/llamadart/issues/949).
-// - The statics of the library are never destroyed, so a call that is still
-//   running while the process exits goes on finding them.
-// - With no call in flight, exit() goes on as in any process and takes no
-//   time in the library, also right after a call.
-// - With a call in flight, the rest of exit() would run under it: the exit
-//   handlers and static destructors of what the call uses, a GPU driver's
-//   among them. Waiting for the call instead would hold exit() up, and a Dart
-//   VM aborts when that happens while one of its isolates runs Dart code
-//   (https://github.com/leehack/llamadart/issues/977). So with glibc the
-//   process ends there, as after dart:io's exit(): buffered stdio output is
-//   written and _exit() is called with the status exit() was given. Exit
-//   handlers and static destructors that had not run by then do not run,
-//   the host's among them. Without glibc's on_exit(), exit() asks the
-//   generations to cancel and goes on under the calls.
-// - A function below that is called once the exit has begun returns at once
-//   and does nothing, so a thread that the host joins at exit is not held:
-//   sd_dart_new_sd_ctx() returns NULL, sd_dart_generate_image() false, a
-//   device query SD_DART_GPU_UNAVAILABLE, sd_dart_exit_track() and
-//   sd_dart_exit_untrack() false, and sd_dart_exit_free() frees nothing.
-//   Nothing on Linux needs the objects freed, and an exit with a context
-//   left alive is clean, which a free among the exit handlers of a GPU
-//   driver may not be.
-// - The library registers its exit handler with each static it creates,
-//   before the first load or device query, after the first device query and
-//   after every load. An exit handler that another library registers later
-//   than those runs before it.
-// quick_exit() and _exit() run nothing.
+// On Linux, Android excepted, owned statics stay alive until the process is
+// gone. C exit() runs no wrapper handler, wait, automatic free, forced _exit
+// or late-call refusal. Host callbacks and libc stream flushing run normally.
 //
-// On other platforms nothing runs at exit. sd_dart_exit_teardown() runs
-// teardown, frees included, on every platform.
+// Before C exit(), stop and join workers and shut down Dart isolates / the
+// Flutter engine. Await isolate exit and native finalizers, not just a kill
+// request. A direct C exit() with live Dart isolates can abort the VM without
+// this library (llamadart#977). Retained owned statics do not protect driver
+// or BLAS destructors. Do not invoke explicit teardown before worker joins:
+// it parks later guarded calls and can deadlock those joins.
+//
+// quick_exit() and _exit() run nothing. Apple automatic teardown and explicit
+// sd_dart_exit_teardown() on every platform are unchanged.
 //
 // Objects are tracked by sd_dart_new_sd_ctx(), before it returns, and by
 // sd_dart_exit_track().

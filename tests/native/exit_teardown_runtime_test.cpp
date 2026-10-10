@@ -375,9 +375,9 @@ void expect_teardown_ran() {
     } else if (witness.before_ran.load() || witness.after_ran.load() ||
                sd_dart_exit_tracked_count() <= witness.expected_contexts.load()) {
         message = "exit freed tracked objects";
-    } else if (sd_dart_exit_untrack(witness_before)) {
-        // Every thread that arrives once the exit has begun is refused.
-        message = "exit did not begin in the library";
+    } else if (!sd_dart_exit_untrack(witness_before)) {
+        // Linux C exit must not put the wrapper into a refusal state.
+        message = "Linux exit refused ordinary host cleanup";
     } else if (witness.idle.load() && elapsed_ms(witness.main_returned) >= 100) {
         message = "an exit with nothing in flight took time";
     }
@@ -702,6 +702,24 @@ int test_join_idle(const char* model, const char* backend) {
     return kNotChecked;
 }
 
+// Finish a dependency-using worker and free its context before C exit.
+int test_host_shutdown(const char* model, const char* backend, bool generating) {
+    CHECK(atexit([] {
+        CHECK(sd_dart_exit_tracked_count() == 0);
+        sleep_ms(300);
+        std::fprintf(stderr, "HOST_HANDLER_COMPLETED\n");
+    }) == 0);
+    std::thread worker([=] {
+        sd_ctx_t* context = load(model, backend);
+        if (generating) CHECK(generate(context, 1) == 1);
+        sd_dart_exit_free(context);
+    });
+    worker.join();
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    std::printf("COOPERATIVE_BUFFERED_OUTPUT\n");
+    return 0;
+}
+
 std::atomic<int> device_queries{0};
 
 // Returns from main while threads query the device memory and nothing is
@@ -876,6 +894,9 @@ int main(int argc, char** argv) {
         }
         if (scenario == "generate-through-exit") {
             return test_generate_through_exit(model, backend);
+        }
+        if (scenario == "host-shutdown-generation" || scenario == "host-shutdown-load") {
+            return test_host_shutdown(model, backend, scenario == "host-shutdown-generation");
         }
         if (scenario == "join-idle") {
             return test_join_idle(model, backend);

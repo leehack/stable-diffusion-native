@@ -24,18 +24,10 @@ public:
     SdDartStaticsCall(const SdDartStaticsCall&)            = delete;
     SdDartStaticsCall& operator=(const SdDartStaticsCall&) = delete;
 
-#if SD_DART_EXIT_ON_LINUX
-    // Whether exit() has begun, and the call must not begin: the exit
-    // handlers of the driver it would ask may have run.
-    bool refused() const { return refused_; }
-#endif
 
 private:
     // False on the teardown thread once teardown has begun.
     bool counted_;
-#if SD_DART_EXIT_ON_LINUX
-    bool refused_ = false;
-#endif
 };
 
 // Mark the start and end of a call whose error messages

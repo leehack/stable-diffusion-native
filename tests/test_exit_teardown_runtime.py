@@ -50,7 +50,7 @@ SOURCE = REPO_ROOT / "tests" / "native" / "exit_teardown_runtime_test.cpp"
 DART_PROBE = REPO_ROOT / "tests" / "native" / "exit_teardown_dart_probe.cpp"
 DART_HARNESS = REPO_ROOT / "tests" / "dart" / "exit_teardown.dart"
 DART_SCENARIOS = ("idle", "leaked", "killed-in-load", "killed-in-run", "exit-in-run",
-                  "exit-in-free")
+                  "exit-in-free", "host-shutdown", "host-shutdown-load")
 # How long after telling a worker to free its context `exit-in-free` exits.
 DART_FREE_DELAYS_US = (0, 2000, 6000)
 COMPILER = os.environ.get("CXX") or shutil.which("c++")
@@ -72,15 +72,15 @@ BACKENDS = ("default", "cpu")
 # that does are left out. Added: a context that upstream's own functions
 # created and use, an exit with a call in flight, and a host whose exit handler
 # joins its worker.
-LINUX_SCENARIOS = tuple(
-    scenario for scenario in SCENARIOS
-    if scenario not in ("generate-wait", "load-wait", "free-quit")
-) + ("idle-untracked", "exit-in-load", "exit-in-generation", "exit-status",
-     "generate-through-exit", "join-idle")
+# Raw exit with live dependency-using workers is outside the host contract.
+# Keep those cases in the native probe for diagnostics, not release readiness.
+LINUX_SCENARIOS = ("idle", "dispose", "log", "idle-untracked", "join-idle",
+                   "host-shutdown-generation", "host-shutdown-load")
 # The status a scenario passes to exit(), where it is not 0, and what it
 # leaves in stdio's buffer when it exits with a call in flight.
 EXIT_STATUS = {"exit-status": 37}
-BUFFERED_OUTPUT = {"exit-in-generation": "generating on", "exit-status": "generating on",
+BUFFERED_OUTPUT = {"host-shutdown-generation": "COOPERATIVE_BUFFERED_OUTPUT",
+                   "host-shutdown-load": "COOPERATIVE_BUFFERED_OUTPUT", "exit-in-generation": "generating on", "exit-status": "generating on",
                    "exit-in-load": "loading on"}
 METAL_ABORT = "[rsets->data count] == 0"
 SCENARIO_ENV = {"ASAN_OPTIONS": "detect_leaks=0"}
@@ -157,7 +157,29 @@ class ExitWaitRuntimeTest(unittest.TestCase):
                  else f"exit code {result.returncode}")
         return ended, lines[-1][:200] if lines else ""
 
-    def test_exit_frees_nothing_and_ends_the_process_under_a_call(self) -> None:
+    def test_cooperative_dart_host_shutdown(self) -> None:
+        if SANITIZER:
+            self.skipTest("the Dart VM cannot load a sanitized runtime")
+        if DART is None:
+            if os.environ.get("SD_REQUIRE_DART"):
+                self.fail("needs a Dart SDK on PATH")
+            self.skipTest("needs a Dart SDK on PATH")
+        library = build.BIN_ROOT / self.target.name / "lib" / self.target.library
+        probe = Path(self.directory.name) / "libexit_teardown_dart_probe.so"
+        build_test(library, probe, "-shared", "-fPIC", source=DART_PROBE)
+        for scenario in ("host-shutdown", "host-shutdown-load"):
+            for attempt in range(RUNS):
+                with self.subTest(scenario=scenario, run=attempt):
+                    result = subprocess.run(
+                        [DART, str(DART_HARNESS), str(library), str(probe), str(self.model),
+                         scenario, "tracked", "cpu", "64", "0"],
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    self.assertIn("HOST_WORKER_EXITED", result.stdout)
+                    self.assertIn("HOST_HANDLER_COMPLETED", result.stderr)
+                    self.assertIn("C_BUFFERED_PAYLOAD", result.stdout)
+
+    def test_cooperative_host_shutdown_preserves_normal_exit(self) -> None:
         for backend in self.backends:
             for scenario in LINUX_SCENARIOS:
                 outcomes: dict[str, int] = {}

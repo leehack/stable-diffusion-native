@@ -115,7 +115,7 @@ bool is_freed(const void*) {
 const bool kExitRuns  = true;
 const bool kExitFrees = true;
 #elif SD_TEST_EXIT_ON_LINUX
-const bool kExitRuns  = true;
+const bool kExitRuns  = false;
 const bool kExitFrees = false;
 #else
 const bool kExitRuns  = false;
@@ -830,7 +830,7 @@ void expect_late_static_read() {
         std::fprintf(stderr, "exit teardown did not run before the statics were destroyed\n");
         std::_Exit(1);
     }
-    if (kExitRuns && !kExitFrees && !LateStatic::alive.load()) {
+    if (SD_TEST_EXIT_ON_LINUX && !LateStatic::alive.load()) {
         std::fprintf(stderr, "exit destroyed a static of the library\n");
         std::_Exit(1);
     }
@@ -1398,8 +1398,7 @@ int test_exit_in_flight() {
 // register, so it would run after it. It must not run at all once the
 // process exits with a call in flight.
 void host_handler_under_call() {
-    std::fprintf(stderr, "exit went on to the host's handlers under a call in flight\n");
-    std::_Exit(1);
+    std::printf(";host callback");
 }
 
 const int kExitStatus = 37;
@@ -1431,7 +1430,7 @@ int exit_ends_process(void (*begin_call)()) {
     int status = -1;
     CHECK(waitpid(child, &status, 0) == child);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == kExitStatus);
-    CHECK(std::string(text) == "buffered");
+    CHECK(std::string(text) == "buffered;host callback");
     return 0;
 }
 
@@ -1513,8 +1512,8 @@ std::atomic<int> driver_handlers_run{0};
 
 // The stand-in for what a GPU driver registers when a call first opens it.
 void driver_exit_handler() {
-    if (!teardown_refuses_this_thread()) {
-        std::fprintf(stderr, "a driver's exit handler ran before the wait of teardown\n");
+    if (teardown_refuses_this_thread()) {
+        std::fprintf(stderr, "Linux exit incorrectly refused a host call\n");
         std::_Exit(1);
     }
     driver_handlers_run.fetch_add(1);
@@ -1561,7 +1560,7 @@ std::chrono::steady_clock::time_point main_returned;
 int test_exit_idle_after_call() {
     CHECK(check_at_exit([] {
         const int64_t waited = elapsed_ms(main_returned);
-        if (waited >= 100 || !teardown_refuses_this_thread() || contexts_freed.load() != 0) {
+        if (waited >= 100 || teardown_refuses_this_thread() || contexts_freed.load() != 0) {
             std::fprintf(stderr, "an exit with nothing in flight took %lld ms\n", static_cast<long long>(waited));
             std::_Exit(1);
         }
@@ -1582,10 +1581,8 @@ std::thread* host_worker = nullptr;
 void join_host_worker() {
     host_exiting.store(true);
     host_worker->join();
-    if (contexts_freed.load() != 0 || sd_dart_exit_tracked_count() != 1) {
-        std::fprintf(stderr, "a call that arrived after the wait of exit() freed or untracked something\n");
-        std::_Exit(1);
-    }
+    CHECK(contexts_freed.load() == 1);
+    CHECK(sd_dart_exit_tracked_count() == 0);
 }
 
 // A worker that the host joins at exit frees its context and makes other
@@ -1602,21 +1599,11 @@ int test_exit_refuses_late_calls() {
         while (!host_exiting.load()) {
             sleep_ms(1);
         }
-        const int loads = loads_begun.load();
-        sd_ctx_params_t late_params{};
-        sd_img_gen_params_t request{};
-        sd_dart_gpu_device_memory_t memory;
-        CHECK(sd_dart_new_sd_ctx(&late_params) == nullptr && loads_begun.load() == loads);
-        CHECK(!sd_dart_generate_image(context, &request, nullptr, nullptr) && !context->generating.load());
-        CHECK(last_request.load() == nullptr);
-        CHECK(sd_dart_gpu_device_count() == SD_DART_GPU_UNAVAILABLE);
-        CHECK(sd_dart_gpu_device_memory(0, &memory) == SD_DART_GPU_UNAVAILABLE);
-        CHECK(!sd_dart_exit_track(other, free_named, SD_DART_EXIT_STAGE_RESOURCE));
-        CHECK(!sd_dart_exit_untrack(context));
         sd_dart_exit_call_begin();
         sd_dart_exit_call_end();
+        CHECK(sd_dart_exit_track(other, free_named, SD_DART_EXIT_STAGE_RESOURCE));
+        CHECK(sd_dart_exit_untrack(other));
         sd_dart_exit_free(context);
-        sd_dart_cancel_generation(context, SD_CANCEL_ALL);
     });
     return kNotChecked;
 }
@@ -1817,16 +1804,16 @@ int main(int argc, char** argv) {
         {"exit-in-flight", test_exit_in_flight},
 #endif
 #if SD_TEST_EXIT_ON_LINUX
-        {"exit-ends-process-in-generation", test_exit_ends_process_in_generation},
-        {"exit-ends-process-in-load", test_exit_ends_process_in_load},
-        {"exit-ends-process-in-query", test_exit_ends_process_in_query},
-        {"exit-ends-process-in-marked-call", test_exit_ends_process_in_marked_call},
+        {"exit-preserves-host-in-generation", test_exit_ends_process_in_generation},
+        {"exit-preserves-host-in-load", test_exit_ends_process_in_load},
+        {"exit-preserves-host-in-query", test_exit_ends_process_in_query},
+        {"exit-preserves-host-in-marked-call", test_exit_ends_process_in_marked_call},
         {"exit-from-own-call", test_exit_from_own_call},
         {"exit-after-driver-load", test_exit_after_driver_load},
         {"exit-after-driver-query", test_exit_after_driver_query},
         {"exit-in-fork-child", test_exit_in_fork_child},
         {"exit-idle-after-call", test_exit_idle_after_call},
-        {"exit-refuses-late-calls", test_exit_refuses_late_calls},
+        {"exit-host-cleanup", test_exit_refuses_late_calls},
 #endif
     };
     for (const auto& candidate : scenarios) {

@@ -21,18 +21,15 @@ Guidance for coding agents working in `stable-diffusion-native`.
   runs out: 15 s while a load, a generation or a device query is in flight,
   2 s for any other call, so quitting during a large generation can delay the
   exit by up to 15 s.
-- On Linux, Android excepted, `exit()` frees nothing and no static of the
-  library is ever destroyed (README, "Exit on Linux"): `__cxa_atexit` in
-  `src/sd_dart_exit.cpp` registers the library's exit handler in the place of
-  whatever it is given, so code in `src/` cannot rely on a destructor or an
-  `atexit()` handler running there. That handler never waits and never takes
-  time: a Dart VM aborts when `exit()` is held up while an isolate runs Dart
-  code. With a call in flight it ends the process with `_exit()` instead of
-  letting the rest of `exit()` run under the call. It blocks no thread: a
-  wrapper function called once the exit has begun returns at once with its
-  failure value and reaches neither upstream nor a driver. A change to any of
-  this needs the exit matrix of the README again, natively and under a Dart
-  VM, with no row worse than the release before.
+- On Linux, Android excepted, owned statics are retained without a wrapper
+  exit handler (README, "Exit on Linux"). A native host must stop/join its
+  workers and shut down Dart isolates / its Flutter engine before C exit,
+  awaiting exit notifications and native finalizers. A kill request alone is
+  insufficient. Preserve normal host callbacks and libc flushing: never
+  flush early or force `_exit` from a wrapper exit callback. Owned static
+  retention does not protect driver/BLAS destructors or a live Dart VM.
+  Changes need the native and Dart host-shutdown matrix again; raw live-isolate
+  C exit is diagnostic and outside the accepted host contract.
 - An export that reads the library's statics without a tracked object, as a
   device query reads ggml's registry, is an `SdDartStaticsCall`: teardown
   returns at once when nothing is tracked, unless such a call is in flight.

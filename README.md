@@ -274,141 +274,51 @@ What is not:
 
 #### Exit on Linux
 
-On Linux a C `exit()` destroyed the statics of the library while other threads
-were still inside it, and those threads crashed
-([llamadart#949](https://github.com/leehack/llamadart/issues/949)): a
-generation in `ggml_cpu_extra_compute_forward`, over the vector of ggml's CPU
-buffer types, and a load in `ggml_backend_reg_name`, over ggml's backend
-registry. On Linux, Android excepted:
+Linux, Android excepted, retains the library's owned statics through a hidden
+`__cxa_atexit` that drops their destructors. It registers no Linux wrapper exit
+handler. C exit runs normal host callbacks, dependency destructors and libc
+stream flushing: no forced `_exit`, early flush, wait, automatic free or
+late-call refusal. The host remains responsible for freeing its contexts.
 
-- **The statics of the library are never destroyed.** The library's own
-  `__cxa_atexit`, the definition Apple builds use, registers the library's
-  exit handler in the place of each static destructor. A call that is still
-  running while the process exits goes on finding them, whichever function it
-  is. `validate_artifacts.py` fails a Linux library that imports the C
-  library's `__cxa_atexit`.
-- **`exit()` frees nothing.** Nothing on Linux needs the contexts freed, an
-  exit with one left alive is clean, and a free during `exit()` would run
-  among the exit handlers of a GPU driver in an order that nothing controls.
-  `sd_dart_exit_teardown`, for native hosts, still frees and blocks, as on
-  every platform.
-- **With no call in flight `exit()` goes on**, as in any process, and takes
-  no time in the library, also right after a call: with nothing freed there
-  is nothing to settle.
-- **With a call in flight the process ends where the library's handler
-  runs.** The rest of `exit()` would run under the call: the exit handlers
-  and static destructors of what the call uses, a GPU driver's among them.
-  Waiting for the call instead holds `exit()` up, and a Dart VM aborts when
-  that happens while one of its isolates runs Dart code
-  ([llamadart#977](https://github.com/leehack/llamadart/issues/977)), with
-  any library or none; a load or a sampling step cannot be ended early
-  either. So the library writes buffered stdio output and calls `_exit()`
-  with the status `exit()` was given, which is what `dart:io`'s `exit()` does
-  on Linux. It gets the status from glibc's `on_exit()`.
-- **It blocks no thread.** A wrapper function that is called once the exit
-  has begun returns at once and does nothing: `sd_dart_new_sd_ctx` returns
-  `NULL`, `sd_dart_generate_image` `false`, a device query
-  `SD_DART_GPU_UNAVAILABLE`, `sd_dart_exit_track` and `_untrack` `false`, and
-  `sd_dart_exit_free` frees nothing. A host whose own exit handler stops and
-  joins a worker is not held by a worker that frees its context then.
-- **The exit handler is registered again after whatever may have opened a
-  driver.** `exit()` runs its handlers latest first. The library registers
-  its own with each static it creates, before the first load or device query,
-  after the first device query and after every load.
+Before C exit, the native host stops new work, stops and joins workers, and
+shuts down its Dart isolates or Flutter engine. Await each isolate's exit and
+native finalizers; requesting a kill is insufficient. A native call in progress
+must complete before its isolate stops. Do not invoke explicit teardown before
+worker joins: it parks later guarded calls and can deadlock them.
 
-What it does not cover:
+Direct C exit with live Dart isolates can abort the VM independently of this
+library ([#977](https://github.com/leehack/llamadart/issues/977)). Owned static
+retention cannot protect external GPU-driver or BLAS destructors. C exit while
+those dependency-using workers remain alive is outside this contract. A timeout
+does not establish quiescence; normal exit must wait or the host must explicitly
+choose its own abrupt termination policy. Apple automatic teardown, explicit
+teardown, Android and Windows are unchanged. musl and hardware GPU exit behavior
+remain unqualified.
 
-- **The rest of `exit()` when a call is in flight.** Exit handlers and static
-  destructors that `exit()` had not run when it reached the library's handler
-  do not run: those the host or another library registered before it, and
-  the destructors of libraries. stdio buffers are written; a C++ stream that
-  is not synchronized with stdio is not flushed. Before, such an exit crashed
-  in 3 to 50 of 50 runs (below). A native host that needs its handlers ends
-  its calls before it exits.
-- **A C library other than glibc.** The status comes from `on_exit()`. Without
-  it `exit()` asks the generations to cancel and goes on under the calls,
-  whose statics stay. A build of that variant passed the 200 native exits
-  while generating below as well, but under a Dart VM on lavapipe 5 of 20
-  exits with a busy isolate aborted, against 7 of 20 before, because the
-  driver's own exit takes time. No musl target is built and none was run.
-- **An exit handler that another library registers later than the library's
-  latest one** runs before it, under the calls in flight: a driver that
-  registers one in the middle of a call, for example.
-- **Calls the library does not see.** `exit()` goes on under an upstream
-  function such as `generate_image` that is not a call in flight. It finds
-  the statics of the library, but not necessarily what it uses of a driver.
-- **An exit with a context idle on a GPU under a Dart VM.** `exit()` goes on
-  there, and the driver's own exit takes time (0.1 to 0.5 s on lavapipe), so
-  a VM with an isolate running Dart code can still abort: 15 of 150 such
-  exits, against 33 of 150 before.
-- What code inside the library passes to `atexit()` is not run, since glibc
-  links `atexit()` into the calling image, where it reaches the same
-  definition. Neither stable-diffusion.cpp nor a ggml backend built here
-  registers a handler.
-- A library built with GCC before 13 holds a stream initializer in every
-  source that includes `<iostream>`, whose destructor would be dropped with
-  the others: `validate_artifacts.py` fails such a library.
-- `dlclose` of the library runs its exit handler and leaves the statics as
-  they are. `quick_exit` and `_exit` run nothing, as before. A child of
-  `fork` exits as any process does.
-- Android is left as it was: an exit during a call in flight has not been
-  examined there. Windows does not apply, going by the documented behavior of
-  its C runtime and not by a run: `exit()` ends in `ExitProcess`, which
-  terminates the other threads before any DLL destroys its statics.
-- No hardware GPU driver was tried.
+The rejected Linux candidate skipped earlier host callbacks and deadlocked
+when its unconditional `fflush(NULL)` met a worker's FILE lock that an earlier
+host callback would release. Removing only that flush lost buffered output.
+Neither behavior is part of this revision. Native preservation tests keep the
+FILE-lock scenario, earlier callback, status37 and buffered-output assertions.
+The maintained Dart runtime harness adds cooperative shutdown scenarios that
+await isolate exit before C exit. Raw exit scenarios are diagnostics and do not
+qualify the cooperative contract.
 
-Measured in a Linux arm64 container (Ubuntu 24.04, glibc 2.39, GCC 13.3) on
-an Apple M4 Max with SDXS (q8, 128 × 128) loaded as `llamadart` loads it, on
-the CPU and on Mesa 25.2.8 lavapipe. A probe opens the library with `dlopen`
-and calls C `exit()` on the main thread while another thread is inside
-`sd_dart_new_sd_ctx` or `sd_dart_generate_image`. "Slow host" adds an exit
-handler of the probe's own that takes 300 ms and runs last, as the handlers of
-a larger host do. A run fails with a signal or an exit code other than 0.
-
-| Exit | Device | Host | `v0.2.0-2` | Now |
-| --- | --- | --- | --- | --- |
-| while generating, after the first sampling step | CPU | fast, slow | 7, 50 of 50 | 0, 0 of 50 |
-| | lavapipe | fast, slow | 3, 8 of 50 | 0, 0 of 50 |
-| 50 ms into the first load | lavapipe | fast, slow | 0, 40 of 50 | 0, 0 of 50 |
-| 250 ms into the first load | lavapipe | fast, slow | 4, 50 of 50 | 0, 0 of 50 |
-| halfway through a third load | lavapipe | fast, slow | 4, 50 of 50 | 0, 0 of 50 |
-| during a load, the three moments above | CPU | fast, slow | 0, 10 of 10 each | 0, 0 of 10 each |
-| 30 ms into a generation | CPU | fast, slow | 0, 10 of 10 | 0, 0 of 10 |
-| | lavapipe | fast, slow | 0, 0 of 10 | 0, 0 of 10 |
-| `return` from `main` while generating | CPU | fast, slow | 3, 10 of 10 | 0, 0 of 10 |
-| | lavapipe | fast, slow | 1, 0 of 10 | 0, 0 of 10 |
-| context idle; context freed; `return` from `main` with a context idle | CPU, lavapipe | fast, slow | 0 of 10 each | 0 of 10 each |
-
-The frames before were `ggml_cpu_extra_compute_forward` for a generation and
-`ggml_backend_reg_name` under `new_sd_ctx` for a load. An exit with a context
-idle takes as long as before, at most 20 ms on the CPU with the fast host.
-
-The same exits from a Dart VM (3.13.1), C `exit()` through FFI on the main
-isolate, 10 runs each. "Timer" and "spinning" add an isolate that runs Dart
-code at the exit, every 5 ms or all the time:
-
-| Exit | Device | `v0.2.0-2` | Now |
-| --- | --- | --- | --- |
-| while generating: no other isolate, timer, spinning | CPU | 0, 0, 1 of 20 | 0, 0, 0 of 20 |
-| | lavapipe | 0, 0, 7 of 20 | 0, 0, 0 of 20 |
-| context idle, five shapes with and without the other isolate | CPU | 0 of 10 each | 0 of 10 each |
-| context idle, spinning isolate, three shapes of 50 | lavapipe | 13, 16, 4 of 50 | 9, 4, 2 of 50 |
-
-Two other designs were built and measured and are not what the library does.
-Waiting in `exit()` for the calls in flight, as Apple platforms do, made the
-Dart rows worse than before: with the timer isolate 7 of 10 exits aborted on
-the CPU and 10 of 10 on lavapipe, and with the spinning one 10 of 10 on both.
-Going on with `exit()` under the calls is the variant without `on_exit()`
-described above.
+Pre-implementation lifecycle proof in the llama.cpp owner used Dart3.13.1 /
+Linuxarm64 GCC14/glibc2.41 / stories15M CPU.60/60 cooperative model exits and
+15/15 no-model controls retained callbacks and output;15/15 raw no-model exits
+VM-aborted. This is host-lifecycle evidence, not qualification of this image
+runtime. Fresh image CPU/Metal/Vulkan runtime, sanitizers and driver qualification
+are still required on this exact revision. No prior result obtained by skipping
+host callbacks is current readiness evidence.
 
 `tests/test_exit_teardown.py` runs the registry against stand-ins for
 upstream, also under AddressSanitizer and ThreadSanitizer.
 `tests/test_exit_teardown_runtime.py` runs it against a built macOS runtime
 and a real `sd_ctx_t`, on Metal and on the CPU: the test writes a 12 MB
 PixArt model itself, so CI needs no download. Against a built Linux runtime
-(`SD_EXIT_TEARDOWN_TARGET`) the same scenarios have to end with every tracked
-object still tracked, on the CPU, together with those of an exit with a
-call in flight and of a host that joins its worker at exit; what a Vulkan
+(`SD_EXIT_TEARDOWN_TARGET`) the same supported scenarios must preserve host callbacks and native cleanup
+ordering on the CPU; raw exits with a call in flight remain diagnostic; what a Vulkan
 target does on its first Vulkan device, Mesa lavapipe in CI, is reported and
 not failed. Where no Metal residency set is
 live, as on GitHub's macOS runners, an untracked context exits cleanly and the

@@ -174,6 +174,11 @@ void worker((SendPort, List<String>) arguments) {
   events.send('loading');
   final context = runtime.loadContext();
   events.send('loaded');
+  if (scenario == 'host-shutdown' || scenario == 'host-shutdown-load') {
+    if (scenario == 'host-shutdown') runtime.generateOn(context);
+    runtime.free(context);
+    return;
+  }
   if (scenario == 'leaked' || scenario == 'killed-in-load') {
     // Keeps the isolate alive until it is killed.
     ReceivePort();
@@ -192,6 +197,12 @@ void worker((SendPort, List<String>) arguments) {
 
 Future<void> main(List<String> arguments) async {
   final scenario = arguments[3];
+  if (scenario.startsWith('host-shutdown')) {
+    DynamicLibrary.open(arguments[1])
+        .lookupFunction<Void Function(), void Function()>(
+          'probe_register_host_exit',
+        )();
+  }
   final runtime = Runtime(arguments);
   if (scenario == 'idle') {
     runtime.generateOn(runtime.loadContext());
@@ -225,6 +236,7 @@ Future<void> main(List<String> arguments) async {
     cExit(0);
   }
   final waitFor = switch (scenario) {
+    'host-shutdown' || 'host-shutdown-load' => 'loaded',
     'leaked' => 'loaded',
     'killed-in-load' => 'loading',
     _ => 'generating',
@@ -234,7 +246,9 @@ Future<void> main(List<String> arguments) async {
     await Future<void>.delayed(const Duration(milliseconds: 20));
     cExit(0);
   }
-  isolate.kill(priority: Isolate.immediate);
+  if (!scenario.startsWith('host-shutdown')) {
+    isolate.kill(priority: Isolate.immediate);
+  }
   await exited.first;
   exited.close();
   logPoll.cancel();
@@ -242,5 +256,15 @@ Future<void> main(List<String> arguments) async {
   if (runtime.logSequence == 0) {
     stderr.writeln('exit teardown: the worker logged nothing');
     exit(4);
+  }
+  if (scenario.startsWith('host-shutdown')) {
+    events.close();
+    final count = DynamicLibrary.open(arguments[0])
+        .lookupFunction<Int32 Function(), int Function()>(
+          'sd_dart_exit_tracked_count',
+        )();
+    if (count != 0) throw StateError('host shutdown left tracked contexts');
+    stdout.writeln('HOST_WORKER_EXITED');
+    cExit(0);
   }
 }
