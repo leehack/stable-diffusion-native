@@ -4,8 +4,8 @@ Needs the macOS runtime of this host under `bin/` (`tools/build.py build
 --target macos-arm64`) and skips without it. The test binary writes its own
 12 MB model, so nothing is downloaded.
 
-On Linux, where exit() frees nothing and ends the process when a call is in
-flight, it runs the scenarios of that against a built Linux target: set
+On Linux, where the host stops workers before ordinary exit(), it runs
+cooperative shutdown scenarios against a built Linux target: set
 `SD_EXIT_TEARDOWN_TARGET` to its name. They have to pass on the CPU. What a
 Vulkan target does on its first Vulkan device is reported and not failed.
 

@@ -122,15 +122,18 @@ jobs:
         env:
           # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
           GGML_VK_VISIBLE_DEVICES: "0"
-      - name: Exit with calls in flight
-        # On Linux exit() frees nothing, keeps the library's statics alive and
-        # waits only for a host that asked. The scenarios have to pass on the
+      - uses: dart-lang/setup-dart@v1
+        if: runner.os == 'Linux' && matrix.smoke
+      - name: Verify cooperative host shutdown
+        # On Linux the host joins workers before exit(). The scenarios pass on the
         # CPU; the Vulkan target's on lavapipe are reported.
         if: runner.os == 'Linux' && matrix.smoke
         run: python3 -m unittest discover -s tests -p test_exit_teardown_runtime.py -v
         env:
           SD_EXIT_TEARDOWN_TARGET: ${{ matrix.target }}
           SD_EXIT_TEARDOWN_RUNS: "3"
+          SD_REQUIRE_RUNTIME: "1"
+          SD_REQUIRE_DART: "1"
           GGML_VK_VISIBLE_DEVICES: "0"
       - uses: actions/upload-artifact@v4
         if: runner.os == 'macOS'
