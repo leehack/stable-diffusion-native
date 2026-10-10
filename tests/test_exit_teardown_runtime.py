@@ -330,7 +330,8 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
     def test_shares_a_process_with_libllamadart(self) -> None:
         """Each library tears down its own registry, whichever was loaded first."""
         binary = Path(self.directory.name) / "exit_teardown_two_libraries_test"
-        subprocess.run([COMPILER, "-std=c++17", "-O1", "-g", f"-I{REPO_ROOT / 'src'}",
+        sanitize = [f"-fsanitize={SANITIZER}"] if SANITIZER else []
+        subprocess.run([COMPILER, "-std=c++17", "-O1", "-g", *sanitize, f"-I{REPO_ROOT / 'src'}",
                         f"-I{build.HEADER.parent}", str(TWO_LIBRARIES), "-o", str(binary)],
                        check=True)
         for first in ("sd", "llama"):
