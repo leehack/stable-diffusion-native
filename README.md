@@ -164,6 +164,17 @@ void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms);
 void sd_dart_exit_teardown(void);
 ```
 
+`sd_dart_generate_image()` enables the native log recorder and rejects images
+when Metal reports a failed command buffer, including INFO-level diagnostics.
+On failure it frees any returned image batch, sets `*images_out` to `NULL` and
+`*num_images_out` to zero, and exposes the reason through
+`sd_dart_last_error()`. A tracked context with a backend failure rejects later
+generations until it is freed with `sd_dart_exit_free()` and replaced by a new
+context. Do not replace upstream's log callback after enabling the recorder.
+Because upstream diagnostics have no context identity, overlapping generations
+conservatively fail together when a Metal failure is reported. This reports
+failed GPU work; it does not prevent an operating-system GPU watchdog reset.
+
 ggml-metal aborts in its static destructor
 (`GGML_ASSERT([rsets->data count] == 0)`) when a process exits while a Metal
 buffer is still allocated. A caller in a managed runtime cannot always free

@@ -57,6 +57,7 @@ struct Log {
     // The number of the newest error message. Message n is in
     // errors[n % kErrors] until message n + kErrors replaces it.
     std::atomic<uint64_t> errors_recorded;
+    std::atomic<uint64_t> backend_failures;
 
     // The errors have a flag of their own, so that the reason of a failed
     // call never waits behind the other messages or their reader.
@@ -199,6 +200,17 @@ void record(int32_t level, const char* origin, const char* text) {
     if (text == nullptr) {
         return;
     }
+    // Metal also reports failed command buffers at INFO during graph capture.
+    // Recognize the pinned backend's diagnostics before filtering or waiting
+    // for either recorder flag. A lost diagnostic must never permit success.
+    const bool backend_failed = std::strstr(text, "ggml_metal_") != nullptr &&
+        ((std::strstr(text, "command buffer") != nullptr &&
+          std::strstr(text, "failed with status") != nullptr) ||
+         std::strstr(text, "backend is in error state") != nullptr);
+    if (backend_failed) {
+        state.backend_failures.fetch_add(1);
+        level = SD_LOG_ERROR;
+    }
     const bool wanted   = level >= SD_LOG_INFO + state.level_above_info.load(std::memory_order_relaxed);
     const bool is_error = level >= SD_LOG_ERROR;
     if (!wanted && !is_error) {
@@ -270,6 +282,14 @@ void sd_dart_log_call_begin() {
 
 void sd_dart_log_call_end() {
     window_end = state.errors_recorded.load();
+}
+
+uint64_t sd_dart_log_backend_failures() {
+    return state.backend_failures.load();
+}
+
+void sd_dart_log_generation_failed() {
+    record(SD_LOG_ERROR, "", "Metal backend failed; discard the image result and recreate the context before generating again.");
 }
 
 void sd_dart_log_enable(void) {

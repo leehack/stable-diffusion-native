@@ -254,6 +254,14 @@ class ExitTeardownRuntimeTest(unittest.TestCase):
                               timeout=600, errors="replace",
                               env={**os.environ, **SCENARIO_ENV, **load_only})
 
+    def test_guarded_generation_succeeds_on_healthy_backends(self) -> None:
+        for backend in BACKENDS:
+            if backend in self.load_only:
+                continue
+            with self.subTest(backend=backend):
+                result = self.run_scenario("generate-guarded", backend)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def check_scenarios(self, model: Path | str | None = None, size: str | None = None) -> None:
         for scenario in SCENARIOS:
             for backend in BACKENDS:
