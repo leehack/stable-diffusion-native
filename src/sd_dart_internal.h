@@ -1,6 +1,8 @@
 #ifndef SD_DART_INTERNAL_H
 #define SD_DART_INTERNAL_H
 
+#include <cstdint>
+
 // What the wrapper's sources share with each other. Not shipped and not
 // exported.
 
@@ -34,5 +36,11 @@ private:
 // sd_dart_last_error() reports to the calling thread.
 void sd_dart_log_call_begin();
 void sd_dart_log_call_end();
+
+// Monotonic backend-failure count, independent of log level, ring eviction,
+// and dropped messages. Upstream callbacks have no context identity, so a
+// failure conservatively invalidates every generation overlapping it.
+uint64_t sd_dart_log_backend_failures();
+void sd_dart_log_generation_failed();
 
 #endif  // SD_DART_INTERNAL_H

@@ -195,6 +195,8 @@ std::string last_error() {
 std::atomic<bool> fail_load{false};
 std::atomic<bool (*)()> hold_load{nullptr};
 std::atomic<bool (*)(sd_ctx_t*)> run_generation{nullptr};
+bool return_images = false;
+int image_batches_freed = 0;
 std::atomic<void (*)()> hold_free{nullptr};
 std::atomic<int> contexts_freed{0};
 std::atomic<sd_ctx_t*> last_freed{nullptr};
@@ -1240,6 +1242,81 @@ int test_device_query_idle() {
 
 // A call that fails leaves the reason upstream logged for it with the thread
 // that made the call, once the recorder is enabled.
+int test_generation_backend_failure() {
+    sd_ctx_params_t params{};
+    sd_img_gen_params_t request{};
+    return_images = true;
+    // The generation wrapper must enable recording itself, even with logs muted.
+    sd_dart_log_set_level(SD_LOG_ERROR + 1);
+    for (int level : {SD_LOG_INFO, SD_LOG_ERROR}) {
+        sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+        sd_image_t* images = nullptr;
+        int count = 0;
+        run_generation.store(level == SD_LOG_INFO ? +[](sd_ctx_t*) {
+            std::thread([] {
+                upstream_log(SD_LOG_INFO, "ggml - ggml_metal_graph_compute: command buffer 0 failed with status 5");
+            }).join();
+            return true;
+        } : +[](sd_ctx_t*) {
+            upstream_log(SD_LOG_ERROR, "ggml - ggml_metal_synchronize: error: command buffer 0 failed with status 5");
+            return true;
+        });
+        const int before = image_batches_freed;
+        CHECK(!sd_dart_generate_image(context, &request, &images, &count));
+        CHECK(images == nullptr && count == 0 && image_batches_freed == before + 1);
+        CHECK(last_error().find("command buffer 0 failed") != std::string::npos);
+        // The context is unusable until disposal/reload; do not call upstream again.
+        run_generation.store(+[](sd_ctx_t*) -> bool { CHECK(false); return true; });
+        CHECK(!sd_dart_generate_image(context, &request, &images, &count));
+        CHECK(images == nullptr && count == 0);
+        CHECK(last_error().find("recreate") != std::string::npos);
+        sd_dart_exit_free(context);
+    }
+    // A fresh context and ordinary CPU success are unaffected by old failures,
+    // ordinary errors, warnings, and cancellation messages.
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    run_generation.store(+[](sd_ctx_t*) {
+        upstream_log(SD_LOG_WARN, "low memory");
+        upstream_log(SD_LOG_INFO, "ggml_metal_graph_compute: command buffer 0 aborted");
+        upstream_log(SD_LOG_ERROR, "an unrelated optional operation failed");
+        return true;
+    });
+    sd_image_t* images = nullptr;
+    int count = 0;
+    CHECK(sd_dart_generate_image(context, &request, &images, &count));
+    CHECK(images != nullptr && count == 2);
+    free_sd_images(images, count);
+    // Upstream failure must also discard any partially returned batch.
+    run_generation.store(+[](sd_ctx_t*) { return false; });
+    CHECK(!sd_dart_generate_image(context, &request, &images, &count));
+    CHECK(images == nullptr && count == 0);
+    run_generation.store(nullptr);
+    CHECK(sd_dart_generate_image(context, &request, &images, &count));
+    CHECK(last_error().empty());
+    free_sd_images(images, count);
+    // The already-poisoned backend diagnostic is also a failure signal.
+    run_generation.store(+[](sd_ctx_t*) {
+        upstream_log(SD_LOG_ERROR, "ggml_metal_graph_compute: backend is in error state from a previous command buffer failure - recreate the backend to recover");
+        return true;
+    });
+    CHECK(!sd_dart_generate_image(context, &request, &images, &count));
+    CHECK(images == nullptr && count == 0);
+    sd_dart_exit_free(context);
+    context = sd_dart_new_sd_ctx(&params);
+    run_generation.store(+[](sd_ctx_t*) {
+        upstream_log(SD_LOG_INFO, "ggml_metal_graph_compute: command buffer 0 failed with status 5");
+        for (int i = 0; i < 64; ++i) upstream_log(SD_LOG_ERROR, "later error");
+        return true;
+    });
+    const int before_null_count = image_batches_freed;
+    CHECK(!sd_dart_generate_image(context, &request, &images, nullptr));
+    CHECK(images == nullptr && image_batches_freed == before_null_count + 1);
+    CHECK(last_error().find("recreate") != std::string::npos);
+    sd_dart_exit_free(context);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
 int test_last_error() {
     sd_ctx_params_t params{};
     sd_img_gen_params_t request{};
@@ -1750,7 +1827,13 @@ bool generate_image(sd_ctx_t* sd_ctx,
         upstream_log(SD_LOG_ERROR, "diffusion_engine.cpp:3 - generate_image failed");
     }
     if (num_images_out != nullptr) {
-        *num_images_out = 7;
+        *num_images_out = return_images ? 2 : 7;
+    }
+    if (return_images && images_out != nullptr) {
+        *images_out = static_cast<sd_image_t*>(calloc(2, sizeof(sd_image_t)));
+        for (int i = 0; i < 2; ++i) {
+            (*images_out)[i].data = static_cast<uint8_t*>(malloc(16));
+        }
     }
     sd_ctx->generating.store(false);
     return ok;
@@ -1759,6 +1842,13 @@ bool generate_image(sd_ctx_t* sd_ctx,
 void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {
     sd_ctx->cancel.store(mode);
     sd_ctx->cancel_requests.fetch_add(1);
+}
+
+void free_sd_images(sd_image_t* images, int count) {
+    CHECK(images != nullptr && count == 2);
+    for (int i = 0; i < count; ++i) free(images[i].data);
+    free(images);
+    ++image_batches_freed;
 }
 
 int main(int argc, char** argv) {
@@ -1799,6 +1889,7 @@ int main(int argc, char** argv) {
         {"device-query-timeout", test_device_query_timeout},
         {"device-query-idle", test_device_query_idle},
         {"last-error", test_last_error},
+        {"generation-backend-failure", test_generation_backend_failure},
         {"log-at-exit", test_log_at_exit},
 #if defined(__APPLE__)
         {"exit-in-flight", test_exit_in_flight},

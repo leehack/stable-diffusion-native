@@ -25,6 +25,7 @@ struct Entry {
     void (*cancel_fn)(void*) = nullptr;
     int32_t stage            = 0;
     uint64_t order           = 0;
+    bool backend_failed      = false;
 };
 
 // A thread that just left a call in flight usually still makes short calls on
@@ -421,8 +422,43 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                             sd_image_t** images_out,
                             int* num_images_out) {
     Call call(kWorkCall);
+    sd_dart_log_enable();
     ErrorWindow errors;
-    return generate_image(sd_ctx, sd_img_gen_params, images_out, num_images_out);
+    if (images_out != nullptr) *images_out = nullptr;
+    if (num_images_out != nullptr) *num_images_out = 0;
+    Registry& registry = state();
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto found = registry.objects.find(sd_ctx);
+        if (found != registry.objects.end() && found->second.backend_failed) {
+            sd_dart_log_generation_failed();
+            return false;
+        }
+    }
+    const uint64_t before = sd_dart_log_backend_failures();
+    // Upstream permits a null count output. Still collect the count so that
+    // rejecting a returned batch frees every image's pixel allocation.
+    int local_count = 0;
+    int* count_out = num_images_out != nullptr ? num_images_out : &local_count;
+    const bool ok = generate_image(sd_ctx, sd_img_gen_params, images_out, count_out);
+    const bool backend_failed = sd_dart_log_backend_failures() != before;
+    if (backend_failed) {
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            const auto found = registry.objects.find(sd_ctx);
+            if (found != registry.objects.end()) found->second.backend_failed = true;
+        }
+        sd_dart_log_generation_failed();
+    }
+    if (!ok || backend_failed) {
+        if (images_out != nullptr && *images_out != nullptr) {
+            free_sd_images(*images_out, *count_out);
+            *images_out = nullptr;
+        }
+        if (num_images_out != nullptr) *num_images_out = 0;
+        return false;
+    }
+    return true;
 }
 
 void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {

@@ -425,10 +425,11 @@ int test_idle(const char* model, const char* backend, bool tracked) {
     return tracked ? kNotChecked : 0;
 }
 
-int test_generate(const char* model, const char* backend) {
-    sd_ctx_t* context = load(model, backend, false);
-    CHECK(generate(context, 1, false) == 1);
-    free_sd_ctx(context);
+int test_generate(const char* model, const char* backend, bool guarded = false) {
+    sd_ctx_t* context = load(model, backend, guarded);
+    CHECK(generate(context, 1, guarded) == 1);
+    if (guarded) sd_dart_exit_free(context);
+    else free_sd_ctx(context);
     return 0;
 }
 
@@ -852,6 +853,9 @@ int main(int argc, char** argv) {
         load_only           = std::getenv("SD_EXIT_TEARDOWN_LOAD_ONLY") != nullptr;
         if (scenario == "generate") {
             return test_generate(model, backend);
+        }
+        if (scenario == "generate-guarded") {
+            return test_generate(model, backend, true);
         }
         if (scenario == "idle") {
             return test_idle(model, backend, true);

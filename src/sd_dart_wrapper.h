@@ -212,8 +212,15 @@ SD_API void sd_dart_exit_teardown(void);
 // teardown.
 SD_API sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 
-// generate_image() as a call in flight. Takes and returns what generate_image()
-// does. Teardown cancels it with SD_CANCEL_ALL, which stable-diffusion.cpp
+// generate_image() as a call in flight. Enables native log recording and
+// returns false if Metal reports a failed command buffer, even if upstream
+// returns success. On failure, frees the returned batch and clears both
+// outputs. A tracked context with a backend failure rejects later generations:
+// free it with sd_dart_exit_free() and load a new context. Concurrent calls
+// conservatively fail together when a backend failure overlaps them, since
+// upstream's log callback does not identify a context. Do not replace that
+// callback after enabling the wrapper recorder.
+// Teardown cancels it with SD_CANCEL_ALL, which stable-diffusion.cpp
 // honors before a sampling step and before the decode of each image, and
 // waits for it with the longer bound. Blocks after teardown.
 SD_API bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
