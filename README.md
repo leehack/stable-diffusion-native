@@ -610,6 +610,13 @@ Run the `Native Build & Release` workflow with a tag such as `v0.1.0`. Tags are
 `vMAJOR.MINOR.PATCH`, with an optional `-N` rebuild counter starting at 1
 (`v0.1.0-2`). Each release records the upstream commit in `manifest.json`.
 
+Set `publish=false` to prepare and validate all platform archives and the Apple
+XCFramework without creating a tag or GitHub release. The workflow uploads
+`stable-diffusion-native-<tag>` as a run artifact retained for 14 days. Build
+and packaging jobs have read-only repository permissions; only the separate
+publication job has write permission, and it is skipped in preparation mode.
+Normal release runs keep `publish=true` by default.
+
 Archive names:
 
 - `stable-diffusion-native-runtime-<target>-<tag>.tar.gz`
