@@ -1240,8 +1240,8 @@ int test_device_query_idle() {
     return 0;
 }
 
-// A call that fails leaves the reason upstream logged for it with the thread
-// that made the call, once the recorder is enabled.
+// Backend failures invalidate the whole returned batch and its tracked
+// context, independently of logging level and retained diagnostic history.
 int test_generation_backend_failure() {
     sd_ctx_params_t params{};
     sd_img_gen_params_t request{};
@@ -1317,6 +1317,8 @@ int test_generation_backend_failure() {
     return 0;
 }
 
+// A call that fails leaves the reason upstream logged for it with the thread
+// that made the call, once the recorder is enabled.
 int test_last_error() {
     sd_ctx_params_t params{};
     sd_img_gen_params_t request{};

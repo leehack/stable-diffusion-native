@@ -427,13 +427,17 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
     if (images_out != nullptr) *images_out = nullptr;
     if (num_images_out != nullptr) *num_images_out = 0;
     Registry& registry = state();
+    bool context_failed = false;
     {
         std::lock_guard<std::mutex> lock(registry.mutex);
         const auto found = registry.objects.find(sd_ctx);
-        if (found != registry.objects.end() && found->second.backend_failed) {
-            sd_dart_log_generation_failed();
-            return false;
-        }
+        context_failed = found != registry.objects.end() && found->second.backend_failed;
+    }
+    if (context_failed) {
+        // The recorder can wait on its own flags. Keep cancellation and
+        // disposal independent of that wait, as on the failure path below.
+        sd_dart_log_generation_failed();
+        return false;
     }
     const uint64_t before = sd_dart_log_backend_failures();
     // Upstream permits a null count output. Still collect the count so that
