@@ -604,6 +604,14 @@ python3 tools/apple_xcframework.py consumer dist/stable-diffusion-native-apple-x
 Flutter companion does (a dynamic library that re-exports the framework), runs
 the macOS probe and builds the iOS device and simulator slices.
 
+## Upstream qualification
+
+The local upstream 982 candidate is preparation only; see the
+[ABI audit, carry inventory and outstanding gates](docs/upstream_982_qualification.md).
+Its larger context struct requires regenerated consumer bindings, and Metal
+batched CFG remains unqualified. `tests/test_runtime_api.py` exercises a built
+runtime's defaults and component conversion without models or a GPU.
+
 ## Release
 
 Run the `Native Build & Release` workflow with a tag such as `v0.1.0`. Tags are
