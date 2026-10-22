@@ -609,6 +609,9 @@ the macOS probe and builds the iOS device and simulator slices.
 
 Upstream 982 has its
 [ABI audit, carry inventory, evidence and outstanding gates](docs/upstream_982_qualification.md).
+It carries two fixes the pin lacks: unbatched CFG in Metal builds (below) and
+the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
+2 GiB.
 Its larger context struct requires regenerated consumer bindings. A null
 `flash_attn_mode` or `conv_direct_mode` with its legacy flags `false`, the
 initializer default, now selects upstream's auto probes, which change output

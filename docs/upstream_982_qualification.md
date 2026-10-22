@@ -2,8 +2,11 @@
 
 This branch moves to upstream `0518b34374761cb82aeda5ad3c2f0686fdad2cec`
 (`master-982-0518b34`), with ggml `dc998771e700d49bbdf9a39cede22bb5b3311767`.
-It adds one carry, unbatched CFG in Metal builds (below), and retires none:
-no source workaround has enough evidence for retirement. It is not released;
+It carries two fixes the pin lacks: unbatched CFG in Metal builds, a wrapper
+change (below), and `patches/pickle_line_span.patch` for
+[#23](https://github.com/leehack/stable-diffusion-native/issues/23), merged in
+[#26](https://github.com/leehack/stable-diffusion-native/pull/26). It retires
+none: no source workaround has enough evidence for retirement. It is not released;
 the platforms listed under "Remaining gates" are unqualified. The public
 baseline remains owner
 `v0.2.0-4` / `c9922d960c79f7ba7381161ca6784f3b7c1e2fce`, upstream
@@ -98,7 +101,7 @@ v0.2.0-2, Linux host-exit retention in v0.2.0-3 and Metal fail-loud in v0.2.0-4.
 
 | Carry / class | Purpose, original trigger and owner provenance | Affected revisions / upstream equivalent and earliest evidence | Tests and decision |
 | --- | --- | --- | --- |
-| Vendored source patches | None: the owner stores a submodule, not an applied patch stack. Upstream's ggml fork is upstream content. | Both baseline and candidate submodules are clean. | **None to remove.** Do not mistake upstream `af0fc72` removing its conv1d workaround for retirement of an owner patch. |
+| Carried upstream patch `pickle_line_span.patch` / correctness fix | [#26](https://github.com/leehack/stable-diffusion-native/pull/26) for [#23](https://github.com/leehack/stable-diffusion-native/issues/23): the legacy pickle scanner narrows the remaining span to `int`, so checkpoints above 2 GiB are rejected. `CMakeLists.txt` patches a build-tree copy of `src/model_io/pickle_io.cpp`; the submodule stays clean. | Candidate `pickle_io.cpp` is byte-identical to the baseline; no upstream fix. The patch applies to `0518b34` and the macOS build reports `Carrying patches/pickle_line_span.patch`; build info lists it. | `test_pickle_span` passes against the candidate. **Keep.** It is the only patch; upstream's ggml fork is upstream content, and upstream `af0fc72` removing its conv1d workaround retires no owner patch. |
 | Ordered native progress ring / permanent | `ea53d85` (#14): Dart callbacks after shutdown aborted; callback locks deadlocked VM shutdown; latest-only polling lost batch transitions. | All owner builds since #14. Candidate still has a process-global native callback, without a managed-runtime polling/lifetime replacement. No equivalent release. | `test_progress`, `test_progress_stress`, real CPU generation. **Keep** all history, atomics and registration lifetime. |
 | Native log/error ring / permanent | `6eb1bac` (#17): upstream log threads cannot safely call Dart; failed loads return null without a reason. | All owner builds since #17. Upstream callback still borrows message storage; no equivalent. | `test_log`, missing-model/exit stand-ins. **Keep** bounded error window, UTF-8 boundaries and dropped-message accounting. |
 | Log spin abandonment / mitigation | #17: Windows `ExitProcess` can kill a flag holder; a descheduled reader formerly hid load errors. Separate error flag and 100 ms bound prevent indefinite waits. | Candidate has no equivalent recorder or holder-death protocol. | `test_log` plain, ASan and TSan controls; Windows execution remains unavailable. **Keep.** |
@@ -125,8 +128,10 @@ v0.2.0-2, Linux host-exit retention in v0.2.0-3 and Metal fail-loud in v0.2.0-4.
 ## Reader controls and issue boundaries
 
 Owner [#23](https://github.com/leehack/stable-diffusion-native/issues/23)
-remains reproducible. Baseline and candidate `pickle_io.cpp` and `binary_io.h`
-are byte-identical. Using the native fixture from draft
+reproduces on the unpatched candidate: baseline and candidate `pickle_io.cpp`
+and `binary_io.h` are byte-identical. This branch carries the fix from
+[#26](https://github.com/leehack/stable-diffusion-native/pull/26) (see the
+inventory). Controls run before #26 merged, with the native fixture from
 [#25](https://github.com/leehack/stable-diffusion-native/pull/25), exact head
 `d9bacef31e2569d5df4c3e508caf278d704280eb`:
 
@@ -137,13 +142,10 @@ are byte-identical. Using the native fixture from draft
 | Same valid prefixes in those large containing spans | fail at GLOBAL | fail at GLOBAL | pass all cases |
 | Bounded inputs with ASan | same source as candidate | pass | pass |
 
-The diagnostic copy makes `find_char` accept `size_t`, caps its int-returning
-scan at `INT_MAX`, and removes all 13 narrowing remaining-span casts. It is
-outside the submodule and **not part of this branch's runtime**. This proves
-the scanner mechanism, not a shipped fix. PR #25 remains test-only with its
-expected failure; no duplicate test PR or upstream submission was made.
-The original trusted >2 GiB real-checkpoint/public-Dart evidence is in #23;
-this run does not repeat the huge-checkpoint conversion or loading.
+That diagnostic copy proved the scanner mechanism; the shipped fix is #26's
+patch, whose `test_pickle_span` passes on this branch. This branch does not
+repeat the trusted >2 GiB real-checkpoint conversion or public-Dart load
+recorded in #23.
 
 Owner [#24](https://github.com/leehack/stable-diffusion-native/issues/24)
 remains unresolved: its original full ZIP load timed out at 45 s. Later
@@ -192,15 +194,19 @@ separately from the source rebuild. The archive SHA-256 is
 the dylib SHA-256 is
 `79ed1ab7c0451596bcb18070d459826a8b04409875873e91f39ffd84b2ffe1ce`.
 
-On the guarded candidate macOS arm64 build, with the pinned Flutter 3.47.1
-Dart SDK:
+On the guarded candidate macOS arm64 build with #26's patch (dylib SHA-256
+`e4e1a2be2271ae1dc3fb1c31cae156b926c49cc98bc581c4544803fd46917b90`), with the
+pinned Flutter 3.47.1 Dart SDK. The real-model rows ran on the build before
+the merge, which differs only in the patched legacy pickle reader; the Metal
+guard control was repeated on the merged build with the same images.
 
 | Check | Result |
 | --- | --- |
 | `validate_artifacts.py macos-arm64` | pass |
+| `test_pickle_span.py` after merging #26 | 5 tests pass; patch applies to `0518b34` |
 | `build.py build --target macos-arm64` definitions check | `SD_DART_METAL=1`, `SD_DART_GPU_BACKEND=1`; with `SD_DART_METAL` dropped from `CMakeLists.txt` the build stops after configure |
 | `smoke_test.py macos-arm64 --expect-device MTL` | pass, including the non-ASCII path conversion |
-| `unittest discover -s tests` with `SD_REQUIRE_DART`, `SD_REQUIRE_RUNTIME`, `SD_REQUIRE_METAL_GENERATION`, 3 runs | 59 tests, pass, 7 skipped (Linux-only ELF/stdio/host-shutdown, real model, libllamadart) |
+| `unittest discover -s tests` with `SD_REQUIRE_DART`, `SD_REQUIRE_RUNTIME`, `SD_REQUIRE_METAL_GENERATION`, 3 runs | 64 tests, pass, 7 skipped (Linux-only ELF/stdio/host-shutdown, real model, libllamadart) |
 | `test_exit_teardown_runtime.py` with `SD_EXIT_TEARDOWN_SANITIZER=address`, Metal generation required | pass, 5 skipped (Linux, real model, libllamadart) |
 | `test_exit_teardown_runtime.py` with `SD_EXIT_TEARDOWN_MODEL` = SD-Turbo Q4_0 GGUF (256×256), Metal generation required, Dart VM harness | pass, 3 skipped (Linux, libllamadart); the untracked-context control aborted in ggml-metal at exit, as before |
 | Same with `SD_EXIT_TEARDOWN_SANITIZER=address` | pass, 4 skipped (also the Dart VM, which cannot load a sanitized runtime) |
