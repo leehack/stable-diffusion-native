@@ -208,6 +208,14 @@ def upstream_commit() -> str:
     ).strip()
 
 
+def upstream_info() -> dict:
+    return {
+        "repository": "leejet/stable-diffusion.cpp",
+        "commit": upstream_commit(),
+        "patches": sorted(p.name for p in (REPO_ROOT / "patches").glob("*.patch")),
+    }
+
+
 def build(target: Target, jobs: int) -> Path:
     if not HEADER.is_file():
         fail("third_party/stable-diffusion.cpp is missing; run "
@@ -240,10 +248,7 @@ def build(target: Target, jobs: int) -> Path:
         "os": target.os,
         "library": target.library,
         "accelerators": list(target.accelerators),
-        "upstream": {
-            "repository": "leejet/stable-diffusion.cpp",
-            "commit": upstream_commit(),
-        },
+        "upstream": upstream_info(),
         "cmakeArgs": [a for a in cmake_args if not a.startswith("-DCMAKE_SHARED_LINKER_FLAGS")],
         "exportedSymbols": api_symbols(*HEADERS),
     }

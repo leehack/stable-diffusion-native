@@ -8,7 +8,8 @@ Guidance for coding agents working in `stable-diffusion-native`.
   consumed by `llamadart`. The Dart API and model handling live in `llamadart`.
 - Upstream is the `third_party/stable-diffusion.cpp` submodule. Update the
   submodule pin instead of patching vendored sources; report upstream bugs
-  there.
+  there. Never edit the submodule. A fix the pin lacks is carried only as a
+  `patches/` entry (`patches/README.md`) with a test that fails without it.
 - What upstream's C API lacks goes in `src/`, which the top-level
   `CMakeLists.txt` compiles into the same library. A wrapper export is an
   `sd_dart_*` function declared with `SD_API` in `src/sd_dart_wrapper.h`, with
