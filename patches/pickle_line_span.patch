@@ -1,0 +1,134 @@
+diff --git a/src/model_io/pickle_io.cpp b/src/model_io/pickle_io.cpp
+--- a/src/model_io/pickle_io.cpp
++++ b/src/model_io/pickle_io.cpp
+@@ -1,5 +1,7 @@
+ #include "pickle_io.h"
+ 
++#include <algorithm>
++#include <cstddef>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
+@@ -115,6 +117,13 @@ static void set_error(std::string* error, const std::string& message) {
+     }
+ }
+ 
++// A legacy checkpoint passes the rest of the file, tensor storage included, so
++// the span can exceed INT_MAX. No pickle line is that long.
++static int find_line_end(const uint8_t* p, const uint8_t* end) {
++    const ptrdiff_t max_len = std::numeric_limits<int>::max();
++    return find_char(p, (int)std::min(end - p, max_len), '\n');
++}
++
+ bool skip_pickle_object(const uint8_t* buffer, size_t buffer_size, size_t* object_size) {
+     const uint8_t* p   = buffer;
+     const uint8_t* end = buffer + buffer_size;
+@@ -148,7 +157,7 @@ bool skip_pickle_object(const uint8_t* buffer, size_t buffer_size, size_t* objec
+             case 'F':    // FLOAT            = b'F'   # push decimal float line
+             case 'S':    // STRING           = b'S'   # push quoted string line
+             case 'V': {  // UNICODE          = b'V'   # push raw-unicode string line
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -206,7 +215,7 @@ bool skip_pickle_object(const uint8_t* buffer, size_t buffer_size, size_t* objec
+                 p += 1 + p[0];
+                 break;
+             case 'P': {  // PERSID           = b'P'   # persistent id, newline-terminated
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -216,12 +225,12 @@ bool skip_pickle_object(const uint8_t* buffer, size_t buffer_size, size_t* objec
+                 p += 8;
+                 break;
+             case 'c': {  // GLOBAL           = b'c'   # push module/name global reference
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+                 p += len + 1;
+-                len = find_char(p, (int)(end - p), '\n');
++                len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -261,12 +270,12 @@ bool skip_pickle_object(const uint8_t* buffer, size_t buffer_size, size_t* objec
+             case 'o':   // OBJ              = b'o'   # build class instance from mark
+                 break;
+             case 'i': {  // INST             = b'i'   # build class instance from module/name
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+                 p += len + 1;
+-                len = find_char(p, (int)(end - p), '\n');
++                len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -680,7 +689,7 @@ bool parse_torch_state_dict_pickle(const uint8_t* buffer,
+                 p += 4;
+                 break;
+             case 'I': {  // INT              = b'I'   # push decimal integer line
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -695,7 +704,7 @@ bool parse_torch_state_dict_pickle(const uint8_t* buffer,
+                 }
+             } break;
+             case 'L': {  // LONG             = b'L'   # push decimal long integer line
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -707,7 +716,7 @@ bool parse_torch_state_dict_pickle(const uint8_t* buffer,
+                 stack.push_back(make_int_value(std::strtoll(s.c_str(), nullptr, 10)));
+             } break;
+             case 'F': {  // FLOAT            = b'F'   # push decimal float line
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -799,7 +808,7 @@ bool parse_torch_state_dict_pickle(const uint8_t* buffer,
+                 p += len;
+             } break;
+             case 'S': {  // STRING           = b'S'   # push quoted string line
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -811,7 +820,7 @@ bool parse_torch_state_dict_pickle(const uint8_t* buffer,
+                 stack.push_back(make_string_value(s));
+             } break;
+             case 'V': {  // UNICODE          = b'V'   # push raw-unicode string line
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+@@ -819,13 +828,13 @@ bool parse_torch_state_dict_pickle(const uint8_t* buffer,
+                 p += len + 1;
+             } break;
+             case 'c': {  // GLOBAL           = b'c'   # push module/name global reference
+-                int len = find_char(p, (int)(end - p), '\n');
++                int len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }
+                 std::string module((const char*)p, len);
+                 p += len + 1;
+-                len = find_char(p, (int)(end - p), '\n');
++                len = find_line_end(p, end);
+                 if (len < 0) {
+                     return false;
+                 }

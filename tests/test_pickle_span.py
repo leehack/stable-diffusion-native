@@ -1,8 +1,9 @@
 """Builds and runs `tests/native/pickle_span_test.cpp`.
 
-The test compiles upstream's `pickle_io.cpp` from the pinned submodule, so it
-needs the submodules' sources but no built runtime and no model. Spans above
-INT_MAX are reserved read-only and cost no memory.
+The test compiles upstream's `pickle_io.cpp` from the pinned submodule with
+`patches/pickle_line_span.patch` applied, as the library does, so it needs the
+submodules' sources but no built runtime and no model. Spans above INT_MAX are
+reserved read-only and cost no memory.
 """
 
 import os
@@ -15,12 +16,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM = REPO_ROOT / "third_party" / "stable-diffusion.cpp"
-SOURCES = [
-    UPSTREAM / "src" / "model_io" / "pickle_io.cpp",
-    REPO_ROOT / "tests" / "native" / "pickle_span_test.cpp",
-]
-INCLUDE_DIRS = [UPSTREAM / "src", UPSTREAM / "include", UPSTREAM / "ggml" / "include"]
+SCANNER = Path("src") / "model_io" / "pickle_io.cpp"
+PATCH = REPO_ROOT / "patches" / "pickle_line_span.patch"
+TEST_SOURCE = REPO_ROOT / "tests" / "native" / "pickle_span_test.cpp"
+INCLUDE_DIRS = [UPSTREAM / "src", UPSTREAM / "src" / "model_io", UPSTREAM / "include",
+                UPSTREAM / "ggml" / "include"]
 COMPILER = os.environ.get("CXX") or shutil.which("c++")
+GIT = shutil.which("git")
 ADDRESS_SANITIZER = "-fsanitize=address"
 
 
@@ -36,16 +38,31 @@ class PickleSpanTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.require(COMPILER is not None, "no C++ compiler; set CXX")
-        self.require((INCLUDE_DIRS[2] / "ggml.h").is_file() and SOURCES[0].is_file(),
+        self.require(GIT is not None, "no git")
+        self.require((INCLUDE_DIRS[3] / "ggml.h").is_file() and (UPSTREAM / SCANNER).is_file(),
                      "third_party/stable-diffusion.cpp is not checked out; run "
                      "`git submodule update --init --recursive`")
 
-    def run_mode(self, mode: str, *flags: str) -> subprocess.CompletedProcess:
+    def patched_scanner(self, directory: Path) -> Path:
+        """Applies the carried patch as CMakeLists.txt does."""
+        root = directory / "patched"
+        scanner = root / SCANNER
+        scanner.parent.mkdir(parents=True)
+        scanner.write_bytes((UPSTREAM / SCANNER).read_bytes().replace(b"\r\n", b"\n"))
+        env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(directory.resolve())}
+        subprocess.run([GIT, "apply", str(PATCH)], cwd=root, env=env, check=True)
+        self.assertNotEqual((UPSTREAM / SCANNER).read_bytes(), scanner.read_bytes())
+        return scanner
+
+    def run_mode(self, mode: str, *flags: str,
+                 patched: bool = True) -> subprocess.CompletedProcess:
         includes = [f"-I{directory}" for directory in INCLUDE_DIRS]
         with tempfile.TemporaryDirectory() as directory:
-            binary = Path(directory) / "pickle_span_test"
+            directory = Path(directory)
+            scanner = self.patched_scanner(directory) if patched else UPSTREAM / SCANNER
+            binary = directory / "pickle_span_test"
             subprocess.run([COMPILER, "-std=c++17", "-O1", "-g", *flags, *includes,
-                            *map(str, SOURCES), "-o", str(binary)], check=True)
+                            str(scanner), str(TEST_SOURCE), "-o", str(binary)], check=True)
             return subprocess.run([str(binary), mode], capture_output=True, text=True,
                                   timeout=600)
 
@@ -74,12 +91,17 @@ class PickleSpanTest(unittest.TestCase):
     def test_rejects_malformed_pickles_in_spans_above_int_max(self) -> None:
         self.assert_passes("large")
 
-    # Upstream narrows the remaining span to int before scanning for a newline
-    # (#23), so the pinned scanner rejects these. A submodule bump that fixes it
-    # makes this an unexpected success, which fails the run: remove the marker.
-    @unittest.expectedFailure
     def test_skips_valid_pickles_in_spans_above_int_max(self) -> None:
         self.assert_passes("large-ok")
+
+    # The pinned upstream narrows the remaining span to int before scanning for
+    # a newline (#23). Once a pin no longer does, the carried patch can go.
+    def test_pinned_upstream_still_needs_the_patch(self) -> None:
+        result = self.run_mode("large-ok", patched=False)
+        self.assertNotEqual(
+            0, result.returncode,
+            "the pinned upstream now skips valid pickles in spans above INT_MAX; "
+            "remove patches/pickle_line_span.patch")
 
 
 if __name__ == "__main__":

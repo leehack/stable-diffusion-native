@@ -1,4 +1,4 @@
-// Runs upstream's pickle scanner, compiled from the pinned submodule, on the
+// Runs upstream's pickle scanner, compiled as the library compiles it, on the
 // spans read_torch_legacy_file gives it. That reader passes the rest of the
 // whole checkpoint, tensor storage included, so a small pickle can sit in a
 // span longer than INT_MAX.
