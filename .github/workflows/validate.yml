@@ -122,6 +122,12 @@ jobs:
         env:
           # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
           GGML_VK_VISIBLE_DEVICES: "0"
+      - name: Check the context defaults and conversion ABI
+        if: runner.os != 'Windows' && matrix.smoke
+        run: python3 -m unittest discover -s tests -p test_runtime_api.py -v
+        env:
+          SD_RUNTIME_API_TARGET: ${{ matrix.target }}
+          SD_REQUIRE_RUNTIME: "1"
       - uses: dart-lang/setup-dart@v1
         if: runner.os == 'Linux' && matrix.smoke
       - name: Verify cooperative host shutdown

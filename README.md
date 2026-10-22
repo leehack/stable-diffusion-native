@@ -608,7 +608,11 @@ the macOS probe and builds the iOS device and simulator slices.
 
 Upstream 982 has its
 [ABI audit, carry inventory, evidence and outstanding gates](docs/upstream_982_qualification.md).
-Its larger context struct requires regenerated consumer bindings.
+Its larger context struct requires regenerated consumer bindings. A null
+`flash_attn_mode` or `conv_direct_mode` with its legacy flags `false`, the
+initializer default, now selects upstream's auto probes, which change output
+and are not seed-reproducible on Metal; to keep earlier behavior, pass the
+explicit modes the document maps from the legacy flags.
 `tests/test_runtime_api.py` exercises a built runtime's defaults and component
 conversion without models or a GPU.
 

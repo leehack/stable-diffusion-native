@@ -38,7 +38,35 @@ The added pointers make an old 320-byte Dart allocation unsafe: the candidate
 initializer writes beyond it. This is a **blocking consumer ABI gate**, even
 though older members keep their offsets. Bindings must be regenerated from
 released headers, and the mode/batching policy must be mapped explicitly.
-Null modes preserve the legacy flag route; adopting auto mode is separate.
+
+A null or empty mode honors a legacy flag only when that flag is `true`. With
+the flag `false`, the `sd_ctx_params_init` default and what llamadart writes
+today, upstream runs its **auto** probes (`flash_attention_for` and
+`conv_direct_for` in `diffusion_engine.cpp`). Auto changes output against
+v0.2.0-4, and on Metal it is not seed-reproducible: flash attention is chosen
+by a timing probe at load.
+
+| SD-Turbo F16 + TAESD, 128², 1 step, seed 7, CFG 2 | Image SHA-256 prefix |
+| --- | --- |
+| v0.2.0-4 CPU, flags false / `diffusion_flash_attn` true | `4ca7bc91` / `bf06aed2` |
+| Candidate CPU, null modes, flags false (auto picks flash on) | `bf06aed2` |
+| Candidate CPU, `"off"` / `"off,diffusion=on"` | `4ca7bc91` / `bf06aed2` |
+| Candidate MTL0, null modes, flags false | auditor saw flash on in 2 of 10 loads, with different images |
+| Candidate MTL0, `"off"` / `"off,diffusion=on"`, three loads each | `4e51cf6f` ×3 / `7f798ea8` ×3, no auto probe logged |
+
+To keep v0.2.0-4 behavior the consumer must always pass both modes,
+never null, mapped from its existing flags:
+
+| v0.2.0-4 flags | `flash_attn_mode` |
+| --- | --- |
+| `flash_attn` | `"off,te=on,clip_vision=on,vae=on,diffusion=on"` (v0.2.0-4 left ControlNet off) |
+| only `diffusion_flash_attn` | `"off,diffusion=on"` |
+| neither | `"off"` |
+
+`conv_direct_mode` is `"off"`, plus `",diffusion=on,control_net=on"` for
+`diffusion_conv_direct` and `",vae=on"` for `vae_conv_direct`. The legacy
+booleans can stay as they are; an explicit mode overrides them. `"auto"`
+remains available as a separate, opt-in consumer feature.
 In a Metal build `sd_dart_new_sd_ctx` loads with `batched_cfg=false` whatever
 the caller passes, so a consumer that keeps the `true` default still gets
 correct images there; raw `new_sd_ctx` does not.
@@ -170,8 +198,9 @@ Dart SDK:
 | Check | Result |
 | --- | --- |
 | `validate_artifacts.py macos-arm64` | pass |
+| `build.py build --target macos-arm64` definitions check | `SD_DART_METAL=1`, `SD_DART_GPU_BACKEND=1`; with `SD_DART_METAL` dropped from `CMakeLists.txt` the build stops after configure |
 | `smoke_test.py macos-arm64 --expect-device MTL` | pass, including the non-ASCII path conversion |
-| `unittest discover -s tests` with `SD_REQUIRE_DART`, `SD_REQUIRE_RUNTIME`, `SD_REQUIRE_METAL_GENERATION`, 3 runs | 57 tests, pass, 7 skipped (Linux-only ELF/stdio/host-shutdown, real model, libllamadart) |
+| `unittest discover -s tests` with `SD_REQUIRE_DART`, `SD_REQUIRE_RUNTIME`, `SD_REQUIRE_METAL_GENERATION`, 3 runs | 59 tests, pass, 7 skipped (Linux-only ELF/stdio/host-shutdown, real model, libllamadart) |
 | `test_exit_teardown_runtime.py` with `SD_EXIT_TEARDOWN_SANITIZER=address`, Metal generation required | pass, 5 skipped (Linux, real model, libllamadart) |
 | `test_exit_teardown_runtime.py` with `SD_EXIT_TEARDOWN_MODEL` = SD-Turbo Q4_0 GGUF (256×256), Metal generation required, Dart VM harness | pass, 3 skipped (Linux, libllamadart); the untracked-context control aborted in ggml-metal at exit, as before |
 | Same with `SD_EXIT_TEARDOWN_SANITIZER=address` | pass, 4 skipped (also the Dart VM, which cannot load a sanitized runtime) |

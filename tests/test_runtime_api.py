@@ -16,16 +16,22 @@ from smoke_test import write_safetensors  # noqa: E402
 
 
 class RuntimeApiTest(unittest.TestCase):
+    def skip_unless_required(self, reason: str) -> None:
+        """Skips, or fails with SD_REQUIRE_RUNTIME=1, as the CI build jobs set."""
+        if os.environ.get("SD_REQUIRE_RUNTIME"):
+            self.fail(reason)
+        self.skipTest(reason)
+
     def test_context_defaults_and_component_conversion(self):
         target_name = os.environ.get("SD_RUNTIME_API_TARGET", "")
         if not target_name and sys.platform == "darwin":
             target_name = "macos-arm64" if platform.machine() == "arm64" else "macos-x64"
         if not target_name or sys.platform == "win32":
-            self.skipTest("set SD_RUNTIME_API_TARGET to a built macOS or Linux target")
+            self.skip_unless_required("set SD_RUNTIME_API_TARGET to a built macOS or Linux target")
         target = build.TARGETS[target_name]
         library = build.BIN_ROOT / target.name / "lib" / target.library
         if not library.is_file():
-            self.skipTest(f"no built runtime for {target.name}")
+            self.skip_unless_required(f"no built runtime for {target.name}")
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             source = directory / "probe.safetensors"
