@@ -7,8 +7,9 @@ to the CPU.
 
 Also checks the `sd_dart_wrapper.h` progress recorder against real progress,
 which converting a few synthetic tensors reports without needing a model, and
-that the GPU device memory exports agree with the device list, and that a
-load which fails leaves its reason with the log recorder.
+that the GPU device memory exports agree with the device list, that a
+load which fails leaves its reason with the log recorder, and that
+conversion reads and writes files under a non-ASCII UTF-8 path.
 """
 
 from __future__ import annotations
@@ -207,6 +208,30 @@ def check_log_recording(library: Path) -> list[str]:
     return problems
 
 
+def check_unicode_path(lib: ctypes.CDLL) -> list[str]:
+    """Converts synthetic tensors between files in a non-ASCII directory.
+
+    Upstream takes UTF-8 paths; on Windows they must not go through the ANSI
+    code page.
+    """
+    lib.str_to_sd_type.argtypes = [ctypes.c_char_p]
+    lib.convert.restype = ctypes.c_bool
+    lib.convert.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                            ctypes.c_int, ctypes.c_char_p, ctypes.c_bool]
+    with tempfile.TemporaryDirectory() as work_dir:
+        directory = Path(work_dir) / "모델 ü"
+        directory.mkdir()
+        source, output = directory / "probe.safetensors", directory / "출력.gguf"
+        write_safetensors(source)
+        converted = lib.convert(str(source).encode(), None, str(output).encode(),
+                                lib.str_to_sd_type(b"f32"), b"", False)
+        magic = output.read_bytes()[:4] if output.is_file() else b""
+    if not converted or magic != b"GGUF":
+        return [f"converting under a non-ASCII path returned {converted} and wrote {magic!r}"]
+    print("  non-ASCII UTF-8 path conversion ok")
+    return []
+
+
 def host_memory() -> int:
     return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
@@ -328,6 +353,7 @@ def main() -> None:
         [device.split("\t")[0] for device in devices], args.expect_device)
     problems += check_progress_recording(library)
     problems += check_log_recording(library)
+    problems += check_unicode_path(lib)
     for problem in problems:
         print(f"error: {problem}", file=sys.stderr)
     if problems:

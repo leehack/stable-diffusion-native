@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import apple_xcframework  # noqa: E402
-from build import HEADERS, TARGETS, WRAPPER_HEADER  # noqa: E402
+from build import HEADERS, TARGETS, WRAPPER_HEADER, wrapper_definition_problems  # noqa: E402
 from package_release import TAG_PATTERN  # noqa: E402
 from sd_api import api_symbols  # noqa: E402
 from validate_artifacts import (  # noqa: E402
@@ -194,6 +194,24 @@ class TargetsTest(unittest.TestCase):
         for target in TARGETS.values():
             if target.os in ("linux", "windows"):
                 self.assertTrue(target.host_arch, target.name)
+
+    def test_metal_targets_must_configure_the_metal_guard(self):
+        apple = TARGETS["ios-arm64"]
+        self.assertEqual([], wrapper_definition_problems(
+            apple, {"SD_DART_METAL=1", "SD_DART_GPU_BACKEND=1", "GGML_SHARED"}))
+        for definitions in ({"SD_DART_GPU_BACKEND=1"},
+                            {"SD_DART_METAL=0", "SD_DART_GPU_BACKEND=1"}):
+            self.assertEqual(["ios-arm64 configured stable-diffusion without SD_DART_METAL=1"],
+                             wrapper_definition_problems(apple, definitions))
+
+    def test_other_targets_must_leave_it_off(self):
+        self.assertEqual([], wrapper_definition_problems(
+            TARGETS["linux-x64-vulkan"], {"SD_DART_METAL=0", "SD_DART_GPU_BACKEND=1"}))
+        self.assertEqual([], wrapper_definition_problems(
+            TARGETS["android-arm64"], {"SD_DART_METAL=0", "SD_DART_GPU_BACKEND=0"}))
+        self.assertEqual(["windows-x64 configured stable-diffusion without SD_DART_METAL=0"],
+                         wrapper_definition_problems(
+                             TARGETS["windows-x64"], {"SD_DART_METAL=1", "SD_DART_GPU_BACKEND=0"}))
 
 
 class AppleXcframeworkTest(unittest.TestCase):

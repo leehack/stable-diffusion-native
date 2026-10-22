@@ -184,6 +184,23 @@ def configure_args(target: Target, work_dir: Path) -> list[str]:
     return args
 
 
+def wrapper_definition_problems(target: Target, definitions: set[str]) -> list[str]:
+    """What the wrapper sources were configured with that this target contradicts."""
+    expected = {
+        f"SD_DART_METAL={1 if 'metal' in target.accelerators else 0}",
+        f"SD_DART_GPU_BACKEND={1 if set(target.accelerators) - {'cpu'} else 0}",
+    }
+    return [f"{target.name} configured stable-diffusion without {definition}"
+            for definition in sorted(expected - definitions)]
+
+
+def check_wrapper_definitions(target: Target, work_dir: Path) -> None:
+    path = work_dir / "sd_dart_definitions-Release.txt"
+    definitions = set(path.read_text().split()) if path.is_file() else set()
+    for problem in wrapper_definition_problems(target, definitions):
+        fail(problem)
+
+
 def find_library(build_dir: Path, library: str) -> Path:
     matches = [p for p in build_dir.rglob(library) if p.is_file() and not p.is_symlink()]
     if not matches:
@@ -224,6 +241,7 @@ def build(target: Target, jobs: int) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
     cmake_args = configure_args(target, work_dir)
     run(["cmake", "-S", str(REPO_ROOT), "-B", str(work_dir), *cmake_args])
+    check_wrapper_definitions(target, work_dir)
     run(["cmake", "--build", str(work_dir), "--config", "Release", "-j", str(jobs)])
 
     out_dir = BIN_ROOT / target.name

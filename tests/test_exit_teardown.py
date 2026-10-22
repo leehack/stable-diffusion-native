@@ -128,6 +128,14 @@ class ExitTeardownTest(unittest.TestCase):
     def test_tracks_waits_and_frees_in_order(self) -> None:
         self.build_and_run()
 
+    def test_metal_build_runs_cfg_unbatched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "exit_teardown_test"
+            subprocess.run(compile_command(binary, SOURCES, "-DSD_DART_METAL=1"), check=True)
+            result = subprocess.run([str(binary), "batched-cfg"], capture_output=True, text=True,
+                                    timeout=60)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_scenarios_are_clean_under_sanitizers(self) -> None:
         for sanitizer in SANITIZERS:
             flag = f"-fsanitize={sanitizer}"

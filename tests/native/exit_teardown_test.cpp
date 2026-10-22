@@ -206,6 +206,8 @@ std::atomic<int> loads_begun{0};
 std::atomic<int> calls_after_teardown{0};
 // The arguments the stand-ins were last called with.
 std::atomic<const sd_ctx_params_t*> last_load_params{nullptr};
+std::atomic<bool> last_load_batched_cfg{false};
+std::atomic<int> last_load_threads{0};
 std::atomic<const sd_img_gen_params_t*> last_request{nullptr};
 std::atomic<sd_image_t**> last_images_out{nullptr};
 
@@ -1789,6 +1791,8 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     loads_begun.fetch_add(1);
     calls_after_teardown.fetch_add(teardown_returned.load() ? 1 : 0);
     last_load_params.store(sd_ctx_params);
+    last_load_batched_cfg.store(sd_ctx_params->batched_cfg);
+    last_load_threads.store(sd_ctx_params->n_threads);
     if (bool (*hold)() = hold_load.load()) {
         hold();
     }
@@ -1853,6 +1857,34 @@ void free_sd_images(sd_image_t* images, int count) {
     ++image_batches_freed;
 }
 
+// A Metal build loads with batched CFG off from a copy of the caller's
+// parameters; any other build passes them through.
+int test_batched_cfg() {
+    sd_ctx_params_t params{};
+    params.n_threads   = 3;
+    params.batched_cfg = true;
+    sd_ctx_t* batched  = sd_dart_new_sd_ctx(&params);
+    CHECK(batched != nullptr);
+    CHECK(sd_dart_exit_tracked_count() == 1);
+    CHECK(params.batched_cfg);
+    CHECK(last_load_threads.load() == 3);
+#if SD_DART_METAL
+    CHECK(last_load_params.load() != &params);
+    CHECK(!last_load_batched_cfg.load());
+#else
+    CHECK(last_load_params.load() == &params);
+    CHECK(last_load_batched_cfg.load());
+#endif
+    params.batched_cfg  = false;
+    sd_ctx_t* unbatched = sd_dart_new_sd_ctx(&params);
+    CHECK(last_load_params.load() == &params);
+    CHECK(!last_load_batched_cfg.load());
+    sd_dart_exit_free(unbatched);
+    sd_dart_exit_free(batched);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const std::string scenario = argc > 1 ? argv[1] : "";
     const struct {
@@ -1893,6 +1925,7 @@ int main(int argc, char** argv) {
         {"last-error", test_last_error},
         {"generation-backend-failure", test_generation_backend_failure},
         {"log-at-exit", test_log_at_exit},
+        {"batched-cfg", test_batched_cfg},
 #if defined(__APPLE__)
         {"exit-in-flight", test_exit_in_flight},
 #endif

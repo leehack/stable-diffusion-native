@@ -189,7 +189,7 @@ alive; see [Exit on Linux](#exit-on-linux).
 
 | Function | Behavior |
 | --- | --- |
-| `sd_dart_new_sd_ctx` | `new_sd_ctx` that tracks the context before it returns. |
+| `sd_dart_new_sd_ctx` | `new_sd_ctx` that tracks the context before it returns. A Metal build loads with batched CFG off ([Upstream qualification](#upstream-qualification)). |
 | `sd_dart_generate_image` | `generate_image` as a call in flight: teardown cancels it and waits for it. |
 | `sd_dart_cancel_generation` | `sd_cancel_generation` for a tracked context, from any thread. Does nothing for a context that is not tracked, including one already freed. Never blocks. |
 | `sd_dart_exit_free` | Untracks an object and frees it with the function it was tracked with (`free_sd_ctx` for a context). Does nothing when it is not tracked, so it also works as a Dart `NativeFinalizer`. |
@@ -604,6 +604,27 @@ python3 tools/apple_xcframework.py consumer dist/stable-diffusion-native-apple-x
 `consumer` links the zip into `tests/swiftpm_consumer` the way the `llamadart`
 Flutter companion does (a dynamic library that re-exports the framework), runs
 the macOS probe and builds the iOS device and simulator slices.
+
+## Upstream qualification
+
+Upstream 982 has its
+[ABI audit, carry inventory, evidence and outstanding gates](docs/upstream_982_qualification.md).
+It carries two fixes the pin lacks: unbatched CFG in Metal builds (below) and
+the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
+2 GiB.
+Its larger context struct requires regenerated consumer bindings. A null
+`flash_attn_mode` or `conv_direct_mode` with its legacy flags `false`, the
+initializer default, now selects upstream's auto probes, which change output
+and are not seed-reproducible on Metal; to keep earlier behavior, pass the
+explicit modes the document maps from the legacy flags.
+`tests/test_runtime_api.py` exercises a built runtime's defaults and component
+conversion without models or a GPU.
+
+In a Metal build, the Apple targets, `sd_dart_new_sd_ctx` runs CFG unbatched
+whatever `sd_ctx_params_t.batched_cfg` says: ggml-metal's group normalization
+writes only the first batch item
+([leejet/stable-diffusion.cpp#2149](https://github.com/leejet/stable-diffusion.cpp/issues/2149)),
+so a batched CFG step returns a wrong image without an error.
 
 ## Release
 

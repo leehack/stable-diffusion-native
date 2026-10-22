@@ -95,5 +95,16 @@ foreach(backend CUDA HIPBLAS METAL VULKAN OPENCL SYCL MUSA)
         set(SD_DART_GPU_BACKEND 1)
     endif()
 endforeach()
+if(SD_METAL)
+    set(SD_DART_METAL 1)
+else()
+    set(SD_DART_METAL 0)
+endif()
 target_compile_definitions(stable-diffusion PRIVATE
-    SD_DART_GPU_BACKEND=${SD_DART_GPU_BACKEND})
+    SD_DART_GPU_BACKEND=${SD_DART_GPU_BACKEND}
+    SD_DART_METAL=${SD_DART_METAL})
+
+# tools/build.py checks these: a missing definition falls back to 0 in the
+# sources and would drop the Metal guard without a build error.
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/sd_dart_definitions-$<CONFIG>.txt"
+    CONTENT "$<JOIN:$<TARGET_PROPERTY:stable-diffusion,COMPILE_DEFINITIONS>,\n>\n")
