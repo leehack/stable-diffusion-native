@@ -20,7 +20,7 @@ import tarfile
 from pathlib import Path
 
 import apple_xcframework
-from build import BIN_ROOT, HEADERS, REPO_ROOT, TARGETS, UPSTREAM_DIR, upstream_commit
+from build import BIN_ROOT, HEADERS, REPO_ROOT, TARGETS, UPSTREAM_DIR, upstream_info
 
 PACKAGE = "stable-diffusion-native"
 TAG_PATTERN = re.compile(r"^v\d+\.\d+\.\d+(-[1-9]\d*)?$")
@@ -120,10 +120,7 @@ def main() -> None:
         "schemaVersion": 1,
         "package": PACKAGE,
         "tag": args.tag,
-        "upstream": {
-            "repository": "leejet/stable-diffusion.cpp",
-            "commit": upstream_commit(),
-        },
+        "upstream": upstream_info(),
         "artifacts": artifacts,
     }
     (args.dist / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

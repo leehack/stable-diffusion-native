@@ -11,7 +11,8 @@ consumed by [llamadart](https://github.com/leehack/llamadart) and other
 wrappers. It stays independent from `llamadart` so the artifacts can be reused
 elsewhere.
 
-- Pin an upstream stable-diffusion.cpp commit as a submodule.
+- Pin an upstream stable-diffusion.cpp commit as a submodule, plus the few
+  [carried fixes](patches/README.md) the pin lacks.
 - Build one shared library per platform with upstream's C API
   (`stable-diffusion.h`) as the FFI boundary.
 - Export only that API and the [wrapper API](#wrapper-api) this repository
