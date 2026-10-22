@@ -210,6 +210,13 @@ SD_API void sd_dart_exit_teardown(void);
 // returns. Free the context with sd_dart_exit_free(). A load cannot be
 // cancelled: teardown waits for it, with the longer bound. Blocks after
 // teardown.
+//
+// In a library built with Metal, the Apple targets, the context runs CFG
+// unbatched whatever sd_ctx_params_t.batched_cfg says, also on the CPU:
+// ggml-metal's group normalization leaves every batch item after the first
+// unwritten (leejet/stable-diffusion.cpp#2149), and the image a batched CFG
+// step then returns is wrong without any error. The caller's parameters are
+// not modified.
 SD_API sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 
 // generate_image() as a call in flight. Enables native log recording and

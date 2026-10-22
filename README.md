@@ -188,7 +188,7 @@ alive; see [Exit on Linux](#exit-on-linux).
 
 | Function | Behavior |
 | --- | --- |
-| `sd_dart_new_sd_ctx` | `new_sd_ctx` that tracks the context before it returns. |
+| `sd_dart_new_sd_ctx` | `new_sd_ctx` that tracks the context before it returns. A Metal build loads with batched CFG off ([Upstream qualification](#upstream-qualification)). |
 | `sd_dart_generate_image` | `generate_image` as a call in flight: teardown cancels it and waits for it. |
 | `sd_dart_cancel_generation` | `sd_cancel_generation` for a tracked context, from any thread. Does nothing for a context that is not tracked, including one already freed. Never blocks. |
 | `sd_dart_exit_free` | Untracks an object and frees it with the function it was tracked with (`free_sd_ctx` for a context). Does nothing when it is not tracked, so it also works as a Dart `NativeFinalizer`. |
@@ -606,11 +606,17 @@ the macOS probe and builds the iOS device and simulator slices.
 
 ## Upstream qualification
 
-The local upstream 982 candidate is preparation only; see the
-[ABI audit, carry inventory and outstanding gates](docs/upstream_982_qualification.md).
-Its larger context struct requires regenerated consumer bindings, and Metal
-batched CFG remains unqualified. `tests/test_runtime_api.py` exercises a built
-runtime's defaults and component conversion without models or a GPU.
+Upstream 982 has its
+[ABI audit, carry inventory, evidence and outstanding gates](docs/upstream_982_qualification.md).
+Its larger context struct requires regenerated consumer bindings.
+`tests/test_runtime_api.py` exercises a built runtime's defaults and component
+conversion without models or a GPU.
+
+In a Metal build, the Apple targets, `sd_dart_new_sd_ctx` runs CFG unbatched
+whatever `sd_ctx_params_t.batched_cfg` says: ggml-metal's group normalization
+writes only the first batch item
+([leejet/stable-diffusion.cpp#2149](https://github.com/leejet/stable-diffusion.cpp/issues/2149)),
+so a batched CFG step returns a wrong image without an error.
 
 ## Release
 

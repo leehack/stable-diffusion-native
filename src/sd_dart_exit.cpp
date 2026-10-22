@@ -17,6 +17,11 @@
 #include <dlfcn.h>
 #endif
 
+// Set by the top-level CMakeLists.txt: whether Metal is compiled in.
+#ifndef SD_DART_METAL
+#define SD_DART_METAL 0
+#endif
+
 namespace {
 
 struct Entry {
@@ -412,6 +417,17 @@ SdDartStaticsCall::~SdDartStaticsCall() {
 sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     Call call(kObjectCall | kWorkCall);
     ErrorWindow errors;
+#if SD_DART_METAL
+    // ggml-metal's GROUP_NORM writes only the first batch item
+    // (leejet/stable-diffusion.cpp#2149), so batched CFG returns a wrong
+    // image as a success that no backend failure reveals.
+    sd_ctx_params_t unbatched;
+    if (sd_ctx_params != nullptr && sd_ctx_params->batched_cfg) {
+        unbatched             = *sd_ctx_params;
+        unbatched.batched_cfg = false;
+        sd_ctx_params         = &unbatched;
+    }
+#endif
     sd_ctx_t* context = new_sd_ctx(sd_ctx_params);
     insert(context, free_context, cancel_context, SD_DART_EXIT_STAGE_CONTEXT);
     return context;

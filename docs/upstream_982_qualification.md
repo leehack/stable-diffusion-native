@@ -1,9 +1,11 @@
-# Upstream 982 qualification — local preparation only
+# Upstream 982 qualification
 
-This branch prepares upstream `0518b34374761cb82aeda5ad3c2f0686fdad2cec`
+This branch moves to upstream `0518b34374761cb82aeda5ad3c2f0686fdad2cec`
 (`master-982-0518b34`), with ggml `dc998771e700d49bbdf9a39cede22bb5b3311767`.
-It is **not ready for publication or consumer adoption**. No source workaround
-has enough evidence for retirement. The public baseline remains owner
+It adds one carry, unbatched CFG in Metal builds (below), and retires none:
+no source workaround has enough evidence for retirement. It is not released;
+the platforms listed under "Remaining gates" are unqualified. The public
+baseline remains owner
 `v0.2.0-4` / `c9922d960c79f7ba7381161ca6784f3b7c1e2fce`, upstream
 `3f8527a46c54ecf4cb4ed6003da8e8982283c73c` / ggml `89c4413f`.
 Live owner main and upstream master were refreshed on 2026-10-21.
@@ -37,6 +39,9 @@ initializer writes beyond it. This is a **blocking consumer ABI gate**, even
 though older members keep their offsets. Bindings must be regenerated from
 released headers, and the mode/batching policy must be mapped explicitly.
 Null modes preserve the legacy flag route; adopting auto mode is separate.
+In a Metal build `sd_dart_new_sd_ctx` loads with `batched_cfg=false` whatever
+the caller passes, so a consumer that keeps the `true` default still gets
+correct images there; raw `new_sd_ctx` does not.
 
 `convert_with_components` now appends `const sd_lora_t* loras, int lora_count`.
 The new runtime test compiles that exact function-pointer type and calls the
@@ -78,6 +83,7 @@ v0.2.0-2, Linux host-exit retention in v0.2.0-3 and Metal fail-loud in v0.2.0-4.
 | GPU build-presence/status mapping / permanent | #17: an absent backend and a compiled backend finding no device are distinct states. | Candidate ggml registry still cannot represent the build-time distinction alone. | `test_device_memory` with/without backend definitions. **Keep.** |
 | Free-memory underflow/clamp / defensive mitigation | #17: Vulkan subtracts unsigned usage from budget; overuse wrapped near `SIZE_MAX`; clamp output to `[0,total]`. | ggml `65c60b239f02ab3fb35017af1e817d17a13e4952` now uses min(budget,heap), saturating subtraction. Included by SD `af0fc72` (#2147); earliest locally available containing release `master-973-f0aac52`. SD `60423ab` (master-961) reclaims before wrapped estimates; different layer. | Wrapper under/over-budget stand-ins pass. No real Vulkan comparison or artifact-level retirement proof. **Keep** cheap output invariant; upstream source overlap alone is insufficient. |
 | Metal fail-loud output discard/context poison / correctness mitigation | `ea60915` (#21), owner #19: command-buffer failure could return corrupt images as success. Published v0.2.0-4. | Candidate Metal still logs the same failure/status/error-state diagnostics; no verified upstream image-result cleanup/context poison equivalent. | Existing `test_exit_teardown` controlled failures/cleanup/success and `test_log` level/overflow controls retained. CPU image success passes. Physical failure unavailable. **Keep** conservative overlap invalidation. Separate from watchdog prevention (#1047). |
+| Metal unbatched CFG / correctness mitigation (new) | This branch: upstream `1b0ba10` (#2085) runs both CFG branches in one batched UNet forward, on by default, and ggml-metal GROUP_NORM writes only batch item 0 ([#2149](https://github.com/leejet/stable-diffusion.cpp/issues/2149)). The wrong image is returned as success. | Candidate ggml-metal GROUP_NORM still dispatches `ngrp,1,1`; #2149 open. No upstream fix. | `test_exit_teardown` `batched-cfg` stand-in in default and `-DSD_DART_METAL=1` builds (fails with the guard removed); real Metal image controls below. **Keep** until a fixed ggml passes the batch-2 sentinel. |
 | Windows short upstream build + inherited `EP_PREFIX` / build workaround | #14: Vulkan shader generator hit FTK1011 at 260-character tlog paths; short upstream path alone failed. EP prefix reduced the recorded path to 213 chars. | Candidate still nests an ExternalProject shader build. No measured default-path Windows replacement. | Source retained; Windows build unavailable. **Keep.** |
 | Export allowlist / permanent | `935b70e` and #14: separate ggml copies must coexist without symbol collisions. Headers define public closure. | Candidate adds two public exports; does not remove collision risk. | Candidate macOS artifact exact export/dependency validation passes, no imported `__cxa_atexit`. Windows PE and ELF parser fixtures retained. **Keep.** |
 | Windows MSVC generator / build selection | Initial pipeline: Ninja could select runner MinGW rather than MSVC. | No evidence candidate changes runner compiler selection. | Tool configuration retained, no Windows run. **Keep.** |
@@ -117,12 +123,40 @@ non-reproduction reported in #25 does not identify a causal fix or reconcile
 that input/environment. No large ZIPs were created/downloaded here, and the
 scanner patch must not be presented as fixing ZIP loading.
 
-## Executed qualification and remaining gates
+## Upstream fixes this upgrade brings
 
-Built the baseline and candidate macOS-arm64 libraries using the owner build
-tool; relocated ccache into the worktree after the sandbox refused its usual
-home-directory cache. Candidate `validate_artifacts.py macos-arm64` passes.
-No production wrapper source change was needed.
+| Upstream | Change | Evidence here |
+| --- | --- | --- |
+| `8c442fb` (#2144) | Library opens model files through UTF-8 paths on Windows. | `tools/smoke_test.py` converts synthetic tensors between files in a non-ASCII directory on every smoke target, Windows CPU and Vulkan included; it passes on macOS arm64. Windows runs only in CI. |
+| `2f016e8` (#2145) | The same for the CLI and server examples. | Not built here (examples off). |
+| `60423ab` (#2124), `b7a74e6` (#2119) | Reclaim before trusting wrapped Vulkan iGPU memory estimates; demote resident params to disk when reclamation fails. | No Vulkan iGPU here; unqualified. The owner free-memory clamp stays. |
+
+## Metal batched CFG
+
+Upstream `1b0ba10` (#2085) added `batched_cfg`, default `true`. On Metal it
+returns a wrong image as success, so every Apple build would regress for a
+consumer that keeps the default. `sd_dart_new_sd_ctx` therefore loads a copy of
+the parameters with `batched_cfg=false` when the library is built with Metal
+(`SD_DART_METAL`, from `SD_METAL`). The caller's struct is not modified. Other
+builds pass the flag through: CPU batched output is identical to unbatched.
+
+Executed on an Apple M4 Max, macOS arm64:
+
+| Control | Result |
+| --- | --- |
+| Model-free GROUP_NORM `[8,8,64,B]`, 32 groups, output prefilled with 123456, candidate ggml | CPU batch 1/2 all items written (max error 3e-7). MTL0 batch 1 and batch-2 item 0 correct; **batch-2 item 1 unchanged 4096/4096**. |
+| SD-Turbo F16 + TAESD, 128×128, 1 Euler step, seed 7, CFG 2, raw `new_sd_ctx`, MTL0 | Unbatched: range 0..255, mean 129.74. **Batched: range 71..147, mean 108.89**, 46,710/49,152 bytes differ by more than 16 from unbatched. |
+| Same, CPU | Batched and unbatched byte-identical to the published v0.2.0-4 CPU image (SHA-256 prefix `bf06aed231065595`). |
+| Published v0.2.0-4 vs candidate unbatched, MTL0 | Mean absolute difference 0.15, max 5. |
+| Guarded build, `sd_dart_new_sd_ctx` with `batched_cfg=true`, MTL0 | Byte-identical to the candidate's unbatched Metal image. Raw `new_sd_ctx` still reproduces the defect. |
+
+The `batched-cfg` stand-in in `tests/native/exit_teardown_test.cpp` runs in the
+default build (flag passed through) and with `-DSD_DART_METAL=1` (copy with the
+flag off, caller's struct unchanged); with the guard removed the Metal variant
+fails. Vulkan, CUDA and other GPU backends keep batched CFG unqualified: no
+device here, and #2149 names only Metal.
+
+## Executed qualification
 
 The checksum-verified published v0.2.0-4 archive and dylib are compared
 separately from the source rebuild. The archive SHA-256 is
@@ -130,51 +164,32 @@ separately from the source rebuild. The archive SHA-256 is
 the dylib SHA-256 is
 `79ed1ab7c0451596bcb18070d459826a8b04409875873e91f39ffd84b2ffe1ce`.
 
-The guarded native comparison uses existing SD-Turbo F16 GGUF + full TAESD,
-CPU/four threads, 128×128, one Euler/discrete step, seed7, CFG2, prompt
-`a lighthouse`. It verifies image/count/dimensions, writes raw RGB, frees via
-`sd_dart_exit_free`, checks registry count1→0 and double-free no-op. Candidate
-explicit mode controls use attention on/convolution off; an explicit
-unbatched route and a batched CPU route are compared. This is a correctness
-smoke, not a performance benchmark or new-family qualification. All four
-RGB controls have SHA-256
-`bf06aed2310655953e6a403c264db320ac23aaf407e8f8e67fc7853a05839c86`.
-The candidate's null-mode/legacy-flag route was also compared separately.
+On the guarded candidate macOS arm64 build, with the pinned Flutter 3.47.1
+Dart SDK:
 
-The selected suite ran 48 tests: 44 passed, three Linux-only import/stdio
-checks skipped on macOS, and the newly written conversion probe failed
-because it supplied a null `tensor_type_rules` string. The existing smoke
-recipe passes an empty string; the corrected probe now does so and passes
-its targeted rerun (one test). The independent auditor reproduced the same
-invalid-null failure on the baseline, so this was a harness error, not a
-candidate regression. The combined completed evidence is 45 passing tests
-and three explicit skips; the full suite was not repeated after that
-one-argument test correction. Existing coverage includes native ASan/TSan
-stand-ins and the pinned-Dart progress/shutdown stress controls. The native
-model-dependent exit runtime harness was deliberately excluded.
+| Check | Result |
+| --- | --- |
+| `validate_artifacts.py macos-arm64` | pass |
+| `smoke_test.py macos-arm64 --expect-device MTL` | pass, including the non-ASCII path conversion |
+| `unittest discover -s tests` with `SD_REQUIRE_DART`, `SD_REQUIRE_RUNTIME`, `SD_REQUIRE_METAL_GENERATION`, 3 runs | 57 tests, pass, 7 skipped (Linux-only ELF/stdio/host-shutdown, real model, libllamadart) |
+| `test_exit_teardown_runtime.py` with `SD_EXIT_TEARDOWN_SANITIZER=address`, Metal generation required | pass, 5 skipped (Linux, real model, libllamadart) |
+| `test_exit_teardown_runtime.py` with `SD_EXIT_TEARDOWN_MODEL` = SD-Turbo Q4_0 GGUF (256×256), Metal generation required, Dart VM harness | pass, 3 skipped (Linux, libllamadart); the untracked-context control aborted in ggml-metal at exit, as before |
+| Same with `SD_EXIT_TEARDOWN_SANITIZER=address` | pass, 4 skipped (also the Dart VM, which cannot load a sanitized runtime) |
 
-An initial whole-suite attempt used the default Flutter wrapper instead of
-the pinned Dart SDK and auto-detected the library built during the run; it
-was stopped and is not qualification evidence. All replacement tests used
-the pinned Flutter 3.47.1 Dart binary. No remaining owned test jobs are left
-running at the freeze.
+Earlier guarded CPU controls (SD-Turbo F16 + TAESD, four threads) freed via
+`sd_dart_exit_free` with registry count 1→0 and a double-free no-op. They are
+correctness smokes, not performance benchmarks or new-family qualification.
 
-**Required before adoption:** exact-head independent review; regenerate and
-map consumer bindings/default policy; obtain Metal GROUP_NORM batch1/batch2
-sentinels and real batched/unbatched image controls; run release and ASan
-Metal teardown and Linux cooperative native/Dart teardown; qualify real
-Vulkan memory/performance; audit every Apple slice's privacy/minimum-OS/
-XCFramework/SwiftPM/signing; complete platform packaging/export checks.
+## Remaining gates
 
-Upstream [#2149](https://github.com/leejet/stable-diffusion.cpp/issues/2149)
-is still open. Candidate Metal GROUP_NORM still dispatches `ngrp,1,1` and
-passes dimensions0–2 only; its normalization kernel is unchanged from the
-baseline. This source evidence plus the upstream reproduction means the new
-`batched_cfg=true` default cannot be claimed supported on Metal. CPU parity
-does not resolve that gate. FP8 CPU #2139/#2140 (first master-966) and Vulkan
-convolution #2137/#2141 (first master-967) have upstream repair provenance,
-but representative FP8/real-Vulkan runtime qualification was unavailable.
-No unrelated model substitutes for those acceptance checks.
-
-No consumer pins, published artifacts, tags, workflows, issues or PRs were
-changed. All existing primary/active investigation checkouts were preserved.
+- Exact-head independent review.
+- Consumer: regenerate bindings from the released headers and map
+  `batched_cfg`, `flash_attn_mode` and `conv_direct_mode` explicitly.
+- Linux cooperative native/Dart teardown with a built Linux target, release
+  and ASan.
+- Windows: the Unicode path smoke runs only in CI; no Windows device run.
+- Real Vulkan memory, convolution (#2137/#2141) and batched CFG; FP8 CPU
+  (#2139/#2140).
+- Every Apple slice's privacy imports, minimum OS, XCFramework, SwiftPM and
+  signing; iOS devices.
+- Android CPU on a device.
