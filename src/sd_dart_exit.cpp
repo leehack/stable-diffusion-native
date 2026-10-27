@@ -433,6 +433,34 @@ sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     return context;
 }
 
+namespace {
+
+// Moves the images out of upstream's result into an array that
+// free_sd_images() frees, as generate_image() returned before upstream
+// switched to owned results, and frees the rest of the result with its
+// generation_info. Both are allocated by this library's C runtime.
+sd_image_t* take_images(sd_image_generation_result_t* result, int* count) {
+    *count = 0;
+    if (result == nullptr || result->count <= 0) {
+        free_sd_image_generation_result(result);
+        return nullptr;
+    }
+    auto* images = static_cast<sd_image_t*>(calloc(static_cast<size_t>(result->count), sizeof(sd_image_t)));
+    if (images == nullptr) {
+        free_sd_image_generation_result(result);
+        return nullptr;
+    }
+    for (int i = 0; i < result->count; ++i) {
+        images[i]                   = result->items[i].image;
+        result->items[i].image.data = nullptr;
+    }
+    *count = result->count;
+    free_sd_image_generation_result(result);
+    return images;
+}
+
+}  // namespace
+
 bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                             const sd_img_gen_params_t* sd_img_gen_params,
                             sd_image_t** images_out,
@@ -456,11 +484,8 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
         return false;
     }
     const uint64_t before = sd_dart_log_backend_failures();
-    // Upstream permits a null count output. Still collect the count so that
-    // rejecting a returned batch frees every image's pixel allocation.
-    int local_count = 0;
-    int* count_out = num_images_out != nullptr ? num_images_out : &local_count;
-    const bool ok = generate_image(sd_ctx, sd_img_gen_params, images_out, count_out);
+    sd_image_generation_result_t* result = nullptr;
+    bool ok = generate_image(sd_ctx, sd_img_gen_params, &result);
     const bool backend_failed = sd_dart_log_backend_failures() != before;
     if (backend_failed) {
         {
@@ -470,15 +495,14 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
         }
         sd_dart_log_generation_failed();
     }
-    if (!ok || backend_failed) {
-        if (images_out != nullptr && *images_out != nullptr) {
-            free_sd_images(*images_out, *count_out);
-            *images_out = nullptr;
-        }
-        if (num_images_out != nullptr) *num_images_out = 0;
-        return false;
+    if (!ok || backend_failed || images_out == nullptr) {
+        free_sd_image_generation_result(result);
+        return ok && !backend_failed;
     }
-    return true;
+    int count   = 0;
+    *images_out = take_images(result, &count);
+    if (num_images_out != nullptr) *num_images_out = count;
+    return *images_out != nullptr;
 }
 
 void sd_dart_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {

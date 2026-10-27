@@ -607,18 +607,21 @@ the macOS probe and builds the iOS device and simulator slices.
 
 ## Upstream qualification
 
-Upstream 982 has its
-[ABI audit, carry inventory, evidence and outstanding gates](docs/upstream_982_qualification.md).
+Upstream 1017 has its
+[ABI audit, wrapper review, FP8 evidence and outstanding gates](docs/upstream_1017_qualification.md);
+the carry inventory is in the [upstream 982 record](docs/upstream_982_qualification.md).
 It carries two fixes the pin lacks: unbatched CFG in Metal builds (below) and
 the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
 2 GiB.
-Its larger context struct requires regenerated consumer bindings. A null
+Upstream's `generate_image` now returns an owned result with per-image
+generation metadata; `sd_dart_generate_image` keeps returning an image array
+that `free_sd_images` frees and drops that metadata. Since upstream 982 a null
 `flash_attn_mode` or `conv_direct_mode` with its legacy flags `false`, the
-initializer default, now selects upstream's auto probes, which change output
-and are not seed-reproducible on Metal; to keep earlier behavior, pass the
-explicit modes the document maps from the legacy flags.
-`tests/test_runtime_api.py` exercises a built runtime's defaults and component
-conversion without models or a GPU.
+initializer default, selects upstream's auto probes, which change output and
+are not seed-reproducible on Metal; to keep earlier behavior, pass the
+explicit modes the 982 record maps from the legacy flags.
+`tests/test_runtime_api.py` exercises a built runtime's defaults, result
+contract and component conversion without models or a GPU.
 
 In a Metal build, the Apple targets, `sd_dart_new_sd_ctx` runs CFG unbatched
 whatever `sd_ctx_params_t.batched_cfg` says: ggml-metal's group normalization

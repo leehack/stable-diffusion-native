@@ -176,10 +176,16 @@ int generate(sd_ctx_t* context, int steps, bool guarded = true) {
     params.seed                           = 7;
     params.sample_params.sample_steps     = steps;
     params.sample_params.guidance.txt_cfg = 1.0f;
-    sd_image_t* images                    = nullptr;
-    int count                             = 0;
-    const bool ok                         = guarded ? sd_dart_generate_image(context, &params, &images, &count)
-                                                    : generate_image(context, &params, &images, &count);
+    if (!guarded) {
+        sd_image_generation_result_t* result = nullptr;
+        const bool ok                        = generate_image(context, &params, &result);
+        const int count                      = ok ? result->count : -1;
+        free_sd_image_generation_result(result);
+        return count;
+    }
+    sd_image_t* images = nullptr;
+    int count          = 0;
+    const bool ok      = sd_dart_generate_image(context, &params, &images, &count);
     if (images != nullptr) {
         free_sd_images(images, count);
     }

@@ -195,8 +195,12 @@ std::string last_error() {
 std::atomic<bool> fail_load{false};
 std::atomic<bool (*)()> hold_load{nullptr};
 std::atomic<bool (*)(sd_ctx_t*)> run_generation{nullptr};
-bool return_images = false;
-int image_batches_freed = 0;
+// Images in a successful stand-in result.
+int result_images = 1;
+// free_sd_image_generation_result() calls with a result, and the pixel
+// buffers that it and free_sd_images() freed.
+int results_freed = 0;
+int pixels_freed = 0;
 std::atomic<void (*)()> hold_free{nullptr};
 std::atomic<int> contexts_freed{0};
 std::atomic<sd_ctx_t*> last_freed{nullptr};
@@ -209,7 +213,7 @@ std::atomic<const sd_ctx_params_t*> last_load_params{nullptr};
 std::atomic<bool> last_load_batched_cfg{false};
 std::atomic<int> last_load_threads{0};
 std::atomic<const sd_img_gen_params_t*> last_request{nullptr};
-std::atomic<sd_image_t**> last_images_out{nullptr};
+std::atomic<sd_image_generation_result_t**> last_result_out{nullptr};
 
 // Teardown blocks a thread that reaches the registry outside a call in
 // flight. This one keeps reaching it, so when its count stops after the
@@ -870,8 +874,9 @@ int test_context() {
     sd_image_t* images = nullptr;
     int count          = 0;
     CHECK(sd_dart_generate_image(first, &request, &images, &count));
-    CHECK(last_request.load() == &request && last_images_out.load() == &images);
-    CHECK(count == 7);
+    CHECK(last_request.load() == &request && last_result_out.load() != nullptr);
+    CHECK(images != nullptr && count == 1);
+    free_sd_images(images, count);
     CHECK(!first->generating.load());
     run_generation.store([](sd_ctx_t*) { return false; });
     CHECK(!sd_dart_generate_image(first, &request, &images, &count));
@@ -1247,7 +1252,7 @@ int test_device_query_idle() {
 int test_generation_backend_failure() {
     sd_ctx_params_t params{};
     sd_img_gen_params_t request{};
-    return_images = true;
+    result_images = 2;
     // The generation wrapper must enable recording itself, even with logs muted.
     sd_dart_log_set_level(SD_LOG_ERROR + 1);
     for (int level : {SD_LOG_INFO, SD_LOG_ERROR}) {
@@ -1263,9 +1268,11 @@ int test_generation_backend_failure() {
             upstream_log(SD_LOG_ERROR, "ggml - ggml_metal_synchronize: error: command buffer 0 failed with status 5");
             return true;
         });
-        const int before = image_batches_freed;
+        const int results_before = results_freed;
+        const int pixels_before  = pixels_freed;
         CHECK(!sd_dart_generate_image(context, &request, &images, &count));
-        CHECK(images == nullptr && count == 0 && image_batches_freed == before + 1);
+        CHECK(images == nullptr && count == 0);
+        CHECK(results_freed == results_before + 1 && pixels_freed == pixels_before + 2);
         CHECK(last_error().find("command buffer 0 failed") != std::string::npos);
         // The context is unusable until disposal/reload; do not call upstream again.
         run_generation.store(+[](sd_ctx_t*) -> bool { CHECK(false); return true; });
@@ -1285,9 +1292,18 @@ int test_generation_backend_failure() {
     });
     sd_image_t* images = nullptr;
     int count = 0;
+    // A success moves the pixels out of upstream's result and frees the rest.
+    int results_before = results_freed;
+    int pixels_before  = pixels_freed;
     CHECK(sd_dart_generate_image(context, &request, &images, &count));
-    CHECK(images != nullptr && count == 2);
+    CHECK(images != nullptr && count == 2 && images[0].data != nullptr && images[1].data != nullptr);
+    CHECK(results_freed == results_before + 1 && pixels_freed == pixels_before);
     free_sd_images(images, count);
+    CHECK(pixels_freed == pixels_before + 2);
+    // A caller that takes no images still gets the result freed.
+    pixels_before = pixels_freed;
+    CHECK(sd_dart_generate_image(context, &request, nullptr, nullptr));
+    CHECK(pixels_freed == pixels_before + 2);
     // Upstream failure must also discard any partially returned batch.
     run_generation.store(+[](sd_ctx_t*) { return false; });
     CHECK(!sd_dart_generate_image(context, &request, &images, &count));
@@ -1310,9 +1326,9 @@ int test_generation_backend_failure() {
         for (int i = 0; i < 64; ++i) upstream_log(SD_LOG_ERROR, "later error");
         return true;
     });
-    const int before_null_count = image_batches_freed;
+    results_before = results_freed;
     CHECK(!sd_dart_generate_image(context, &request, &images, nullptr));
-    CHECK(images == nullptr && image_batches_freed == before_null_count + 1);
+    CHECK(images == nullptr && results_freed == results_before + 1);
     CHECK(last_error().find("recreate") != std::string::npos);
     sd_dart_exit_free(context);
     CHECK(sd_dart_exit_tracked_count() == 0);
@@ -1819,10 +1835,11 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
 
 bool generate_image(sd_ctx_t* sd_ctx,
                     const sd_img_gen_params_t* sd_img_gen_params,
-                    sd_image_t** images_out,
-                    int* num_images_out) {
+                    sd_image_generation_result_t** result_out) {
     last_request.store(sd_img_gen_params);
-    last_images_out.store(images_out);
+    last_result_out.store(result_out);
+    CHECK(result_out != nullptr);
+    *result_out = nullptr;
     sd_ctx->cancel.store(SD_CANCEL_RESET);
     sd_ctx->generating.store(true);
     bool ok = true;
@@ -1832,14 +1849,15 @@ bool generate_image(sd_ctx_t* sd_ctx,
     if (!ok) {
         upstream_log(SD_LOG_ERROR, "diffusion_engine.cpp:3 - generate_image failed");
     }
-    if (num_images_out != nullptr) {
-        *num_images_out = return_images ? 2 : 7;
-    }
-    if (return_images && images_out != nullptr) {
-        *images_out = static_cast<sd_image_t*>(calloc(2, sizeof(sd_image_t)));
-        for (int i = 0; i < 2; ++i) {
-            (*images_out)[i].data = static_cast<uint8_t*>(malloc(16));
+    if (ok) {
+        auto* result  = static_cast<sd_image_generation_result_t*>(calloc(1, sizeof(sd_image_generation_result_t)));
+        result->items = static_cast<sd_image_result_t*>(calloc(result_images, sizeof(sd_image_result_t)));
+        result->count = result_images;
+        for (int i = 0; i < result_images; ++i) {
+            result->items[i].image.data      = static_cast<uint8_t*>(malloc(16));
+            result->items[i].generation_info = static_cast<char*>(calloc(1, 3));
         }
+        *result_out = result;
     }
     sd_ctx->generating.store(false);
     return ok;
@@ -1851,10 +1869,24 @@ void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {
 }
 
 void free_sd_images(sd_image_t* images, int count) {
-    CHECK(images != nullptr && count == 2);
-    for (int i = 0; i < count; ++i) free(images[i].data);
+    CHECK(images != nullptr && count > 0);
+    for (int i = 0; i < count; ++i) {
+        pixels_freed += images[i].data != nullptr ? 1 : 0;
+        free(images[i].data);
+    }
     free(images);
-    ++image_batches_freed;
+}
+
+void free_sd_image_generation_result(sd_image_generation_result_t* result) {
+    if (result == nullptr) return;
+    ++results_freed;
+    for (int i = 0; i < result->count; ++i) {
+        pixels_freed += result->items[i].image.data != nullptr ? 1 : 0;
+        free(result->items[i].image.data);
+        free(result->items[i].generation_info);
+    }
+    free(result->items);
+    free(result);
 }
 
 // A Metal build loads with batched CFG off from a copy of the caller's
