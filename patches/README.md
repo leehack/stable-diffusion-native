@@ -13,3 +13,4 @@ an upstream issue or pull request to retire it.
 | Patch | Sources | Fixes | Test |
 | --- | --- | --- | --- |
 | `pickle_line_span.patch` | `src/model_io/pickle_io.cpp` | A legacy PyTorch checkpoint above 2 GiB is rejected: the pickle scanner narrows the rest of the file to `int` before looking for a newline ([#23](https://github.com/leehack/stable-diffusion-native/issues/23)). | `tests/test_pickle_span.py` |
+| `fp8_metal_f16_load.patch` | `src/model_manager.cpp` | An FP8 (E4M3 or E5M2) checkpoint aborts the process on Metal: ggml-metal claims FP8 `MUL_MAT` but has no FP8 kernel. Weights a Metal backend computes with now load as F16, which holds every FP8 value; other backends keep FP8 ([#29](https://github.com/leehack/stable-diffusion-native/issues/29)). | `tests/test_fp8_runtime.py` |

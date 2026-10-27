@@ -113,6 +113,11 @@ This is a pre-existing defect of every published Apple runtime, not caused or
 fixed by this upgrade, and the default Apple backend crashes rather than
 refusing. Vulkan was not run.
 
+`patches/fp8_metal_f16_load.patch` ([#29](https://github.com/leehack/stable-diffusion-native/issues/29))
+fixes it after this upgrade: under a debugger the abort is in
+`ggml_metal_op_mul_mat` during the SD2 v-prediction probe in `new_sd_ctx`, and
+Metal now loads FP8 weights as F16.
+
 ## Executed qualification
 
 macOS arm64 (Apple M4 Max), release build of this branch, dylib SHA-256

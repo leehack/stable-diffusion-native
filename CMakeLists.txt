@@ -76,6 +76,7 @@ function(sd_native_carry_patch patch)
 endfunction()
 
 sd_native_carry_patch(pickle_line_span.patch src/model_io/pickle_io.cpp)
+sd_native_carry_patch(fp8_metal_f16_load.patch src/model_manager.cpp)
 
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.
