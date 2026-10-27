@@ -1,0 +1,80 @@
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -1012,26 +1012,62 @@ bool StableDiffusionGGML::tae_preview_only() const {
+     return config_->params.tae_preview_only && version != VERSION_SDXS_512_DS && version != VERSION_SDXS_09;
+ }
+ 
++// Applying a LoRA immediately adds an F32 diff into each F16 weight in place, on
++// the backend holding the weight. ggml-metal adds only equal types, and the
++// scheduler aborts on an op a pre-allocated tensor's backend cannot run.
++static bool backend_adds_f32_into_f16(ggml_backend_t backend) {
++    ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
++    ggml_context* ctx       = ggml_init(params);
++    if (ctx == nullptr) {
++        return false;
++    }
++    ggml_tensor* weight  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 16);
++    ggml_tensor* diff    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
++    const bool supported = ggml_backend_supports_op(backend, ggml_add_inplace(ctx, weight, diff));
++    ggml_free(ctx);
++    return supported;
++}
++
+ void StableDiffusionGGML::configure_weight_loading() {
+     const auto* sd_ctx_params = &config_->params;
+     const auto& model_loader  = model_manager->loader();
+     const auto wtype_stat     = model_loader.get_wtype_stat();
+     bool have_int8_tensorwise = false;
+     bool have_quant_type_rule = false;
++    bool have_fp8_weight      = false;
++    bool have_f16_weight      = false;
+     for (const auto& [_, tensor_storage] : model_loader.get_tensor_storage_map()) {
+         if (tensor_storage.is_int8_tensorwise) {
+             have_int8_tensorwise = true;
+         }
++        const ggml_type load_type = tensor_storage.expected_type < GGML_TYPE_COUNT ? tensor_storage.expected_type
++                                                                                   : tensor_storage.type;
++        if (load_type == GGML_TYPE_F8_E4M3 || load_type == GGML_TYPE_F8_E5M2) {
++            have_fp8_weight = true;
++        } else if (load_type == GGML_TYPE_F16) {
++            have_f16_weight = true;
++        }
+         if (tensor_storage.expected_type < GGML_TYPE_COUNT && ggml_is_quantized(tensor_storage.expected_type)) {
+             have_quant_type_rule = true;
+         }
+-        if (have_int8_tensorwise && have_quant_type_rule) {
+-            break;
++    }
++    // Merging into an FP8 weight crashes ggml-cpu, which has neither the FP8
++    // matrix kernel the F32 cast uses nor an F32 to FP8 conversion.
++    const char* immediate_lora_blocker = nullptr;
++    if (have_fp8_weight) {
++        immediate_lora_blocker = "FP8 weights";
++    } else if (have_f16_weight) {
++        for (SDBackendModule module : {SDBackendModule::TE, SDBackendModule::DIFFUSION, SDBackendModule::VAE}) {
++            ggml_backend_t backend = backend_manager.runtime_backend(module);
++            if (backend != nullptr && !backend_adds_f32_into_f16(backend)) {
++                immediate_lora_blocker = "F16 weights on this backend";
++                break;
++            }
+         }
+     }
+ 
+     if (sd_ctx_params->lora_apply_mode == LORA_APPLY_AUTO) {
+-        bool have_quantized_weight = have_int8_tensorwise;
++        bool have_quantized_weight = have_int8_tensorwise || immediate_lora_blocker != nullptr;
+         for (const auto& [type, _] : wtype_stat) {
+             if (ggml_is_quantized(type)) {
+                 have_quantized_weight = true;
+@@ -1054,6 +1090,10 @@ void StableDiffusionGGML::configure_weight_loading() {
+                 "INT8 tensorwise weights do not support the immediately LoRA apply mode; "
+                 "using at_runtime instead");
+             apply_lora_immediately = false;
++        } else if (immediate_lora_blocker != nullptr) {
++            LOG_WARN("%s do not support the immediately LoRA apply mode; using at_runtime instead",
++                     immediate_lora_blocker);
++            apply_lora_immediately = false;
+         } else if (row_split_active()) {
+             LOG_WARN(
+                 "row-split tensors do not support the immediately LoRA apply mode; "

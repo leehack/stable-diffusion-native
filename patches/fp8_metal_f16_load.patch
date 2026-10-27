@@ -1,3 +1,38 @@
+diff --git a/src/core/backend_fit.cpp b/src/core/backend_fit.cpp
+--- a/src/core/backend_fit.cpp
++++ b/src/core/backend_fit.cpp
+@@ -96,7 +96,19 @@ namespace sd::backend_fit {
+         return false;
+     }
+ 
++    // model_manager.cpp loads FP8 weights that Metal computes with as F16, at
++    // twice their size. A component the plan keeps off Metal is overestimated.
++    static bool metal_loads_fp8_as_f16() {
++#ifndef SD_USE_UPSTREAM_GGML
++        ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL");
++        return reg != nullptr && ggml_backend_reg_dev_count(reg) > 0;
++#else
++        return false;
++#endif
++    }
++
+     static std::vector<Component> estimate_components(ModelLoader& loader, ggml_type override_wtype) {
++        const bool fp8_as_f16     = metal_loads_fp8_as_f16();
+         int64_t bytes[3]          = {0, 0, 0};
+         int64_t largest_tensor[3] = {0, 0, 0};
+         for (const auto& [name, stored_tensor] : loader.get_tensor_storage_map()) {
+@@ -110,6 +122,11 @@ namespace sd::backend_fit {
+             } else if (override_wtype != GGML_TYPE_COUNT && loader.tensor_should_be_converted(ts, override_wtype)) {
+                 ts.type = override_wtype;
+             }
++#ifndef SD_USE_UPSTREAM_GGML
++            if (fp8_as_f16 && (ts.type == GGML_TYPE_F8_E4M3 || ts.type == GGML_TYPE_F8_E5M2)) {
++                ts.type = GGML_TYPE_F16;
++            }
++#endif
+             const int64_t tensor_bytes = (int64_t)ts.nbytes() + 64;
+             bytes[int(kind)] += tensor_bytes;
+             largest_tensor[int(kind)] = std::max(largest_tensor[int(kind)], tensor_bytes);
 diff --git a/src/model_manager.cpp b/src/model_manager.cpp
 --- a/src/model_manager.cpp
 +++ b/src/model_manager.cpp
@@ -9,20 +44,23 @@ diff --git a/src/model_manager.cpp b/src/model_manager.cpp
  #include <iterator>
  #include <mutex>
  #include <tuple>
-@@ -185,6 +186,36 @@ size_t estimate_tensors_size(const std::map<std::string, ggml_tensor*>& tensors)
+@@ -185,6 +186,40 @@ size_t estimate_tensors_size(const std::map<std::string, ggml_tensor*>& tensors)
      return size;
  }
  
 +// ggml-metal reports FP8 MUL_MAT as supported, so Linear keeps FP8 weights, but
 +// it has no FP8 matrix kernel and aborts the process encoding one. Weights a
 +// Metal backend computes with are loaded as F16 instead, which holds every FP8
-+// value exactly.
-+static void load_fp8_params_as_f16_on_metal(const std::map<std::string, ggml_tensor*>& tensors,
-+                                            ggml_backend_t compute_backend) {
++// value exactly. So are FP8 LoRA tensors on every backend: LoRA multiplies
++// them directly, and ggml-cpu has no FP8 matrix kernel either.
++static void load_fp8_params_as_f16(ModelComponent component,
++                                   const std::map<std::string, ggml_tensor*>& tensors,
++                                   ggml_backend_t compute_backend) {
 +#ifndef SD_USE_UPSTREAM_GGML
 +    ggml_backend_dev_t device = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
 +    ggml_backend_reg_t reg    = device != nullptr ? ggml_backend_dev_backend_reg(device) : nullptr;
-+    if (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "MTL") != 0) {
++    if (component != ModelComponent::LoRA &&
++        (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "MTL") != 0)) {
 +        return;
 +    }
 +    for (const auto& pair : tensors) {
@@ -38,6 +76,7 @@ diff --git a/src/model_manager.cpp b/src/model_manager.cpp
 +        }
 +    }
 +#else
++    (void)component;
 +    (void)tensors;
 +    (void)compute_backend;
 +#endif
@@ -46,11 +85,11 @@ diff --git a/src/model_manager.cpp b/src/model_manager.cpp
  void ModelManager::set_split_buffer_type(ggml_backend_t compute_backend, ggml_backend_buffer_type_t split_buft, const std::vector<std::pair<ggml_backend_t, size_t>>& device_limits) {
      if (compute_backend == nullptr) {
          return;
-@@ -228,6 +259,7 @@ bool ModelManager::register_param_tensors(ModelComponent component,
+@@ -228,6 +263,7 @@ bool ModelManager::register_param_tensors(ModelComponent component,
          LOG_ERROR("model manager tensor component is invalid");
          return false;
      }
-+    load_fp8_params_as_f16_on_metal(tensors, compute_backend);
++    load_fp8_params_as_f16(component, tensors, compute_backend);
      if (registered_tensor_size != nullptr) {
          *registered_tensor_size += estimate_tensors_size(tensors);
      }
