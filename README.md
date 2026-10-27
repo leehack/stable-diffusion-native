@@ -615,8 +615,9 @@ the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
 2 GiB, the [`fp8_metal_f16_load.patch`](patches/README.md), which loads FP8
 weights as F16 on Metal instead of aborting, so they take twice their file size
 there, and the [`lora_immediate_fallback.patch`](patches/README.md), which
-applies a LoRA at runtime instead of crashing where it cannot be merged: into
-FP8 weights, and into F16 weights on Metal.
+applies a LoRA at runtime instead of crashing where the `immediately` mode
+cannot merge it: into FP8 weights, and on Metal, which cannot add into the F16
+convolution weights every model has.
 Upstream's `generate_image` now returns an owned result with per-image
 generation metadata; `sd_dart_generate_image` keeps returning an image array
 that `free_sd_images` frees and drops that metadata. Since upstream 982 a null

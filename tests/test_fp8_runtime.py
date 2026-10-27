@@ -2,17 +2,18 @@
 
 The model is the 12 MB PixArt model `exit_teardown_runtime_test make-model`
 writes, with its weights replaced by fixed patterns. Its 2-D weights hold
-values that E4M3, E5M2 and F16 represent exactly, kept as F32 in a control
+values that E4M3, E5M2, F16 and BF16 represent exactly, kept as F32 in a control
 copy and stored in each of those types in further copies, so on each device
 the images differ only by matrix precision. Nothing is downloaded.
 
 On Metal `patches/fp8_metal_f16_load.patch` loads FP8 weights as F16; without
-it an FP8 generation aborts the process (#29). The LoRA tests apply one small
-adapter in every apply mode to F32, F16 and FP8 weights. Without the patches
-an FP8 LoRA tensor crashes the CPU in every mode, and the immediately mode,
-which auto selects for these weights, crashes the CPU for FP8 weights and
-aborts Metal for F16 weights (#31). GitHub's macOS runners list no Metal
-device; run this on a Mac with `SD_REQUIRE_METAL_GENERATION=1`.
+it an FP8 generation aborts the process (#29). The LoRA tests apply small
+linear and convolution adapters in every apply mode to each weight type.
+Without the patches an FP8 LoRA tensor crashes the CPU in every mode, and the
+immediately mode, which auto selects for these weights, crashes the CPU for
+FP8 weights and aborts Metal, whose F16 convolution weights it cannot add
+into (#31). GitHub's macOS runners list no Metal device; run this on a Mac
+with `SD_REQUIRE_METAL_GENERATION=1`.
 
     SD_FP8_TARGET=<target>          a built Linux target; macOS defaults to
                                     the host's
@@ -46,19 +47,26 @@ MODEL_WRITER = REPO_ROOT / "tests" / "native" / "exit_teardown_runtime_test.cpp"
 PROBE = REPO_ROOT / "tests" / "native" / "fp8_runtime_test.cpp"
 GGML_METAL = REPO_ROOT / "third_party" / "stable-diffusion.cpp" / "ggml" / "src" / "ggml-metal"
 # Mean absolute difference per channel byte between two images of one device
-# that should match. An M4 Max measured at most 0.05 on the CPU and 0 on Metal.
+# that should match. An M4 Max measured at most 0.11 on the CPU and 0 on Metal.
 MAX_MEAN_DIFFERENCE = 0.5
-# The LoRA changes the image by 1.6 per byte on an M4 Max.
-MIN_LORA_EFFECT = 1.0
 # Fewer distinct bytes would mean a flat image that hides any difference.
 MIN_DISTINCT_BYTES = 16
 FP8_TYPES = {"F8_E4M3": (7, 3), "F8_E5M2": (15, 2)}  # exponent bias, mantissa bits
 # 2-D weights: +-2^-6 * (1 + m/4), which every type here holds exactly.
+WEIGHT_TYPES = ("F32", "F16", "BF16", *FP8_TYPES)
 WEIGHT_VALUES = [sign * 2.0 ** -6 * (1 + m / 4) for sign in (1, -1) for m in range(4)]
 # Every other tensor: values in [-0.125, 0.125). Larger ones make the tiny
 # network chaotic, so that matrix precision alone changes the image.
 OTHER_PATTERN = struct.pack("<61f", *(((i * 37) % 61 - 30.5) / 61 * 0.25 for i in range(61)))
-LORA_TARGET = "model.diffusion_model.final_layer.linear"
+# Upstream loads a convolution weight as F16 whatever the file holds.
+LINEAR_TARGET = "model.diffusion_model.final_layer.linear"
+CONV_TARGET = "model.diffusion_model.x_embedder.proj"
+# Applied immediately, these merge on the text encoder's and the TAESD's own
+# backend. Upstream applies no LoRA to the TAESD at runtime.
+TE_TARGET = "text_encoders.t5xxl.transformer.encoder.block.0.layer.0.SelfAttention.q"
+TAE_TARGET = "tae.decoder.layers.11"
+LORAS = {"linear": (LINEAR_TARGET, "F16"), "linear-fp8": (LINEAR_TARGET, "F8_E4M3"),
+         "conv": (CONV_TARGET, "F16"), "te": (TE_TARGET, "F16"), "tae": (TAE_TARGET, "F16")}
 LORA_RANK = 4
 LORA_DOWN_VALUES = [((i * 5) % 9 - 4) / 32 for i in range(9)]
 LORA_UP_VALUES = [((i * 7) % 11 - 5) / 8 for i in range(11)]
@@ -72,6 +80,12 @@ def encode(values: list[float], dtype: str, count: int) -> bytes:
     if dtype in ("F32", "F16"):
         code = "f" if dtype == "F32" else "e"
         return struct.pack(f"<{count}{code}", *(values[i % len(values)] for i in range(count)))
+    if dtype == "BF16":
+        f32 = encode(values, "F32", len(values))
+        if any(f32[i:i + 2] != b"\0\0" for i in range(0, len(f32), 4)):
+            raise ValueError(f"BF16 does not hold every value of {values}")
+        encoded = b"".join(f32[i + 2:i + 4] for i in range(0, len(f32), 4))
+        return (encoded * -(-count // len(values)))[:2 * count]
     bias, bits = FP8_TYPES[dtype]
     encoded = []
     for value in values:
@@ -132,14 +146,16 @@ def write_weight_copies(source: Path, copies: dict[str, Path]) -> int:
     return converted
 
 
-def write_lora(path: Path, weight_shape: list[int], down_dtype: str) -> None:
-    out_features, in_features = weight_shape
-    down = f"{LORA_TARGET}.lora_down.weight"
-    up = f"{LORA_TARGET}.lora_up.weight"
-    header = {down: {"dtype": down_dtype, "shape": [LORA_RANK, in_features]},
-              up: {"dtype": "F16", "shape": [out_features, LORA_RANK]}}
+def write_lora(path: Path, target: str, weight_shape: list[int], down_dtype: str) -> None:
+    """Writes a LoRA for the linear or convolution weight `target`."""
+    out_features, *in_shape = weight_shape
+    down = f"{target}.lora_down.weight"
+    up = f"{target}.lora_up.weight"
+    up_shape = [out_features, LORA_RANK] + [1] * (len(in_shape) - 1)
+    header = {down: {"dtype": down_dtype, "shape": [LORA_RANK, *in_shape]},
+              up: {"dtype": "F16", "shape": up_shape}}
     write_safetensors(path, header, {
-        down: encode(LORA_DOWN_VALUES, down_dtype, LORA_RANK * in_features),
+        down: encode(LORA_DOWN_VALUES, down_dtype, LORA_RANK * math.prod(in_shape)),
         up: encode(LORA_UP_VALUES, "F16", out_features * LORA_RANK)})
 
 
@@ -187,13 +203,12 @@ class RuntimeTestCase(unittest.TestCase):
         source_model = work / "model.safetensors"
         subprocess.run([str(binaries[MODEL_WRITER]), "make-model", str(source_model)],
                        check=True, timeout=600, capture_output=True)
-        cls.models = {dtype: work / f"{dtype.lower()}.safetensors"
-                      for dtype in ("F32", "F16", *FP8_TYPES)}
+        cls.models = {dtype: work / f"{dtype.lower()}.safetensors" for dtype in WEIGHT_TYPES}
         cls.converted = write_weight_copies(source_model, cls.models)
         header, _ = read_safetensors(cls.models["F32"])
-        cls.loras = {dtype: work / f"lora-{dtype.lower()}.safetensors" for dtype in ("F16", "F8_E4M3")}
-        for dtype, path in cls.loras.items():
-            write_lora(path, header[f"{LORA_TARGET}.weight"]["shape"], dtype)
+        cls.loras = {name: work / f"lora-{name}.safetensors" for name in LORAS}
+        for name, (target, dtype) in LORAS.items():
+            write_lora(cls.loras[name], target, header[f"{target}.weight"]["shape"], dtype)
         listing = subprocess.run([str(cls.probe), "devices"], check=True, capture_output=True,
                                  text=True, timeout=120).stdout
         cls.devices = [line.split("\t")[0] for line in listing.splitlines() if line.strip()]
@@ -209,13 +224,15 @@ class RuntimeTestCase(unittest.TestCase):
                 self.fail(self.skip_reason)
             self.skipTest(self.skip_reason)
 
-    def generate(self, dtype: str, device: str, lora: str | None = None,
-                 mode: str = "") -> tuple[subprocess.CompletedProcess, bytes]:
+    def generate(self, dtype: str, device: str, lora: str | None = None, mode: str = "",
+                 rules: str = "", model: Path | None = None) -> tuple[subprocess.CompletedProcess, bytes]:
+        """Generates one image; the result's stdout holds the runtime's log."""
         output = Path(self.directory.name) / "image.rgb"
         output.unlink(missing_ok=True)
-        command = [str(self.probe), "generate", str(self.models[dtype]), device, str(output)]
+        model = model or self.models[dtype]
+        command = [str(self.probe), "generate", str(model), device, str(output)]
         if lora is not None:
-            command += [str(self.loras[lora]), mode]
+            command += [str(self.loras[lora]), mode] + ([rules] if rules else [])
         result = subprocess.run(command, capture_output=True, text=True, timeout=600)
         return result, output.read_bytes() if output.is_file() else b""
 
@@ -284,23 +301,35 @@ class Fp8RuntimeTest(RuntimeTestCase):
                          "auto-fit plans FP8 weights below the F16 size Metal loads them at")
 
 
+FALLBACK_WARNING = "do not support the immediately LoRA apply mode; using at_runtime instead"
+APPLIED = re.compile(r"\((\d+) / (\d+)\) LoRA tensors have been applied")
+
+
 class LoraRuntimeTest(RuntimeTestCase):
+    def generate_with_lora(self, what: str, *args, **kwargs) -> tuple[str, bytes]:
+        result, image = self.generate(*args, **kwargs)
+        self.assertEqual(0, result.returncode, f"{what}:\n{result.stderr[-4000:]}")
+        self.assertTrue(any(int(applied) > 0 and applied == total
+                            for applied, total in APPLIED.findall(result.stdout)),
+                        f"{what} applies no LoRA tensor:\n{result.stdout[-4000:]}")
+        return result.stdout, image
+
     def check_device(self, device: str) -> None:
         self.generate_control(device)
-        for weights in ("F32", "F16", "F8_E4M3"):
+        for weights in WEIGHT_TYPES:
             plain = self.generate(weights, device)[1]
-            reference, expected = self.generate(weights, device, "F16", "at_runtime")
-            self.assertEqual(0, reference.returncode,
-                             f"{weights} weights, F16 LoRA at_runtime on {device}:\n{reference.stderr[-4000:]}")
-            self.assertGreaterEqual(mean_difference(plain, expected), MIN_LORA_EFFECT,
-                                    f"the LoRA does not change the {weights} image on {device}")
-            for lora, mode in (("F16", "immediately"), ("F16", "auto"),
-                               ("F8_E4M3", "at_runtime"), ("F8_E4M3", "immediately")):
-                with self.subTest(weights=weights, lora=lora, mode=mode):
-                    result, image = self.generate(weights, device, lora, mode)
-                    what = f"{weights} weights, {lora} LoRA {mode} on {device}"
-                    self.assertEqual(0, result.returncode, f"{what}:\n{result.stderr[-4000:]}")
-                    self.assert_matches(expected, image, f"{what} is not the at_runtime image")
+            for lora in ("linear", "linear-fp8", "conv"):
+                what = f"{weights} weights, {lora} LoRA on {device}"
+                _, expected = self.generate_with_lora(f"{what} at_runtime", weights, device, lora, "at_runtime")
+                self.assertNotEqual(plain, expected, f"{what} does not change the image")
+                for mode in ("immediately", "auto"):
+                    with self.subTest(weights=weights, lora=lora, mode=mode):
+                        log, image = self.generate_with_lora(f"{what} {mode}", weights, device, lora, mode)
+                        self.assert_matches(expected, image, f"{what} {mode} is not the at_runtime image")
+                        # Metal cannot add into the F16 weights every model has.
+                        falls_back = mode == "immediately" and (weights in FP8_TYPES or device.startswith("MTL"))
+                        if device == "CPU" or device.startswith("MTL"):
+                            self.assertEqual(falls_back, FALLBACK_WARNING in log, f"{what} {mode}:\n{log[-4000:]}")
 
     def test_lora_applies_on_the_cpu(self) -> None:
         self.check_device("CPU")
@@ -309,6 +338,36 @@ class LoraRuntimeTest(RuntimeTestCase):
         for device in self.gpus():
             with self.subTest(device=device):
                 self.check_device(device)
+
+    def test_lora_falls_back_for_a_module_on_metal(self) -> None:
+        metal = [device for device in self.gpus() if device.startswith("MTL")]
+        if not metal:
+            self.skipTest(f"no Metal device in {self.devices}")
+        for module, lora in (("te", "te"), ("vae", "tae")):
+            with self.subTest(module=module):
+                backend = f"CPU,{module}={metal[0]}"
+                result, _ = self.generate("F16", backend, lora, "immediately")
+                self.assertEqual(0, result.returncode, f"{lora} LoRA on {backend}:\n{result.stderr[-4000:]}")
+                self.assertIn(FALLBACK_WARNING, result.stdout)
+
+    def test_lora_merges_fp8_weights_a_type_rule_loads_as_f16(self) -> None:
+        # Upstream converts only some weights; FP8 elsewhere would keep the fallback.
+        fp8_header, fp8_data = read_safetensors(self.models["F8_E4M3"])
+        control_header, control_data = read_safetensors(self.models["F32"])
+        header, blobs = {}, {}
+        for name, info in fp8_header.items():
+            source, data = (info, fp8_data) if ".blocks." in name else (control_header[name], control_data)
+            header[name] = dict(source)
+            blobs[name] = data[source["data_offsets"][0]:source["data_offsets"][1]]
+        model = Path(self.directory.name) / "fp8-blocks.safetensors"
+        write_safetensors(model, header, blobs)
+        self.assertIn("F8_E4M3", {info["dtype"] for info in header.values()})
+        _, expected = self.generate_with_lora("at_runtime", "", "CPU", "linear", "at_runtime",
+                                              rules="blocks=f16", model=model)
+        log, image = self.generate_with_lora("immediately", "", "CPU", "linear", "immediately",
+                                             rules="blocks=f16", model=model)
+        self.assertNotIn(FALLBACK_WARNING, log)
+        self.assert_matches(expected, image, "the merged image is not the at_runtime image")
 
 
 class PinnedGgmlMetalTest(unittest.TestCase):
