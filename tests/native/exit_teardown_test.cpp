@@ -1335,6 +1335,26 @@ int test_generation_backend_failure() {
     return 0;
 }
 
+// A success with no images to take is a failure: the result is freed and the
+// outputs are cleared. calloc() failure takes the same path but cannot be
+// forced portably, since macOS and Linux overcommit.
+int test_generation_without_images() {
+    sd_ctx_params_t params{};
+    sd_img_gen_params_t request{};
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    run_generation.store(nullptr);
+    result_images      = 0;
+    sd_image_t* images = reinterpret_cast<sd_image_t*>(1);
+    int count          = 7;
+    const int results_before = results_freed;
+    CHECK(!sd_dart_generate_image(context, &request, &images, &count));
+    CHECK(images == nullptr && count == 0);
+    CHECK(results_freed == results_before + 1);
+    result_images = 1;
+    sd_dart_exit_free(context);
+    return 0;
+}
+
 // A call that fails leaves the reason upstream logged for it with the thread
 // that made the call, once the recorder is enabled.
 int test_last_error() {
@@ -1956,6 +1976,7 @@ int main(int argc, char** argv) {
         {"device-query-idle", test_device_query_idle},
         {"last-error", test_last_error},
         {"generation-backend-failure", test_generation_backend_failure},
+        {"generation-without-images", test_generation_without_images},
         {"log-at-exit", test_log_at_exit},
         {"batched-cfg", test_batched_cfg},
 #if defined(__APPLE__)

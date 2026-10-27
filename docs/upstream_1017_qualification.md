@@ -37,6 +37,10 @@ are unchanged. `tests/native/exit_teardown_test.cpp` checks the moves and the
 frees with a stand-in that returns owned results; `runtime_api_test.cpp` pins
 the new signatures and layouts at compile time.
 
+Since #2206, `SD_CANCEL_ALL` during a batch decode discards the images already
+decoded, so a cancelled batch returns no partial result. llamadart treats a
+cancel as cancelled with no result.
+
 So llamadart regenerates bindings, but its calls and struct sizes stay valid:
 it calls only `sd_dart_generate_image`, `free_sd_images`, the initializers and
 short queries. It must not bind `sd_ctx_supports_ref_image_conditioning`
