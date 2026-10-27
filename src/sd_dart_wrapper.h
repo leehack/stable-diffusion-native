@@ -221,12 +221,15 @@ SD_API sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 
 // generate_image() as a call in flight. Enables native log recording and
 // returns false if Metal reports a failed command buffer, even if upstream
-// returns success. On failure, frees the returned batch and clears both
-// outputs. A tracked context with a backend failure rejects later generations:
-// free it with sd_dart_exit_free() and load a new context. Concurrent calls
-// conservatively fail together when a backend failure overlaps them, since
-// upstream's log callback does not identify a context. Do not replace that
-// callback after enabling the wrapper recorder.
+// returns success. Returns the images as an array of `*num_images_out` that
+// the caller frees with free_sd_images(); upstream's per-image
+// generation_info, which holds the prompts and model paths, is freed here.
+// A null `images_out` frees the images too. On failure, frees the returned
+// batch and clears both outputs. A tracked context with a backend failure
+// rejects later generations: free it with sd_dart_exit_free() and load a new
+// context. Concurrent calls conservatively fail together when a backend
+// failure overlaps them, since upstream's log callback does not identify a
+// context. Do not replace that callback after enabling the wrapper recorder.
 // Teardown cancels it with SD_CANCEL_ALL, which stable-diffusion.cpp
 // honors before a sampling step and before the decode of each image, and
 // waits for it with the longer bound. Blocks after teardown.
