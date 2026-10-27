@@ -1,0 +1,56 @@
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstring>
+ #include <iterator>
+ #include <mutex>
+ #include <tuple>
+@@ -185,6 +186,36 @@ size_t estimate_tensors_size(const std::map<std::string, ggml_tensor*>& tensors)
+     return size;
+ }
+ 
++// ggml-metal reports FP8 MUL_MAT as supported, so Linear keeps FP8 weights, but
++// it has no FP8 matrix kernel and aborts the process encoding one. Weights a
++// Metal backend computes with are loaded as F16 instead, which holds every FP8
++// value exactly.
++static void load_fp8_params_as_f16_on_metal(const std::map<std::string, ggml_tensor*>& tensors,
++                                            ggml_backend_t compute_backend) {
++#ifndef SD_USE_UPSTREAM_GGML
++    ggml_backend_dev_t device = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
++    ggml_backend_reg_t reg    = device != nullptr ? ggml_backend_dev_backend_reg(device) : nullptr;
++    if (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "MTL") != 0) {
++        return;
++    }
++    for (const auto& pair : tensors) {
++        ggml_tensor* tensor = pair.second;
++        if (tensor == nullptr || (tensor->type != GGML_TYPE_F8_E4M3 && tensor->type != GGML_TYPE_F8_E5M2) ||
++            tensor->data != nullptr || tensor->buffer != nullptr || tensor->view_src != nullptr) {
++            continue;
++        }
++        tensor->type  = GGML_TYPE_F16;
++        tensor->nb[0] = ggml_type_size(GGML_TYPE_F16);
++        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
++            tensor->nb[i] = tensor->nb[i - 1] * tensor->ne[i - 1];
++        }
++    }
++#else
++    (void)tensors;
++    (void)compute_backend;
++#endif
++}
++
+ void ModelManager::set_split_buffer_type(ggml_backend_t compute_backend, ggml_backend_buffer_type_t split_buft, const std::vector<std::pair<ggml_backend_t, size_t>>& device_limits) {
+     if (compute_backend == nullptr) {
+         return;
+@@ -228,6 +259,7 @@ bool ModelManager::register_param_tensors(ModelComponent component,
+         LOG_ERROR("model manager tensor component is invalid");
+         return false;
+     }
++    load_fp8_params_as_f16_on_metal(tensors, compute_backend);
+     if (registered_tensor_size != nullptr) {
+         *registered_tensor_size += estimate_tensors_size(tensors);
+     }

@@ -610,9 +610,10 @@ the macOS probe and builds the iOS device and simulator slices.
 Upstream 1017 has its
 [ABI audit, wrapper review, FP8 evidence and outstanding gates](docs/upstream_1017_qualification.md);
 the carry inventory is in the [upstream 982 record](docs/upstream_982_qualification.md).
-It carries two fixes the pin lacks: unbatched CFG in Metal builds (below) and
+It carries three fixes the pin lacks: unbatched CFG in Metal builds (below),
 the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
-2 GiB.
+2 GiB, and the [`fp8_metal_f16_load.patch`](patches/README.md), which loads FP8
+weights as F16 on Metal instead of aborting.
 Upstream's `generate_image` now returns an owned result with per-image
 generation metadata; `sd_dart_generate_image` keeps returning an image array
 that `free_sd_images` frees and drops that metadata. Since upstream 982 a null
