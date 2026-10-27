@@ -343,6 +343,7 @@ class LoraRuntimeTest(RuntimeTestCase):
         metal = [device for device in self.gpus() if device.startswith("MTL")]
         if not metal:
             self.skipTest(f"no Metal device in {self.devices}")
+        self.generate_control(metal[0])
         for module, lora in (("te", "te"), ("vae", "tae")):
             with self.subTest(module=module):
                 backend = f"CPU,{module}={metal[0]}"
