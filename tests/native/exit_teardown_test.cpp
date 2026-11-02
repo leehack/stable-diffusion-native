@@ -1844,6 +1844,10 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     return new sd_ctx_t();
 }
 
+sd_ctx_t* sd_dart_new_sd_ctx_intrinsic_tiny_impl(const sd_ctx_params_t* params) {
+    return new_sd_ctx(params);
+}
+
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
     CHECK(!sd_ctx->generating.load());
     calls_after_teardown.fetch_add(teardown_returned.load() ? 1 : 0);

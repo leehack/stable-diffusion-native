@@ -226,6 +226,17 @@ SD_API void sd_dart_exit_teardown(void);
 // not modified.
 SD_API sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 
+// Version 1 of the persistent intrinsic tiny-decoder policy. Like
+// sd_dart_new_sd_ctx(), but requires an intrinsic SDXS (512-DS or 09) decoder
+// and no external VAE/TAE. Rejected before load-time decoder probes. Every
+// automatic refresh validates the candidate under the context execution lock
+// before rebuilding runners, and image/video generation validates it again
+// after refresh. A later source replacement cannot select a full VAE.
+// Returns null on policy refusal; use sd_dart_last_error() for the reason.
+// Free a returned context with sd_dart_exit_free(). Old runtimes without this
+// export cannot enforce the policy.
+SD_API sd_ctx_t* sd_dart_new_sd_ctx_intrinsic_tiny_v1(const sd_ctx_params_t* sd_ctx_params);
+
 // generate_image() as a call in flight. Enables native log recording and
 // returns false if Metal reports a failed command buffer, even if upstream
 // returns success. Returns the images as an array of `*num_images_out` that

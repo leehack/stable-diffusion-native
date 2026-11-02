@@ -414,7 +414,7 @@ SdDartStaticsCall::~SdDartStaticsCall() {
     }
 }
 
-sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+static sd_ctx_t* new_context(const sd_ctx_params_t* sd_ctx_params, bool intrinsic_tiny) {
     Call call(kObjectCall | kWorkCall);
     ErrorWindow errors;
     // The pinned upstream asserts when a VRAM budget prevents its load-time
@@ -451,9 +451,18 @@ sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         sd_ctx_params         = &unbatched;
     }
 #endif
-    sd_ctx_t* context = new_sd_ctx(sd_ctx_params);
+    sd_ctx_t* context = intrinsic_tiny ? sd_dart_new_sd_ctx_intrinsic_tiny_impl(sd_ctx_params)
+                                       : new_sd_ctx(sd_ctx_params);
     insert(context, free_context, cancel_context, SD_DART_EXIT_STAGE_CONTEXT);
     return context;
+}
+
+sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* params) {
+    return new_context(params, false);
+}
+
+sd_ctx_t* sd_dart_new_sd_ctx_intrinsic_tiny_v1(const sd_ctx_params_t* params) {
+    return new_context(params, true);
 }
 
 namespace {
