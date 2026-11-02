@@ -32,10 +32,15 @@ function(sd_native_carry_patch patch)
     get_target_property(sources stable-diffusion SOURCES)
     foreach(path IN LISTS ARGN)
         set(upstream_file "${SD_NATIVE_UPSTREAM_DIR}/${path}")
-        if(NOT "${upstream_file}" IN_LIST sources)
+        string(MD5 source_key "${upstream_file}")
+        get_property(current_source GLOBAL PROPERTY "SD_NATIVE_PATCHED_${source_key}")
+        if(NOT current_source)
+            set(current_source "${upstream_file}")
+        endif()
+        if(NOT "${current_source}" IN_LIST sources)
             message(FATAL_ERROR "patches/${patch}: ${path} is not a stable-diffusion source")
         endif()
-        file(READ "${upstream_file}" text)
+        file(READ "${current_source}" text)
         # A Windows checkout can convert upstream's line endings; patches use LF.
         string(REPLACE "\r\n" "\n" text "${text}")
         file(WRITE "${patched_dir}/${path}" "${text}")
@@ -57,15 +62,21 @@ function(sd_native_carry_patch patch)
 
     foreach(path IN LISTS ARGN)
         set(upstream_file "${SD_NATIVE_UPSTREAM_DIR}/${path}")
+        string(MD5 source_key "${upstream_file}")
+        get_property(current_source GLOBAL PROPERTY "SD_NATIVE_PATCHED_${source_key}")
+        if(NOT current_source)
+            set(current_source "${upstream_file}")
+        endif()
         set(patched_file "${patched_dir}/${path}")
-        file(READ "${upstream_file}" original)
+        file(READ "${current_source}" original)
         string(REPLACE "\r\n" "\n" original "${original}")
         file(READ "${patched_file}" patched)
         if(original STREQUAL patched)
             message(FATAL_ERROR "patches/${patch} left ${path} unchanged:\n${output}")
         endif()
-        list(REMOVE_ITEM sources "${upstream_file}")
+        list(REMOVE_ITEM sources "${current_source}")
         list(APPEND sources "${patched_file}")
+        set_property(GLOBAL PROPERTY "SD_NATIVE_PATCHED_${source_key}" "${patched_file}")
         # Quoted includes in the copy must still find the upstream files next to it.
         get_filename_component(upstream_file_dir "${upstream_file}" DIRECTORY)
         set_source_files_properties("${patched_file}" TARGET_DIRECTORY stable-diffusion
@@ -78,10 +89,12 @@ endfunction()
 sd_native_carry_patch(pickle_line_span.patch src/model_io/pickle_io.cpp)
 sd_native_carry_patch(fp8_metal_f16_load.patch src/model_manager.cpp src/core/backend_fit.cpp)
 sd_native_carry_patch(lora_immediate_fallback.patch src/pipeline/diffusion_engine.cpp)
+sd_native_carry_patch(intrinsic_tiny_decoder_policy.patch src/stable-diffusion.cpp src/pipeline/diffusion_engine.cpp)
 
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.
 target_sources(stable-diffusion PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_decoder_policy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_device.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_exit.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_internal.h"

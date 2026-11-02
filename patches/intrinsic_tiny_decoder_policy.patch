@@ -1,0 +1,128 @@
+--- a/src/stable-diffusion.cpp
++++ b/src/stable-diffusion.cpp
+@@ -11,6 +11,10 @@
+ #include "pipeline/diffusion_engine.h"
+ #include "pipeline/generation.h"
+ #include "pipeline/request.h"
++
++// Implemented by the owner wrapper; policy state outlives C exit teardown.
++bool sd_dart_intrinsic_tiny_required(const void* engine);
++void sd_dart_set_intrinsic_tiny_required(const void* engine, bool required);
+ 
+ #define NONE_STR "NONE"
+ 
+@@ -645,7 +649,7 @@
+     StableDiffusionGGML* sd = nullptr;
+ };
+ 
+-sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
++static sd_ctx_t* new_sd_ctx_with_decoder_policy(const sd_ctx_params_t* sd_ctx_params, bool intrinsic_tiny) {
+     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+     if (sd_ctx == nullptr) {
+         return nullptr;
+@@ -657,7 +661,11 @@
+         return nullptr;
+     }
+ 
++    if (intrinsic_tiny) {
++        sd_dart_set_intrinsic_tiny_required(sd_ctx->sd, true);
++    }
+     if (!sd_ctx->sd->init(sd_ctx_params)) {
++        sd_dart_set_intrinsic_tiny_required(sd_ctx->sd, false);
+         delete sd_ctx->sd;
+         sd_ctx->sd = nullptr;
+         free(sd_ctx);
+@@ -666,8 +674,31 @@
+     return sd_ctx;
+ }
+ 
++sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
++    return new_sd_ctx_with_decoder_policy(sd_ctx_params, false);
++}
++
++sd_ctx_t* sd_dart_new_sd_ctx_intrinsic_tiny_impl(const sd_ctx_params_t* params) {
++    return new_sd_ctx_with_decoder_policy(params, true);
++}
++
++static bool decoder_policy_valid(const StableDiffusionGGML& sd) {
++    if (!sd_dart_intrinsic_tiny_required(&sd)) {
++        return true;
++    }
++    if ((sd.version == VERSION_SDXS_512_DS || sd.version == VERSION_SDXS_09) &&
++        sd.config_ && sd.uses_tae() && !sd.tae_preview_only() &&
++        strlen(SAFE_STR(sd.config_->params.vae_path)) == 0 &&
++        strlen(SAFE_STR(sd.config_->params.taesd_path)) == 0) {
++        return true;
++    }
++    LOG_ERROR("intrinsic tiny decoder policy v1 rejects the current decoder");
++    return false;
++}
++
+ void free_sd_ctx(sd_ctx_t* sd_ctx) {
+     if (sd_ctx->sd != nullptr) {
++        sd_dart_set_intrinsic_tiny_required(sd_ctx->sd, false);
+         delete sd_ctx->sd;
+         sd_ctx->sd = nullptr;
+     }
+@@ -759,7 +790,7 @@
+     if (!result_out || !sd_ctx || !sd_ctx->sd || !params)
+         return false;
+     StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+-    if (!execution.ready)
++    if (!execution.ready || !decoder_policy_valid(*sd_ctx->sd))
+         return false;
+     sd_image_t* images = nullptr;
+     int count          = 0;
+@@ -785,7 +816,7 @@
+     if (!result_out || !sd_ctx || !sd_ctx->sd || !params)
+         return false;
+     StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+-    if (!execution.ready)
++    if (!execution.ready || !decoder_policy_valid(*sd_ctx->sd))
+         return false;
+     auto* result = static_cast<sd_video_generation_result_t*>(calloc(1, sizeof(sd_video_generation_result_t)));
+     if (!result)
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -218,10 +218,31 @@
+     return candidate.refresh_files(false) && apply_model_update(std::move(candidate));
+ }
+ 
++bool sd_dart_intrinsic_tiny_required(const void* engine);
++
++static bool intrinsic_tiny_candidate_allowed(const void* engine, SDVersion version,
++                                             const sd_ctx_params_t* params) {
++    if (!sd_dart_intrinsic_tiny_required(engine)) {
++        return true;
++    }
++    if ((version == VERSION_SDXS_512_DS || version == VERSION_SDXS_09) && params &&
++        strlen(SAFE_STR(params->vae_path)) == 0 && strlen(SAFE_STR(params->taesd_path)) == 0) {
++        return true;
++    }
++    LOG_ERROR("intrinsic tiny decoder policy v1 rejects the updated model or external decoder");
++    return false;
++}
++
+ bool StableDiffusionGGML::apply_model_update(ModelLoader candidate,
+                                              std::unique_ptr<ModelConfig> next_config,
+                                              RunnerGroups groups) {
+     const SDVersion next_version = candidate.get_sd_version();
++    const auto* decoder_config = next_config ? next_config.get() : config_.get();
++    // Reject a changed family before runners, probes or weight placement.
++    if (!intrinsic_tiny_candidate_allowed(this, next_version,
++                                          decoder_config ? &decoder_config->params : nullptr)) {
++        return false;
++    }
+     if (next_version == VERSION_COUNT) {
+         LOG_ERROR("cannot identify updated diffusion model");
+         return false;
+@@ -975,6 +996,9 @@
+         LOG_INFO("Version: %s ", sd_version_name(version));
+     }
+ 
++    if (!intrinsic_tiny_candidate_allowed(this, version, &configuration->params)) {
++        return false;
++    }
+     if (auto_fit_enabled) {
+         if (!sd::backend_fit::derive_backend_specs(model_loader,
+                                                    sd_type_to_ggml_type(sd_ctx_params->wtype),

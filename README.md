@@ -669,3 +669,26 @@ Archive names:
 ## License
 
 MIT. Release archives include the stable-diffusion.cpp and ggml licenses.
+
+### Intrinsic tiny-decoder policy
+
+`sd_dart_new_sd_ctx_intrinsic_tiny_v1(params)` creates a tracked context that
+requires an intrinsic SDXS (512-DS or 09) tiny decoder without an external VAE
+or TAE. It rejects other candidates before runner construction, load-time
+backend probes and auto-fit. Automatic source refresh rechecks the candidate
+under the context execution lock before rebuilding; image and video calls
+check the decoder again after refresh, before generation. An atomic source
+replacement by a full-VAE model therefore fails instead of silently changing
+the decoder. A refusal returns null on load, or false with no images on
+generation; `sd_dart_last_error()` reports the reason. Dispose with
+`sd_dart_exit_free()`. Existing unrestricted contexts keep their behavior.
+
+The versioned export is the capability probe; an older runtime without it
+cannot offer this invariant. This is the owner prerequisite for
+[llamadart #1047](https://github.com/leehack/llamadart/issues/1047), not physical
+iPhone qualification or an artifact publication. Run the model-backed
+regression with `SD_INTRINSIC_TINY_MODEL=<sdxs.gguf>
+SD_FULL_VAE_MODEL=<sd-turbo.gguf> python3 -m unittest discover -s tests
+-p test_decoder_policy_runtime.py`. It runs unchanged and refreshed SDXS,
+refuses the SDXS-to-SD-Turbo replacement, and keeps an unrestricted reload
+control on CPU and the available Metal backend.

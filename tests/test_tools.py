@@ -79,6 +79,7 @@ class ApiSymbolsTest(unittest.TestCase):
                 "sd_dart_log_read",
                 "sd_dart_log_set_level",
                 "sd_dart_new_sd_ctx",
+                "sd_dart_new_sd_ctx_intrinsic_tiny_v1",
                 "sd_dart_progress_enable",
                 "sd_dart_progress_read",
             ],
