@@ -32,8 +32,8 @@ jobs:
           - { target: ios-arm64-sim, runs_on: macos-latest }
           - { target: ios-x64-sim, runs_on: macos-latest }
           - { target: android-arm64, runs_on: ubuntu-latest }
-          - { target: linux-x64, runs_on: ubuntu-latest, smoke: "--expect-device CPU" }
-          - { target: linux-x64-vulkan, runs_on: ubuntu-latest, smoke: "--expect-device Vulkan" }
+          - { target: linux-x64, runs_on: ubuntu-24.04, smoke: "--expect-device CPU" }
+          - { target: linux-x64-vulkan, runs_on: ubuntu-24.04, smoke: "--expect-device Vulkan" }
           - { target: linux-arm64, runs_on: ubuntu-24.04-arm, smoke: "--expect-device CPU" }
           - { target: linux-arm64-vulkan, runs_on: ubuntu-24.04-arm, smoke: "--expect-device Vulkan" }
           - { target: windows-x64, runs_on: windows-2022, smoke: "--expect-device CPU" }
