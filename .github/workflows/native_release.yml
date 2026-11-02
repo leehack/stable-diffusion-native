@@ -186,7 +186,7 @@ jobs:
 
   release:
     needs: verify
-    if: ${{ inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'leehack/stable-diffusion-native' }}
+    if: ${{ always() && !cancelled() && needs.verify.result == 'success' && inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'leehack/stable-diffusion-native' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
