@@ -634,6 +634,18 @@ writes only the first batch item
 ([leejet/stable-diffusion.cpp#2149](https://github.com/leejet/stable-diffusion.cpp/issues/2149)),
 so a batched CFG step returns a wrong image without an error.
 
+### VRAM-budget load safety
+
+Until [#34](https://github.com/leehack/stable-diffusion-native/issues/34) is
+repaired upstream, `sd_dart_new_sd_ctx` returns NULL and records an actionable
+`sd_dart_last_error()` when nonempty `max_vram` is combined with
+`auto_fit=false`. It also rejects an empty/default backend on an integrated-only
+GPU with a budget: select an explicit backend so auto-fit includes that device.
+These checks run before upstream context creation. The raw `new_sd_ctx` export
+remains unguarded, and consumers must retain their existing restrictions until
+a published artifact and affected-device regression are qualified. This is a
+safety restriction, not a repair of upstream memory planning.
+
 ## Release
 
 Run the `Native Build & Release` workflow with a tag such as `v0.1.0`. Tags are

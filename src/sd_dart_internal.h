@@ -42,5 +42,10 @@ void sd_dart_log_call_end();
 // failure conservatively invalidates every generation overlapping it.
 uint64_t sd_dart_log_backend_failures();
 void sd_dart_log_generation_failed();
+void sd_dart_log_load_rejected(const char* reason);
+
+// Called only inside the tracked context-creation call. May throw on a
+// backend registry failure, which the caller must convert to a load error.
+bool sd_dart_default_gpu_is_integrated();
 
 #endif  // SD_DART_INTERNAL_H

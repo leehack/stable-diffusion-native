@@ -292,6 +292,10 @@ void sd_dart_log_generation_failed() {
     record(SD_LOG_ERROR, "", "Metal backend failed; discard the image result and recreate the context before generating again.");
 }
 
+void sd_dart_log_load_rejected(const char* reason) {
+    record(SD_LOG_ERROR, "", reason);
+}
+
 void sd_dart_log_enable(void) {
     // Upstream and ggml keep their callbacks in unsynchronized globals, so
     // they are written once rather than on every call.

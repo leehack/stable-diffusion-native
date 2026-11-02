@@ -53,6 +53,12 @@ void copy_text(char* destination, size_t capacity, const char* text) {
 
 }  // namespace
 
+bool sd_dart_default_gpu_is_integrated() {
+    register_backends();
+    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr &&
+           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr;
+}
+
 int32_t sd_dart_gpu_device_count(void) {
     if (!SD_DART_GPU_BACKEND) {
         return SD_DART_GPU_NO_BACKEND;

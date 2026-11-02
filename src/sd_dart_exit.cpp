@@ -417,6 +417,27 @@ SdDartStaticsCall::~SdDartStaticsCall() {
 sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     Call call(kObjectCall | kWorkCall);
     ErrorWindow errors;
+    // The pinned upstream asserts when a VRAM budget prevents its load-time
+    // prediction probe. Auto-fit skips planning on an integrated-only default
+    // GPU, so that route needs an explicit backend before it is safe too.
+    if (sd_ctx_params != nullptr && sd_ctx_params->max_vram != nullptr &&
+        sd_ctx_params->max_vram[0] != '\0') {
+        if (!sd_ctx_params->auto_fit) {
+            sd_dart_log_load_rejected("max_vram requires auto_fit=true; the pinned runtime may abort without auto-fit.");
+            return nullptr;
+        }
+        if (sd_ctx_params->backend == nullptr || sd_ctx_params->backend[0] == '\0') {
+            try {
+                if (sd_dart_default_gpu_is_integrated()) {
+                    sd_dart_log_load_rejected("max_vram on an integrated-only GPU requires an explicit backend so auto-fit can plan it.");
+                    return nullptr;
+                }
+            } catch (...) {
+                sd_dart_log_load_rejected("Cannot inspect the default GPU safely for max_vram; select an explicit backend.");
+                return nullptr;
+            }
+        }
+    }
 #if SD_DART_METAL
     // ggml-metal's GROUP_NORM writes only the first batch item
     // (leejet/stable-diffusion.cpp#2149), so batched CFG returns a wrong
