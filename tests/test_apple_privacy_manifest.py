@@ -334,7 +334,7 @@ class WorkflowTests(unittest.TestCase):
             -1
             < workflow.find("python3 tools/package_release.py")
             < workflow.find(self.AUDIT)
-            < workflow.find("softprops/action-gh-release")
+            < workflow.find("tools/prepared_release.py publish")
         )
 
     def test_pull_requests_run_the_mach_o_tests_and_the_audit_on_macos(self) -> None:

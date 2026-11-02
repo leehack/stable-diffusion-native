@@ -15,6 +15,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -120,6 +121,12 @@ def main() -> None:
         "schemaVersion": 1,
         "package": PACKAGE,
         "tag": args.tag,
+        "source": {
+            "repository": "leehack/stable-diffusion-native",
+            "commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+            ).strip(),
+        },
         "upstream": upstream_info(),
         "artifacts": artifacts,
     }

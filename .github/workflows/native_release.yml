@@ -9,7 +9,19 @@ on:
       publish:
         description: Publish the prepared artifacts as a GitHub release
         type: boolean
-        default: true
+        default: false
+      prepared_run_id:
+        description: Replay a successful preparation run without rebuilding (empty to build)
+        required: false
+        type: string
+      expected_source_sha:
+        description: Full owner source SHA from the prepared run (required for replay)
+        required: false
+        type: string
+      manifest_sha256:
+        description: Qualified manifest.json SHA256 (required for replay)
+        required: false
+        type: string
       prerelease:
         description: Mark the GitHub release as a prerelease
         type: boolean
@@ -18,8 +30,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: native-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    if: ${{ !inputs.prepared_run_id }}
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runs_on }}
     strategy:
@@ -70,6 +87,7 @@ jobs:
           if-no-files-found: error
 
   package:
+    if: ${{ !inputs.prepared_run_id }}
     needs: build
     # The SwiftPM XCFramework needs xcodebuild.
     runs-on: macos-latest
@@ -91,15 +109,21 @@ jobs:
             cp -R "$dir"/. "bin/${dir#artifacts/bin-}/"
           done
       - name: Package
-        run: python3 tools/package_release.py --tag "${{ inputs.tag }}" --apple-xcframework
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 tools/package_release.py --tag "$RELEASE_TAG" --apple-xcframework
       - name: Validate the XCFramework privacy manifests
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: >-
           python3 tools/apple_privacy_manifest.py --audit-imports
-          "dist/stable-diffusion-native-apple-xcframework-${{ inputs.tag }}.zip"
+          "dist/stable-diffusion-native-apple-xcframework-$RELEASE_TAG.zip"
       - name: Link the XCFramework into a SwiftPM consumer
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: >-
           python3 tools/apple_xcframework.py consumer
-          "dist/stable-diffusion-native-apple-xcframework-${{ inputs.tag }}.zip"
+          "dist/stable-diffusion-native-apple-xcframework-$RELEASE_TAG.zip"
       - name: Upload the prepared release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -108,24 +132,81 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  release:
+  verify:
     needs: package
-    if: ${{ inputs.publish }}
+    if: ${{ always() && !cancelled() && (needs.package.result == 'success' || inputs.prepared_run_id != '') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source: ${{ steps.verify.outputs.source }}
+      digest: ${{ steps.verify.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.prepared_run_id }}
+        with:
+          name: stable-diffusion-native-${{ inputs.tag }}
+          path: dist
+      - name: Verify release inputs and prepared bytes
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PREPARED_RUN_ID: ${{ inputs.prepared_run_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+        run: |
+          if [ -n "$PREPARED_RUN_ID" ]; then
+            python3 tools/prepared_release.py replay --run-id "$PREPARED_RUN_ID" \
+              --tag "$RELEASE_TAG" --source "$EXPECTED_SOURCE_SHA" \
+              --manifest-sha256 "$MANIFEST_SHA256"
+            source="$EXPECTED_SOURCE_SHA"
+            digest="$MANIFEST_SHA256"
+          else
+            source="$GITHUB_SHA"
+            digest="$(sha256sum dist/manifest.json | cut -d ' ' -f 1)"
+            upstream="$(git ls-tree HEAD third_party/stable-diffusion.cpp | awk '{print $3}')"
+            python3 tools/prepared_release.py verify --tag "$RELEASE_TAG" \
+              --source "$source" --manifest-sha256 "$digest" --upstream "$upstream"
+          fi
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Manifest SHA256: $digest" >> "$GITHUB_STEP_SUMMARY"
+          echo "Prepared source: $source" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: verify
+    if: ${{ inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'leehack/stable-diffusion-native' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: stable-diffusion-native-${{ inputs.tag }}
+          name: verified-release-${{ github.run_id }}
           path: dist
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag }}
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ inputs.prerelease }}
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/manifest.json
-            dist/SHA256SUMS
+      - name: Verify again and create the release without overwriting
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.verify.outputs.source }}
+          MANIFEST_SHA256: ${{ needs.verify.outputs.digest }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          python3 tools/prepared_release.py publish --tag "$RELEASE_TAG" \
+            --source "$EXPECTED_SOURCE_SHA" --manifest-sha256 "$MANIFEST_SHA256" "${flags[@]}"
