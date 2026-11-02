@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1760,6 +1761,8 @@ int test_exit_in_fork_child() {
 
 }  // namespace
 
+std::atomic<enum ggml_backend_dev_type> test_device_type{GGML_BACKEND_DEVICE_TYPE_GPU};
+
 struct ggml_backend_device {
     const char* name = "MTL0";
 };
@@ -1795,7 +1798,7 @@ ggml_backend_dev_t ggml_backend_dev_get(size_t) {
 
 ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type) {
     RegistryRead read;
-    return type == GGML_BACKEND_DEVICE_TYPE_GPU ? device_registry().device : nullptr;
+    return type == test_device_type.load() ? device_registry().device : nullptr;
 }
 
 const char* ggml_backend_dev_name(ggml_backend_dev_t device) {
@@ -1807,7 +1810,7 @@ const char* ggml_backend_dev_description(ggml_backend_dev_t) {
 }
 
 enum ggml_backend_dev_type ggml_backend_dev_type(ggml_backend_dev_t) {
-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    return test_device_type.load();
 }
 
 void ggml_backend_dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
@@ -1911,6 +1914,77 @@ void free_sd_image_generation_result(sd_image_generation_result_t* result) {
 
 // A Metal build loads with batched CFG off from a copy of the caller's
 // parameters; any other build passes them through.
+int test_vram_load_guard() {
+    sd_ctx_params_t params{};
+    params.max_vram = "1";
+    sd_dart_log_set_level(SD_LOG_ERROR + 1);
+    auto before = loads_begun.load();
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    CHECK(loads_begun.load() == before);
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    CHECK(last_error().find("auto_fit=true") != std::string::npos);
+
+    params.auto_fit = true;
+    // Upstream disables planning for any nonempty params_backend, even when
+    // auto_fit is true and the runtime backend is explicitly selected.
+    params.backend = "gpu";
+    for (const char* placement : {"gpu", "cpu", "diffusion=gpu"}) {
+        params.params_backend = placement;
+        CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+        CHECK(loads_begun.load() == before);
+        CHECK(sd_dart_exit_tracked_count() == 0);
+        CHECK(last_error().find("empty params_backend") != std::string::npos);
+    }
+    params.params_backend = "";
+    sd_ctx_t* explicit_context = sd_dart_new_sd_ctx(&params);
+    CHECK(explicit_context != nullptr);
+    CHECK(last_error().empty());
+    sd_dart_exit_free(explicit_context);
+    before = loads_begun.load();
+    params.backend = nullptr;
+    params.params_backend = nullptr;
+    test_device_type = GGML_BACKEND_DEVICE_TYPE_IGPU;
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    CHECK(loads_begun.load() == before);
+    CHECK(last_error().find("explicit backend") != std::string::npos);
+    params.backend = "";
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    CHECK(loads_begun.load() == before);
+
+    // Explicit auto-fit planning, a discrete default GPU and no budget remain
+    // admitted, and a rejected call must not poison a later successful load.
+    params.backend = "gpu";
+    sd_ctx_t* context = sd_dart_new_sd_ctx(&params);
+    CHECK(context != nullptr && loads_begun.load() == before + 1);
+    CHECK(last_error().empty());
+    sd_dart_exit_free(context);
+    params.backend = nullptr;
+    test_device_type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    context = sd_dart_new_sd_ctx(&params);
+    CHECK(context != nullptr && loads_begun.load() == before + 2);
+    sd_dart_exit_free(context);
+    // A CPU-only registry does not have the unplanned integrated-GPU path.
+    test_device_type = GGML_BACKEND_DEVICE_TYPE_CPU;
+    context = sd_dart_new_sd_ctx(&params);
+    CHECK(context != nullptr);
+    sd_dart_exit_free(context);
+    test_device_type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    hold_query.store(+[] { throw std::runtime_error("registry unavailable"); });
+    CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+    CHECK(last_error().find("Cannot inspect") != std::string::npos);
+    hold_query.store(nullptr);
+    params.auto_fit = false;
+    params.params_backend = "gpu";
+    for (const char* budget : {static_cast<const char*>(nullptr), ""}) {
+        params.max_vram = budget;
+        context = sd_dart_new_sd_ctx(&params);
+        CHECK(context != nullptr);
+        sd_dart_exit_free(context);
+    }
+    CHECK(sd_dart_exit_tracked_count() == 0);
+    return 0;
+}
+
 int test_batched_cfg() {
     sd_ctx_params_t params{};
     params.n_threads   = 3;
@@ -1979,6 +2053,7 @@ int main(int argc, char** argv) {
         {"generation-without-images", test_generation_without_images},
         {"log-at-exit", test_log_at_exit},
         {"batched-cfg", test_batched_cfg},
+        {"vram-load-guard", test_vram_load_guard},
 #if defined(__APPLE__)
         {"exit-in-flight", test_exit_in_flight},
 #endif
