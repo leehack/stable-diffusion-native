@@ -207,7 +207,8 @@ SD_API void sd_dart_exit_set_wait_ms(int32_t wait_ms, int32_t work_wait_ms);
 SD_API void sd_dart_exit_teardown(void);
 
 // Returns NULL with sd_dart_last_error() when max_vram is nonempty and
-// auto_fit is false, or when auto_fit uses an integrated-only default GPU
+// auto_fit is false or params_backend is nonempty (which disables auto-fit),
+// or when auto_fit uses an integrated-only default GPU
 // without an explicit backend. The pinned upstream can abort in these cases.
 // Safe loads still require sufficient device memory; raw new_sd_ctx() is not
 // guarded by this wrapper.

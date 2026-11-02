@@ -1918,13 +1918,31 @@ int test_vram_load_guard() {
     sd_ctx_params_t params{};
     params.max_vram = "1";
     sd_dart_log_set_level(SD_LOG_ERROR + 1);
-    const auto before = loads_begun.load();
+    auto before = loads_begun.load();
     CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
     CHECK(loads_begun.load() == before);
     CHECK(sd_dart_exit_tracked_count() == 0);
     CHECK(last_error().find("auto_fit=true") != std::string::npos);
 
     params.auto_fit = true;
+    // Upstream disables planning for any nonempty params_backend, even when
+    // auto_fit is true and the runtime backend is explicitly selected.
+    params.backend = "gpu";
+    for (const char* placement : {"gpu", "cpu", "diffusion=gpu"}) {
+        params.params_backend = placement;
+        CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
+        CHECK(loads_begun.load() == before);
+        CHECK(sd_dart_exit_tracked_count() == 0);
+        CHECK(last_error().find("empty params_backend") != std::string::npos);
+    }
+    params.params_backend = "";
+    sd_ctx_t* explicit_context = sd_dart_new_sd_ctx(&params);
+    CHECK(explicit_context != nullptr);
+    CHECK(last_error().empty());
+    sd_dart_exit_free(explicit_context);
+    before = loads_begun.load();
+    params.backend = nullptr;
+    params.params_backend = nullptr;
     test_device_type = GGML_BACKEND_DEVICE_TYPE_IGPU;
     CHECK(sd_dart_new_sd_ctx(&params) == nullptr);
     CHECK(loads_begun.load() == before);
@@ -1956,6 +1974,7 @@ int test_vram_load_guard() {
     CHECK(last_error().find("Cannot inspect") != std::string::npos);
     hold_query.store(nullptr);
     params.auto_fit = false;
+    params.params_backend = "gpu";
     for (const char* budget : {static_cast<const char*>(nullptr), ""}) {
         params.max_vram = budget;
         context = sd_dart_new_sd_ctx(&params);

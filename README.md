@@ -639,7 +639,8 @@ so a batched CFG step returns a wrong image without an error.
 Until [#34](https://github.com/leehack/stable-diffusion-native/issues/34) is
 repaired upstream, `sd_dart_new_sd_ctx` returns NULL and records an actionable
 `sd_dart_last_error()` when nonempty `max_vram` is combined with
-`auto_fit=false`. It also rejects an empty/default backend on an integrated-only
+`auto_fit=false` or a nonempty `params_backend` (which disables auto-fit even
+when `auto_fit=true`). It also rejects an empty/default backend on an integrated-only
 GPU with a budget: select an explicit backend so auto-fit includes that device.
 These checks run before upstream context creation. The raw `new_sd_ctx` export
 remains unguarded, and consumers must retain their existing restrictions until

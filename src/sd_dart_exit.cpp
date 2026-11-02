@@ -422,8 +422,10 @@ sd_ctx_t* sd_dart_new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     // GPU, so that route needs an explicit backend before it is safe too.
     if (sd_ctx_params != nullptr && sd_ctx_params->max_vram != nullptr &&
         sd_ctx_params->max_vram[0] != '\0') {
-        if (!sd_ctx_params->auto_fit) {
-            sd_dart_log_load_rejected("max_vram requires auto_fit=true; the pinned runtime may abort without auto-fit.");
+        const bool explicit_params_backend = sd_ctx_params->params_backend != nullptr &&
+                                             sd_ctx_params->params_backend[0] != '\0';
+        if (!sd_ctx_params->auto_fit || explicit_params_backend) {
+            sd_dart_log_load_rejected("max_vram requires auto_fit=true and an empty params_backend; the pinned runtime disables auto-fit with an explicit params_backend and may abort without planning.");
             return nullptr;
         }
         if (sd_ctx_params->backend == nullptr || sd_ctx_params->backend[0] == '\0') {
