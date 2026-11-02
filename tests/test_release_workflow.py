@@ -23,6 +23,18 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("      contents: write\n", job_header)
         self.assertEqual(workflow.count("action-gh-release@"), 1)
 
+    def test_linux_runtime_builds_keep_the_qualified_ubuntu_baseline(self):
+        # The floating label moved to Ubuntu 26.04 and a different software
+        # Vulkan matrix path; qualification and release must use one baseline.
+        for name in ("validate.yml", "native_release.yml"):
+            workflow = (ROOT / ".github/workflows" / name).read_text()
+            for target in ("linux-x64", "linux-x64-vulkan"):
+                with self.subTest(workflow=name, target=target):
+                    self.assertRegex(
+                        workflow,
+                        rf"target: {target}, runs_on: ubuntu-24\.04,",
+                    )
+
     def test_normal_release_mode_remains_explicit_and_enabled(self):
         workflow = (ROOT / ".github/workflows/native_release.yml").read_text()
         self.assertIn(
