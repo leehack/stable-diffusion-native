@@ -87,6 +87,7 @@ function(sd_native_carry_patch patch)
 endfunction()
 
 sd_native_carry_patch(pickle_line_span.patch src/model_io/pickle_io.cpp)
+sd_native_carry_patch(torch_zip_entry_lookup.patch src/model_io/torch_zip_io.cpp)
 sd_native_carry_patch(fp8_metal_f16_load.patch src/model_manager.cpp src/core/backend_fit.cpp)
 sd_native_carry_patch(lora_immediate_fallback.patch src/pipeline/diffusion_engine.cpp)
 sd_native_carry_patch(intrinsic_tiny_decoder_policy.patch src/stable-diffusion.cpp src/pipeline/diffusion_engine.cpp)

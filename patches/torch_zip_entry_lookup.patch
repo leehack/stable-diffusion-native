@@ -1,0 +1,120 @@
+--- a/src/model_io/torch_zip_io.cpp
++++ b/src/model_io/torch_zip_io.cpp
+@@ -1,5 +1,6 @@
+ #include "torch_zip_io.h"
+ 
++#include <climits>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <string>
+@@ -25,18 +26,41 @@
+     return true;
+ }
+ 
+-static bool find_zip_entry(zip_t* zip, const std::string& entry_name, int* index, uint64_t* size) {
+-    size_t n = zip_entries_total(zip);
+-    for (size_t i = 0; i < n; ++i) {
+-        zip_entry_openbyindex(zip, i);
+-        std::string name = zip_entry_name(zip);
++struct ZipEntryLookup {
++    struct Entry { int index; uint64_t size; };
++    // Keep the first normalized name, as a fresh archive-order scan would.
++    std::unordered_map<std::string, Entry> entries;
++    size_t scanned = 0;
++};
++
++static bool find_zip_entry(zip_t* zip, ZipEntryLookup& lookup, const std::string& entry_name, int* index, uint64_t* size) {
++    auto found = lookup.entries.find(entry_name);
++    if (found != lookup.entries.end()) {
++        *index = found->second.index;
++        *size = found->second.size;
++        return true;
++    }
++    const size_t n = static_cast<size_t>(zip_entries_total(zip));
++    while (lookup.scanned < n) {
++        size_t i = lookup.scanned++;
++        if (zip_entry_openbyindex(zip, i) != 0) {
++            zip_entry_close(zip);
++            return false;
++        }
++        const char* raw_name = zip_entry_name(zip);
++        if (raw_name == nullptr) {
++            zip_entry_close(zip);
++            return false;
++        }
++        std::string name = raw_name;
++        uint64_t entry_size = zip_entry_size(zip);
++        lookup.entries.emplace(name, ZipEntryLookup::Entry{(int)i, entry_size});
++        zip_entry_close(zip);
+         if (name == entry_name) {
+             *index = (int)i;
+-            *size  = zip_entry_size(zip);
+-            zip_entry_close(zip);
++            *size = entry_size;
+             return true;
+         }
+-        zip_entry_close(zip);
+     }
+     return false;
+ }
+@@ -44,6 +68,7 @@
+ static bool parse_zip_data_pkl(const uint8_t* buffer,
+                                size_t buffer_size,
+                                zip_t* zip,
++                               ZipEntryLookup& lookup,
+                                const std::string& dir,
+                                std::vector<TensorStorage>& tensor_storages,
+                                std::string* error) {
+@@ -65,7 +90,7 @@
+         const std::string entry_name = dir + "data/" + tensor_storage.storage_key;
+         int zip_index                = -1;
+         uint64_t entry_size          = 0;
+-        if (!find_zip_entry(zip, entry_name, &zip_index, &entry_size)) {
++        if (!find_zip_entry(zip, lookup, entry_name, &zip_index, &entry_size)) {
+             set_error(error, "storage entry '" + entry_name + "' was not found");
+             return false;
+         }
+@@ -102,12 +127,31 @@
+     }
+ 
+     tensor_storages.clear();
++    ZipEntryLookup lookup;
+     bool success        = true;
+     bool found_data_pkl = false;
+-    int n               = (int)zip_entries_total(zip);
++    const ssize_t entry_count = zip_entries_total(zip);
++    if (entry_count < 0 || static_cast<uint64_t>(entry_count) > INT_MAX) {
++        set_error(error, "torch zip entry count exceeds supported index range");
++        zip_close(zip);
++        return false;
++    }
++    int n = static_cast<int>(entry_count);
+     for (int i = 0; i < n; ++i) {
+-        zip_entry_openbyindex(zip, i);
+-        std::string name = zip_entry_name(zip);
++        if (zip_entry_openbyindex(zip, i) != 0) {
++            set_error(error, "failed to open torch zip entry " + std::to_string(i));
++            zip_entry_close(zip);
++            success = false;
++            break;
++        }
++        const char* raw_name = zip_entry_name(zip);
++        if (raw_name == nullptr) {
++            set_error(error, "torch zip entry has no name");
++            zip_entry_close(zip);
++            success = false;
++            break;
++        }
++        std::string name = raw_name;
+         size_t pos       = name.find("data.pkl");
+         if (pos != std::string::npos) {
+             found_data_pkl  = true;
+@@ -119,7 +163,7 @@
+             if (pkl_data == nullptr || pkl_size == 0) {
+                 set_error(error, "failed to read '" + name + "' from '" + file_path + "'");
+                 success = false;
+-            } else if (!parse_zip_data_pkl((const uint8_t*)pkl_data, pkl_size, zip, dir, tensor_storages, error)) {
++            } else if (!parse_zip_data_pkl((const uint8_t*)pkl_data, pkl_size, zip, lookup, dir, tensor_storages, error)) {
+                 success = false;
+             }
+ 
