@@ -6,12 +6,14 @@ Fixtures are tiny tensor-only pickle byte streams, never Python-unpickled.
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 import zipfile
 
@@ -23,6 +25,15 @@ NATIVE = REPO / "tests/native/torch_zip_lookup_test.cpp"
 CXX = os.environ.get("CXX") or shutil.which("c++")
 CC = os.environ.get("CC") or shutil.which("cc")
 GIT = shutil.which("git")
+
+
+def compile_source(command):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise AssertionError(
+            f"Compiler exited {result.returncode}: {shlex.join(command)}\n"
+            f"stdout (last 8192 characters):\n{result.stdout[-8192:]}\n"
+            f"stderr (last 8192 characters):\n{result.stderr[-8192:]}")
 
 
 def string(value):
@@ -78,17 +89,17 @@ class TorchZipLookupTest(unittest.TestCase):
         copied.parent.mkdir(parents=True)
         copied.write_bytes(reader.read_bytes())
         obj = directory / "zip.o"
-        subprocess.run([CC, "-std=c11", "-O1", "-D_FILE_OFFSET_BITS=64", *flags,
-                        "-c", str(UPSTREAM / "thirdparty/zip.c"), "-o", str(obj)],
-                       check=True, capture_output=True, timeout=120)
+        # Match the library's CMake GNU C11 mode: zip.c uses POSIX/default-source
+        # declarations that glibc hides when strict C11 defines __STRICT_ANSI__.
+        compile_source([CC, "-std=gnu11", "-O1", "-D_FILE_OFFSET_BITS=64", *flags,
+                        "-c", str(UPSTREAM / "thirdparty/zip.c"), "-o", str(obj)])
         binary = directory / "probe"
         includes = [REPO / "tests/native/torch_zip_metadata_shim", directory / "src",
                     UPSTREAM / "src", UPSTREAM / "src/model_io", UPSTREAM / "thirdparty",
                     UPSTREAM / "ggml/include"]
-        subprocess.run([CXX, "-std=c++17", "-O1", "-g", *flags,
+        compile_source([CXX, "-std=c++17", "-O1", "-g", *flags,
                         *("-I" + str(path) for path in includes), str(NATIVE),
-                        str(UPSTREAM / "src/model_io/pickle_io.cpp"), str(obj), "-o", str(binary)],
-                       check=True, capture_output=True, timeout=120)
+                        str(UPSTREAM / "src/model_io/pickle_io.cpp"), str(obj), "-o", str(binary)])
         return binary
 
     def archive(self, name, entries):
@@ -255,6 +266,21 @@ class TorchZipLookupTest(unittest.TestCase):
                 observed = json.loads(result.stdout)
                 fields = ("ok", "error", "inventory", "live_pickle_buffers")
                 self.assertNotEqual({k: baseline[k] for k in fields}, {k: observed[k] for k in fields})
+
+
+class CompilerDiagnosticsTest(unittest.TestCase):
+    def test_failed_compile_exposes_bounded_stdout_and_stderr(self):
+        failed = subprocess.CompletedProcess(["cc", "source.c"], 1,
+                                             "x" * 20000 + "stdout-marker",
+                                             "y" * 20000 + "stderr-marker")
+        with mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaises(AssertionError) as caught:
+                compile_source(["cc", "source.c"])
+        message = str(caught.exception)
+        self.assertIn("Compiler exited 1: cc source.c", message)
+        self.assertIn("stdout-marker", message)
+        self.assertIn("stderr-marker", message)
+        self.assertLess(len(message), 17000)
 
 
 if __name__ == "__main__":
