@@ -48,6 +48,10 @@ def _reset(info: tarfile.TarInfo) -> tarfile.TarInfo:
 
 
 def write_archive(dest: Path, entries: dict[str, Path]) -> None:
+    from runtime_archive import validate_names
+    validate_names(entries)
+    if any(not path.is_file() or path.is_symlink() for path in entries.values()):
+        raise ValueError('archive source contains a linked or nonregular file')
     with tarfile.open(dest, "w:gz") as archive:
         for name in sorted(entries):
             archive.add(entries[name], arcname=name, filter=_reset)
@@ -73,6 +77,10 @@ def main() -> None:
         root = BIN_ROOT / name
         if not root.is_dir():
             continue
+        info = json.loads((root / "build-info.json").read_text())
+        if 'vulkan' in target.accelerators:
+            from vulkan_tri import validate_artifact
+            validate_artifact(root / 'lib' / target.library, info.get('vulkanTriF16'))
         runtime = args.dist / f"{PACKAGE}-runtime-{name}-{args.tag}.tar.gz"
         entries = {
             f"lib/{p.name}": p for p in sorted((root / "lib").iterdir())
@@ -86,7 +94,6 @@ def main() -> None:
         symbols = args.dist / f"{PACKAGE}-symbols-{name}-{args.tag}.tar.gz"
         write_archive(symbols, {f"symbols/{target.library}": root / "symbols" / target.library})
 
-        info = json.loads((root / "build-info.json").read_text())
         for kind, path in (("runtime", runtime), ("symbols", symbols)):
             artifacts.append({
                 "target": name,

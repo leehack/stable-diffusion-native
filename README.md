@@ -49,6 +49,12 @@ Vulkan variants link the Vulkan loader (`libvulkan.so.1`, `vulkan-1.dll`) and
 fail to load without it; consumers fall back to the CPU variant. CI checks them
 on Mesa lavapipe only, so GPU performance still needs hardware runs.
 
+Affected GLSL compilers can compile `tri_f16`'s integer zero constructor to
+NaN. Vulkan builds, packaging and prepared-artifact replay fail unless the
+actual embedded triangle module has a recognized layout and its rejected
+branch stores positive zero. This validates the exact artifact; the upstream
+source and compiler remain unchanged. See [the shader guard](docs/vulkan_tri_guard.md).
+
 Android GPU backends are not shipped. On tested devices, Vulkan crashed in
 the Adreno 750 driver's shader compiler and on a null `vkGetBufferDeviceAddress`
 on Mali-G68, and OpenCL on Adreno 750 was slower than the CPU.

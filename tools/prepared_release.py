@@ -144,11 +144,27 @@ def verify_dist(dist: Path, tag: str, source: str, digest: str, upstream: str) -
         sums[path.name] = artifact["sha256"]
         if key[1] == "runtime":
             with tarfile.open(path, "r:gz") as archive:
-                entries = [e for e in archive.getmembers() if e.name == "build-info.json"]
+                from runtime_archive import runtime_members
+                members = runtime_members(archive)
+                entries = [e for name, e in members.items() if name == "build-info.json"]
                 require(len(entries) == 1 and entries[0].isfile(), "missing build information")
                 info = json.load(archive.extractfile(entries[0]))
                 require(info["target"] == key[0] and info["upstream"] == manifest["upstream"],
                         "archive build source mismatch")
+                target = TARGETS[key[0]]
+                if 'vulkan' in target.accelerators:
+                    from vulkan_tri import validate_artifact_bytes
+                    libraries = [e for name, e in members.items()
+                                 if name == f'lib/{target.library}']
+                    require(len(libraries) == 1 and libraries[0].isfile(),
+                            'missing or ambiguous Vulkan runtime library')
+                    # Legacy build-info lacks the auxiliary captured-module
+                    # field. Its actual bytes pass the identical layout/flow
+                    # proof; a present but malformed field is never legacy.
+                    allow_legacy = 'vulkanTriF16' not in info
+                    validate_artifact_bytes(archive.extractfile(libraries[0]).read(),
+                                            info.get('vulkanTriF16'),
+                                            allow_legacy=allow_legacy)
     require(seen == set(expected), "manifest is missing release targets")
     require({p.name for p in files} == set(sums) | {"manifest.json", "SHA256SUMS"},
             "distribution has extra or missing files")

@@ -69,6 +69,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
                         rf"target: {target}, runs_on: ubuntu-24\.04,",
                     )
 
+    def test_release_byte_guard_sources_have_owner_coverage(self):
+        owners = (ROOT / '.github/CODEOWNERS').read_text().splitlines()
+        for path in ('tools/build.py', 'tools/validate_artifacts.py',
+                     'tools/package_release.py', 'tools/prepared_release.py',
+                     'tools/vulkan_tri.py', 'tools/runtime_archive.py'):
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).is_file())
+                self.assertIn('/' + path + ' @leehack', owners)
+
     def test_publication_requires_explicit_opt_in(self):
         workflow = (ROOT / ".github/workflows/native_release.yml").read_text()
         self.assertIn(
