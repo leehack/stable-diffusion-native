@@ -658,7 +658,37 @@ XCFramework without creating a tag or GitHub release. The workflow uploads
 `stable-diffusion-native-<tag>` as a run artifact retained for 14 days. Build
 and packaging jobs have read-only repository permissions; only the separate
 publication job has write permission, and it is skipped in preparation mode.
-Normal release runs keep `publish=true` by default.
+Preparation is the default (`publish=false`). To publish a previously qualified
+artifact, dispatch the same workflow **on `main`**, setting `prepared_run_id`,
+`expected_source_sha` (the full owner commit), `manifest_sha256` (the SHA256 of
+its exact `manifest.json`), the same `tag`, and explicitly `publish=true`.
+Replay skips every build and packaging job. It requires a successful
+`workflow_dispatch` of this repository's release workflow on `main`, verifies
+its source against current main history and the upstream gitlink, and checks
+the unexpired named artifact, complete target inventory and every archive's
+size/checksum. The publisher verifies the bytes again after the job transfer.
+The prepared run's source, rather than the later publisher commit, becomes
+the release tag. Future manifests also record that owner source in `source`;
+older manifests bind it through the trusted run and upstream gitlink.
+
+A replay with `publish=false` performs the same read-only verification. For
+example, after qualification (replace the digest with its recorded value):
+
+```bash
+gh workflow run native_release.yml -R leehack/stable-diffusion-native --ref main \
+  -f tag=v0.3.0-2 -f prepared_run_id=41540643141 \
+  -f expected_source_sha=1c1f03bbb4578c3fbf80a96ad90718ba78a09407 \
+  -f manifest_sha256="$QUALIFIED_MANIFEST_SHA256" -f publish=false -f prerelease=true
+```
+
+The artifact retention window is 14 days; an expired or missing artifact fails
+closed and needs a new preparation and qualification. Existing tags or releases
+also fail closed. Same-tag runs are serialized, and publication atomically
+creates a new tag before creating the release and uploading assets, with no
+overwrite option. A failure after tag creation may leave a partial tag/release;
+inspect it before an explicit recovery. A rerun never silently replaces it.
+An explicit `publish=true` without a prepared run retains the original
+build-and-publish mode.
 
 Archive names:
 
