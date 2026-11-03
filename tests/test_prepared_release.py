@@ -3,6 +3,7 @@
 import argparse
 import copy
 import io
+import hashlib
 import json
 import os
 import stat
@@ -37,7 +38,17 @@ class DistributionTest(unittest.TestCase):
                 name = f"{release.PACKAGE}-{kind}-{target}-{TAG}.tar.gz"
                 path = self.dist / name
                 with tarfile.open(path, "w:gz") as archive:
-                    info = json.dumps({"target": target, "upstream": self.manifest["upstream"]}).encode()
+                    build_info = {"target": target, "upstream": self.manifest["upstream"]}
+                    if kind == 'runtime' and 'vulkan' in release.TARGETS[target].accelerators:
+                        module = Path(__file__).parent / 'fixtures/vulkan/tri_f16.spv'
+                        payload = module.read_bytes()
+                        build_info['vulkanTriF16'] = {'schemaVersion': 1,
+                            'sha256': hashlib.sha256(payload).hexdigest(),
+                            'spirv_hex': payload.hex()}
+                        library = tarfile.TarInfo('lib/' + release.TARGETS[target].library)
+                        library.size = len(payload)
+                        archive.addfile(library, io.BytesIO(payload))
+                    info = json.dumps(build_info).encode()
                     entry = tarfile.TarInfo("build-info.json")
                     entry.size = len(info)
                     archive.addfile(entry, io.BytesIO(info))

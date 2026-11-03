@@ -161,6 +161,13 @@ def validate(target: Target) -> list[str]:
     if info.get("target") != target.name:
         problems.append(f"build-info target is {info.get('target')!r}")
 
+    if 'vulkan' in target.accelerators:
+        from vulkan_tri import validate_artifact
+        try:
+            validate_artifact(library, info.get('vulkanTriF16'))
+        except ValueError as error:
+            problems.append(str(error))
+
     expected = set(api_symbols(*HEADERS))
     exported = exported_symbols(target, library)
     missing = sorted(expected - exported)

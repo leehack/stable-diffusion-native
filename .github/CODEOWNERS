@@ -1,0 +1,10 @@
+/.github/CODEOWNERS @leehack
+/tools/build.py @leehack
+/tools/validate_artifacts.py @leehack
+/tools/package_release.py @leehack
+/tools/prepared_release.py @leehack
+/tools/vulkan_tri.py @leehack
+/tools/runtime_archive.py @leehack
+/tests/test_vulkan_tri*.py @leehack
+/tests/fixtures/vulkan/ @leehack
+/docs/vulkan_tri_guard.md @leehack

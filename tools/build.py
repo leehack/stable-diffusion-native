@@ -261,6 +261,12 @@ def build(target: Target, jobs: int) -> Path:
     for header in HEADERS:
         shutil.copy2(header, out_dir / "include" / header.name)
 
+    vulkan_tri = None
+    if 'vulkan' in target.accelerators:
+        from vulkan_tri import build_record, validate_artifact
+        vulkan_tri = build_record(work_dir)
+        validate_artifact(out_dir / 'lib' / target.library, vulkan_tri)
+
     info = {
         "target": target.name,
         "os": target.os,
@@ -270,6 +276,8 @@ def build(target: Target, jobs: int) -> Path:
         "cmakeArgs": [a for a in cmake_args if not a.startswith("-DCMAKE_SHARED_LINKER_FLAGS")],
         "exportedSymbols": api_symbols(*HEADERS),
     }
+    if vulkan_tri is not None:
+        info['vulkanTriF16'] = vulkan_tri
     (out_dir / "build-info.json").write_text(json.dumps(info, indent=2) + "\n")
     print(f"built {target.name}: {out_dir / 'lib' / target.library}")
     return out_dir
