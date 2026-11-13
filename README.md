@@ -181,6 +181,8 @@ context. Do not replace upstream's log callback after enabling the recorder.
 Because upstream diagnostics have no context identity, overlapping generations
 conservatively fail together when a Metal failure is reported. This reports
 failed GPU work; it does not prevent an operating-system GPU watchdog reset.
+On iPhone Metal builds the graph split (see "Graph splitting") shortens the
+command buffers that trigger one.
 
 ggml-metal aborts in its static destructor
 (`GGML_ASSERT([rsets->data count] == 0)`) when a process exits while a Metal
@@ -435,6 +437,45 @@ device registry, and `tools/smoke_test.py` compares them with `sd_list_devices`
 on each built runtime: CI does that on Mesa lavapipe for Vulkan, on the macOS
 runners' virtual GPU for Metal, and on the CPU targets for
 `SD_DART_GPU_NO_BACKEND`. No hardware Vulkan device was tried.
+
+### Graph splitting
+
+```c
+void sd_dart_graph_split_set_threshold(uint64_t elements);
+uint64_t sd_dart_graph_split_threshold(void);
+uint64_t sd_dart_graph_split_cuts(void);
+```
+
+A GPU that runs one command buffer longer than its watchdog allows resets, and
+the generation fails: the iPhone 16 Pro's A18 Pro does this in the full-VAE
+decode of SD-Turbo
+([llamadart #1047](https://github.com/leehack/llamadart/issues/1047),
+[#42](https://github.com/leehack/stable-diffusion-native/issues/42)). The
+library installs upstream's `sd_set_backend_eval_callback` so that the backend
+call ends after every graph node whose element count, with its inputs', is at
+least the threshold. Each heavy node then runs in a command buffer of its own.
+
+| Function | Behavior |
+| --- | --- |
+| `sd_dart_graph_split_set_threshold` | Sets the threshold in elements; 0 disables splitting. Callable from any thread. |
+| `sd_dart_graph_split_threshold` | The threshold in effect. |
+| `sd_dart_graph_split_cuts` | Cuts made since the process started, so a caller can tell that splitting happened. |
+
+- **Default.** 2^26 elements in a Metal build for iOS, 0 elsewhere, where
+  nothing is installed.
+- **Installation.** `sd_dart_new_sd_ctx` and `sd_dart_generate_image` install
+  the callback once when the threshold is nonzero; it stays installed, and a
+  later threshold of 0 cuts nothing.
+- **Conflicts.** Upstream has one such callback, so installing it replaces
+  another, such as importance-matrix collection, and upstream ignores it with
+  several devices.
+- **Results.** The CPU image is identical. On Metal, ending a buffer can change
+  float rounding by a few 8-bit levels.
+
+`tests/test_graph_split_runtime.py` generates with the tiny test model at
+several thresholds on the CPU and on each GPU. Whether the split clears the
+watchdog on an iPhone is decided by device runs in llamadart, not by this
+repository's tests.
 
 ### Log forwarding
 
@@ -728,3 +769,6 @@ SD_FULL_VAE_MODEL=<sd-turbo.gguf> python3 -m unittest discover -s tests
 -p test_decoder_policy_runtime.py`. It runs unchanged and refreshed SDXS,
 refuses the SDXS-to-SD-Turbo replacement, and keeps an unrestricted reload
 control on CPU and the available Metal backend.
+
+The full-VAE iPhone decode is addressed by the graph split ("Graph
+splitting"), which the same issue qualifies on a physical iPhone.

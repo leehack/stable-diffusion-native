@@ -9,6 +9,9 @@ bool sd_dart_intrinsic_tiny_required(const void* engine);
 void sd_dart_set_intrinsic_tiny_required(const void* engine, bool required);
 sd_ctx_t* sd_dart_new_sd_ctx_intrinsic_tiny_impl(const sd_ctx_params_t* params);
 
+// Registers the graph splitter with upstream when its threshold is nonzero.
+void sd_dart_graph_split_install();
+
 // What the wrapper's sources share with each other. Not shipped and not
 // exported.
 
