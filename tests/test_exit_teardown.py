@@ -1,9 +1,9 @@
 """Builds and runs `tests/native/exit_teardown_test.cpp`.
 
-The test links `src/sd_dart_exit.cpp`, `src/sd_dart_log.cpp` and
-`src/sd_dart_device.cpp` against stand-ins for the upstream functions they
-wrap and for ggml's device registry, so it needs the submodules' headers but
-no built runtime. On Linux it also runs the scenarios of an exit that frees
+The test links `src/sd_dart_exit.cpp`, `src/sd_dart_graph_split.cpp`,
+`src/sd_dart_log.cpp` and `src/sd_dart_device.cpp` against stand-ins for the
+upstream functions they wrap and for ggml's device registry, so it needs the
+submodules' headers but no built runtime. On Linux it also runs the scenarios of an exit that frees
 nothing and destroys no static.
 Each scenario runs in its own process, as teardown runs once per process.
 """
@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [
     REPO_ROOT / "src" / "sd_dart_device.cpp",
     REPO_ROOT / "src" / "sd_dart_exit.cpp",
+    REPO_ROOT / "src" / "sd_dart_graph_split.cpp",
     REPO_ROOT / "src" / "sd_dart_log.cpp",
     REPO_ROOT / "tests" / "native" / "exit_teardown_test.cpp",
 ]
