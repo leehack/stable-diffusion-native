@@ -20,17 +20,31 @@ add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 # Fixes the pinned upstream lacks (patches/README.md). Each patch is applied to
 # build-tree copies of the upstream sources it changes, and the library
 # compiles the copies, so the submodule stays pristine. Configuring fails when
-# a patch no longer applies or changes nothing.
+# a patch no longer applies or changes nothing. A patch's sources belong to
+# one target: stable-diffusion unless TARGET names another, such as ggml-base.
 find_package(Git REQUIRED)
 function(sd_native_carry_patch patch)
+    cmake_parse_arguments(PARSE_ARGV 1 carry "" "TARGET" "")
+    if(NOT carry_TARGET)
+        set(carry_TARGET stable-diffusion)
+    endif()
+    set(carry_paths ${carry_UNPARSED_ARGUMENTS})
     get_filename_component(name "${patch}" NAME_WE)
     set(patched_root "${CMAKE_BINARY_DIR}/patched")
     set(patched_dir "${patched_root}/${name}")
     file(REMOVE_RECURSE "${patched_dir}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/${patch}")
-    get_target_property(sources stable-diffusion SOURCES)
-    foreach(path IN LISTS ARGN)
+    get_target_property(target_dir ${carry_TARGET} SOURCE_DIR)
+    get_target_property(target_sources ${carry_TARGET} SOURCES)
+    set(sources)
+    foreach(source IN LISTS target_sources)
+        if(NOT source MATCHES "^\\$<")
+            get_filename_component(source "${source}" ABSOLUTE BASE_DIR "${target_dir}")
+        endif()
+        list(APPEND sources "${source}")
+    endforeach()
+    foreach(path IN LISTS carry_paths)
         set(upstream_file "${SD_NATIVE_UPSTREAM_DIR}/${path}")
         string(MD5 source_key "${upstream_file}")
         get_property(current_source GLOBAL PROPERTY "SD_NATIVE_PATCHED_${source_key}")
@@ -38,7 +52,7 @@ function(sd_native_carry_patch patch)
             set(current_source "${upstream_file}")
         endif()
         if(NOT "${current_source}" IN_LIST sources)
-            message(FATAL_ERROR "patches/${patch}: ${path} is not a stable-diffusion source")
+            message(FATAL_ERROR "patches/${patch}: ${path} is not a ${carry_TARGET} source")
         endif()
         file(READ "${current_source}" text)
         # A Windows checkout can convert upstream's line endings; patches use LF.
@@ -60,7 +74,7 @@ function(sd_native_carry_patch patch)
         message(FATAL_ERROR "patches/${patch} does not apply to the pinned upstream:\n${output}")
     endif()
 
-    foreach(path IN LISTS ARGN)
+    foreach(path IN LISTS carry_paths)
         set(upstream_file "${SD_NATIVE_UPSTREAM_DIR}/${path}")
         string(MD5 source_key "${upstream_file}")
         get_property(current_source GLOBAL PROPERTY "SD_NATIVE_PATCHED_${source_key}")
@@ -79,10 +93,10 @@ function(sd_native_carry_patch patch)
         set_property(GLOBAL PROPERTY "SD_NATIVE_PATCHED_${source_key}" "${patched_file}")
         # Quoted includes in the copy must still find the upstream files next to it.
         get_filename_component(upstream_file_dir "${upstream_file}" DIRECTORY)
-        set_source_files_properties("${patched_file}" TARGET_DIRECTORY stable-diffusion
+        set_source_files_properties("${patched_file}" TARGET_DIRECTORY ${carry_TARGET}
             PROPERTIES INCLUDE_DIRECTORIES "${upstream_file_dir}")
     endforeach()
-    set_property(TARGET stable-diffusion PROPERTY SOURCES ${sources})
+    set_property(TARGET ${carry_TARGET} PROPERTY SOURCES ${sources})
     message(STATUS "Carrying patches/${patch}")
 endfunction()
 
@@ -91,6 +105,10 @@ sd_native_carry_patch(torch_zip_entry_lookup.patch src/model_io/torch_zip_io.cpp
 sd_native_carry_patch(fp8_metal_f16_load.patch src/model_manager.cpp src/core/backend_fit.cpp)
 sd_native_carry_patch(lora_immediate_fallback.patch src/pipeline/diffusion_engine.cpp)
 sd_native_carry_patch(intrinsic_tiny_decoder_policy.patch src/stable-diffusion.cpp src/pipeline/diffusion_engine.cpp)
+sd_native_carry_patch(ggml_apple_vm_allocate.patch TARGET ggml-base ggml/src/ggml.c)
+if(TARGET ggml-metal)
+    sd_native_carry_patch(ggml_metal_apple_vm_allocate.patch TARGET ggml-metal ggml/src/ggml-metal/ggml-metal-device.m)
+endif()
 
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.

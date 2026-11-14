@@ -43,6 +43,12 @@ APPLE_STATIC_DESTRUCTOR_IMPORT = "___cxa_atexit"
 # are still inside it (leehack/llamadart#949). Android libraries are left as
 # they were and import it.
 ELF_STATIC_DESTRUCTOR_IMPORT = "__cxa_atexit"
+# ggml's host buffers on iOS come from `posix_memalign`, and libmalloc keeps
+# their freed pages in the app's memory footprint for as long as it likes, so a
+# model that is unloaded still counts toward the jetsam limit
+# (leehack/llamadart#2004). `patches/ggml_apple_vm_allocate.patch` makes every
+# Apple build use `vm_allocate`, as macOS already did.
+IOS_HOST_BUFFER_IMPORT = "_posix_memalign"
 # `std::ios_base::Init::Init()`. Before GCC 13 every source that includes
 # <iostream> holds an object of that class, whose destructor flushes the
 # standard streams when the last one goes. A Linux library drops that
@@ -182,6 +188,11 @@ def validate(target: Target) -> list[str]:
     if target.os in ("macos", "ios") and imports_symbol(library, APPLE_STATIC_DESTRUCTOR_IMPORT):
         problems.append(
             f"imports {APPLE_STATIC_DESTRUCTOR_IMPORT}: static destructors bypass exit teardown"
+        )
+
+    if target.os == "ios" and imports_symbol(library, IOS_HOST_BUFFER_IMPORT):
+        problems.append(
+            f"imports {IOS_HOST_BUFFER_IMPORT}: host buffers outlive their free in the app footprint"
         )
 
     if target.os == "linux":
