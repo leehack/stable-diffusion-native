@@ -15,6 +15,7 @@ from validate_artifacts import (  # noqa: E402
     APPLE_STATIC_DESTRUCTOR_IMPORT,
     ELF_STATIC_DESTRUCTOR_IMPORT,
     ELF_STREAM_INIT_IMPORT,
+    IOS_HOST_BUFFER_IMPORT,
     elf_imports_symbol,
     elf_undefined_symbols,
     imports_symbol,
@@ -100,6 +101,21 @@ extern "C" __attribute__((visibility("hidden"))) int __cxa_atexit(void (*)(void*
 }
 """
 
+HOST_BUFFER_WITH_POSIX_MEMALIGN = """
+#include <stdlib.h>
+void *host_buffer(unsigned long n) {
+    void *p = 0;
+    return posix_memalign(&p, 16384, n) == 0 ? p : 0;
+}
+"""
+HOST_BUFFER_WITH_VM_ALLOCATE = """
+#include <mach/mach.h>
+void *host_buffer(unsigned long n) {
+    vm_address_t p = 0;
+    return vm_allocate(mach_task_self(), &p, n, VM_FLAGS_ANYWHERE) == KERN_SUCCESS ? (void *) p : 0;
+}
+"""
+
 
 @unittest.skipUnless(sys.platform == "darwin", "reads Mach-O imports with nm")
 class StaticDestructorImportTest(unittest.TestCase):
@@ -124,6 +140,13 @@ class StaticDestructorImportTest(unittest.TestCase):
             system = self.build(tmp, "system", STATIC_WITH_DESTRUCTOR, "arm64", "x86_64")
             for arch in ("arm64", "x86_64"):
                 self.assertTrue(imports_symbol(system, APPLE_STATIC_DESTRUCTOR_IMPORT, arch))
+
+    def test_tells_posix_memalign_host_buffers_from_vm_allocate_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.build(tmp, "old", HOST_BUFFER_WITH_POSIX_MEMALIGN)
+            new = self.build(tmp, "new", HOST_BUFFER_WITH_VM_ALLOCATE)
+            self.assertTrue(imports_symbol(old, IOS_HOST_BUFFER_IMPORT))
+            self.assertFalse(imports_symbol(new, IOS_HOST_BUFFER_IMPORT))
 
 
 # `readelf --dyn-syms -W` of GNU binutils and of LLVM: the first appends the
