@@ -657,7 +657,7 @@ the macOS probe and builds the iOS device and simulator slices.
 Upstream 1017 has its
 [ABI audit, wrapper review, FP8 evidence and outstanding gates](docs/upstream_1017_qualification.md);
 the carry inventory is in the [upstream 982 record](docs/upstream_982_qualification.md).
-It carries five fixes the pin lacks: unbatched CFG in Metal builds (below),
+It carries six fixes the pin lacks: unbatched CFG in Metal builds (below),
 the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
 2 GiB, the [`fp8_metal_f16_load.patch`](patches/README.md), which loads FP8
 weights as F16 on Metal instead of aborting, so they take twice their file size
@@ -667,7 +667,9 @@ cannot merge it: into FP8 weights, and on Metal, which cannot add into the F16
 convolution weights every model has, and the
 [`ggml_apple_vm_allocate.patch`](patches/README.md), which backports
 [llama.cpp#31437](https://github.com/ggml-org/llama.cpp/pull/31437) so iOS
-host buffers go back to the system when freed.
+host buffers go back to the system when freed, and the
+[`loader_scratch_vm_allocate.patch`](patches/README.md), which does the same for
+the loader's tensor scratch buffers.
 Upstream's `generate_image` now returns an owned result with per-image
 generation metadata; `sd_dart_generate_image` keeps returning an image array
 that `free_sd_images` frees and drops that metadata. Since upstream 982 a null

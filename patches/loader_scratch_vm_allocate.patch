@@ -1,0 +1,92 @@
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -8,6 +8,7 @@
+ #include <fstream>
+ #include <functional>
+ #include <mutex>
++#include <new>
+ #include <regex>
+ #include <set>
+ #include <stdexcept>
+@@ -33,6 +34,55 @@
+ #include "zip.h"
+ 
+ #include "name_conversion.h"
++
++#if defined(__APPLE__)
++#include <mach/mach.h>
++
++// Tensor-sized scratch memory. libmalloc can keep a freed large block in the
++// process footprint (leehack/llamadart#2004); vm_deallocate returns it at once.
++// Unlike a vector, growing keeps no contents.
++class TensorScratch {
++public:
++    TensorScratch()                                = default;
++    TensorScratch(const TensorScratch&)            = delete;
++    TensorScratch& operator=(const TensorScratch&) = delete;
++    ~TensorScratch() {
++        release();
++    }
++
++    void resize(size_t size) {
++        if (size <= capacity_) {
++            return;
++        }
++        const size_t capacity = std::max(size, 2 * capacity_);
++        release();
++        vm_address_t address = 0;
++        if (vm_allocate(mach_task_self(), &address, capacity, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
++            throw std::bad_alloc();
++        }
++        data_     = (uint8_t*)address;
++        capacity_ = capacity;
++    }
++
++    uint8_t* data() {
++        return data_;
++    }
++
++private:
++    void release() {
++        if (data_ != nullptr) {
++            vm_deallocate(mach_task_self(), (vm_address_t)data_, capacity_);
++        }
++        data_     = nullptr;
++        capacity_ = 0;
++    }
++
++    uint8_t* data_   = nullptr;
++    size_t capacity_ = 0;
++};
++#else
++using TensorScratch = std::vector<uint8_t>;
++#endif
+ 
+ /*================================================= Preprocess ==================================================*/
+ 
+@@ -148,9 +198,9 @@
+             throw std::runtime_error(sd_format("type %s unsupported for integer quantization: no dequantization available",
+                                                ggml_type_name(src_type)));
+         }
+-        std::vector<char> buf;
++        TensorScratch buf;
+         buf.resize(sizeof(float) * n);
+-        char* src_data_f32 = buf.data();
++        char* src_data_f32 = (char*)buf.data();
+         qtype->to_float(src, (float*)src_data_f32, n);
+         if (dst_type == GGML_TYPE_F16) {
+             ggml_fp32_to_fp16_row((float*)src_data_f32, (ggml_fp16_t*)dst, n);
+@@ -1168,9 +1218,9 @@
+                     }
+                 }
+ 
+-                std::vector<uint8_t> read_buffer;
+-                std::vector<uint8_t> convert_buffer;
+-                std::vector<uint8_t> zip_entry_buffer;
++                TensorScratch read_buffer;
++                TensorScratch convert_buffer;
++                TensorScratch zip_entry_buffer;
+ 
+                 while (true) {
+                     int64_t t0, t1;

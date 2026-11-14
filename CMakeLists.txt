@@ -105,6 +105,7 @@ sd_native_carry_patch(torch_zip_entry_lookup.patch src/model_io/torch_zip_io.cpp
 sd_native_carry_patch(fp8_metal_f16_load.patch src/model_manager.cpp src/core/backend_fit.cpp)
 sd_native_carry_patch(lora_immediate_fallback.patch src/pipeline/diffusion_engine.cpp)
 sd_native_carry_patch(intrinsic_tiny_decoder_policy.patch src/stable-diffusion.cpp src/pipeline/diffusion_engine.cpp)
+sd_native_carry_patch(loader_scratch_vm_allocate.patch src/model_loader.cpp)
 sd_native_carry_patch(ggml_apple_vm_allocate.patch TARGET ggml-base ggml/src/ggml.c)
 if(TARGET ggml-metal)
     sd_native_carry_patch(ggml_metal_apple_vm_allocate.patch TARGET ggml-metal ggml/src/ggml-metal/ggml-metal-device.m)

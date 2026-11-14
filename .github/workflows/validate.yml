@@ -144,6 +144,12 @@ jobs:
           SD_GRAPH_SPLIT_TARGET: ${{ matrix.target }}
           SD_REQUIRE_RUNTIME: "1"
           GGML_VK_VISIBLE_DEVICES: "0"
+      - name: Check loader scratch memory
+        # Metal needs a Mac: GitHub's macOS runners list no Metal device.
+        if: runner.os == 'macOS' && matrix.smoke
+        run: python3 -m unittest discover -s tests -p test_loader_scratch_runtime.py -v
+        env:
+          SD_REQUIRE_RUNTIME: "1"
       - uses: dart-lang/setup-dart@v1
         if: runner.os == 'Linux' && matrix.smoke
       - name: Verify cooperative host shutdown
