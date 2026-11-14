@@ -368,6 +368,36 @@ SD_API int32_t sd_dart_gpu_device_count(void);
 // Each call asks the device again.
 SD_API int32_t sd_dart_gpu_device_memory(int32_t device_index, sd_dart_gpu_device_memory_t* out);
 
+// Graph splitting
+//
+// A GPU that runs one command buffer for longer than its watchdog allows
+// resets, and the generation fails: the iPhone 16 Pro's A18 Pro does so in
+// the SD-Turbo VAE decode (llamadart#1047). The library installs an upstream
+// backend evaluation callback that ends the backend call after every graph
+// node whose element count, with its inputs', is at least the threshold, so
+// each such node runs in a command buffer of its own. Results do not change
+// on the CPU; on Metal, ending a buffer can change float rounding by a few
+// 8-bit levels of an image.
+//
+// The threshold is 2^26 elements in a library built with Metal for iOS and 0,
+// which installs nothing, elsewhere. It is read on every node, so a change
+// takes effect at once, but the callback is installed by the next
+// sd_dart_new_sd_ctx() or sd_dart_generate_image() that finds a nonzero
+// threshold and stays installed: a threshold of 0 afterwards cuts nothing.
+// The callback is upstream's only one and replaces another, such as importance
+// matrix collection. Upstream does not use it with several devices.
+
+// Sets the threshold in elements; 0 disables splitting. Callable from any
+// thread.
+SD_API void sd_dart_graph_split_set_threshold(uint64_t elements);
+
+// The threshold now in effect.
+SD_API uint64_t sd_dart_graph_split_threshold(void);
+
+// How many cuts the callback has made since the process started, so that a
+// caller can tell that splitting happened. Process-wide.
+SD_API uint64_t sd_dart_graph_split_cuts(void);
+
 // Log forwarding
 //
 // sd_set_log_callback() calls back on whichever thread logs, the model

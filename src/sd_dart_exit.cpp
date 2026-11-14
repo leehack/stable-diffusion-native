@@ -451,6 +451,7 @@ static sd_ctx_t* new_context(const sd_ctx_params_t* sd_ctx_params, bool intrinsi
         sd_ctx_params         = &unbatched;
     }
 #endif
+    sd_dart_graph_split_install();
     sd_ctx_t* context = intrinsic_tiny ? sd_dart_new_sd_ctx_intrinsic_tiny_impl(sd_ctx_params)
                                        : new_sd_ctx(sd_ctx_params);
     insert(context, free_context, cancel_context, SD_DART_EXIT_STAGE_CONTEXT);
@@ -499,6 +500,7 @@ bool sd_dart_generate_image(sd_ctx_t* sd_ctx,
                             int* num_images_out) {
     Call call(kWorkCall);
     sd_dart_log_enable();
+    sd_dart_graph_split_install();
     ErrorWindow errors;
     if (images_out != nullptr) *images_out = nullptr;
     if (num_images_out != nullptr) *num_images_out = 0;

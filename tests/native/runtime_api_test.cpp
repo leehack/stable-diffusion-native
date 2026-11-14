@@ -29,6 +29,12 @@ static_assert(std::is_same<decltype(&generate_image), Generate>::value, "generat
 using GuardedGenerate = bool (*)(sd_ctx_t*, const sd_img_gen_params_t*, sd_image_t**, int*);
 static_assert(std::is_same<decltype(&sd_dart_generate_image), GuardedGenerate>::value,
               "guarded generation ABI changed");
+static_assert(std::is_same<decltype(&sd_dart_graph_split_set_threshold), void (*)(uint64_t)>::value,
+              "graph split threshold ABI changed");
+static_assert(std::is_same<decltype(&sd_dart_graph_split_threshold), uint64_t (*)(void)>::value,
+              "graph split threshold ABI changed");
+static_assert(std::is_same<decltype(&sd_dart_graph_split_cuts), uint64_t (*)(void)>::value,
+              "graph split cuts ABI changed");
 using Convert = bool (*)(const char*, const char*, const char*, const char*, const char*, const char*,
                          const char*, sd_type_t, const char*, bool, int, const sd_lora_t*, int);
 static_assert(std::is_same<decltype(&convert_with_components), Convert>::value, "conversion ABI changed");

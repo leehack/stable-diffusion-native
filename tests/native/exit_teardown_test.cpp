@@ -1826,6 +1826,9 @@ void sd_set_log_callback(sd_log_cb_t callback, void*) {
 void ggml_log_set(ggml_log_callback, void*) {
 }
 
+void sd_set_backend_eval_callback(sd_graph_eval_callback_t, void*) {
+}
+
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     loads_begun.fetch_add(1);
     calls_after_teardown.fetch_add(teardown_returned.load() ? 1 : 0);

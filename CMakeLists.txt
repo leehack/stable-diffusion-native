@@ -98,6 +98,7 @@ target_sources(stable-diffusion PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_decoder_policy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_device.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_exit.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_graph_split.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_internal.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/sd_dart_wrapper.cpp"
