@@ -100,6 +100,8 @@ class VulkanEntryPointTest(unittest.TestCase):
         generated = build_root / TARGET.name / GENERATED_MODULE
         generated.parent.mkdir(parents=True)
         generated.write_bytes(FIXTURE.read_bytes())
+        (build_root / TARGET.name / 'sd_native_applied_patches.txt').write_text('pickle_line_span.patch\n')
+        (build_root / TARGET.name / 'sd_native_apple_allocator_selection.txt').write_text('upstream-experimental\n')
         with patch.object(build, 'BUILD_ROOT', build_root), patch.object(build, 'BIN_ROOT', self.bin), \
              patch.object(build, 'HEADER', FIXTURE), patch.object(build, 'HEADERS', []), \
              patch.object(build, 'configure_args', return_value=[]), patch.object(build, 'run'), \

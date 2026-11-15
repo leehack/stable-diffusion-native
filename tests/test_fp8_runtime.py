@@ -372,8 +372,7 @@ class LoraRuntimeTest(RuntimeTestCase):
 
 
 class PinnedGgmlMetalTest(unittest.TestCase):
-    # The patch can go once ggml-metal multiplies FP8 matrices or stops
-    # claiming that it does. Checked on the sources, so it runs without a GPU.
+    # A source assertion is a review alarm, never runtime retirement proof.
     def test_pinned_ggml_metal_still_needs_the_patch(self) -> None:
         metal = GGML_METAL
         if not (metal / "ggml-metal-device.m").is_file():
@@ -384,8 +383,15 @@ class PinnedGgmlMetalTest(unittest.TestCase):
         start = supports.index("static bool ggml_metal_supports_mul_mat_op(")
         claim = supports[start:supports.index("\n}\n", start)]
         kernels = "".join(path.read_text() for path in (metal / "kernels").glob("*.metal"))
-        self.assertNotRegex(claim, r"(?i)f8_e|fp8", "ggml-metal now excludes FP8 from MUL_MAT; "
-                            "re-evaluate patches/fp8_metal_f16_load.patch")
+        revision = subprocess.check_output(["git", "-C", str(metal), "rev-parse", "HEAD"],
+                                           text=True).strip()
+        self.assertEqual("eeda9ec48fc84a3df0bb9dcc19ae9053075a2539", revision,
+                         "unreviewed ggml revision; re-audit all FP8 contracts")
+        self.assertIn("op->src[0]->type == GGML_TYPE_F8_E4M3", claim)
+        self.assertNotIn("GGML_TYPE_F8_E5M2", claim,
+                         "E5M2 support changed; renew its original-trigger controls")
+        # eeda9ec4 rejects E4M3 only. Keep E5M2, all-backend FP8 LoRA,
+        # effective-F16 fit and stride/value runtime controls above unchanged.
         self.assertNotRegex(kernels, r"(?i)kernel_mul_m[mv]\w*_fp?8",
                             "ggml-metal now has an FP8 matrix kernel; "
                             "re-evaluate patches/fp8_metal_f16_load.patch")

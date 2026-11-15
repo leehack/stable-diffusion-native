@@ -11,16 +11,16 @@
  
  #define NONE_STR "NONE"
  
-@@ -645,7 +649,7 @@
-     StableDiffusionGGML* sd = nullptr;
- };
+@@ -719,7 +723,7 @@
+     }
+ }
  
 -sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
 +static sd_ctx_t* new_sd_ctx_with_decoder_policy(const sd_ctx_params_t* sd_ctx_params, bool intrinsic_tiny) {
      sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
      if (sd_ctx == nullptr) {
          return nullptr;
-@@ -657,7 +661,11 @@
+@@ -731,7 +735,11 @@
          return nullptr;
      }
  
@@ -32,7 +32,7 @@
          delete sd_ctx->sd;
          sd_ctx->sd = nullptr;
          free(sd_ctx);
-@@ -666,8 +674,31 @@
+@@ -740,8 +748,31 @@
      return sd_ctx;
  }
  
@@ -64,7 +64,7 @@
          delete sd_ctx->sd;
          sd_ctx->sd = nullptr;
      }
-@@ -759,7 +790,7 @@
+@@ -833,7 +864,7 @@
      if (!result_out || !sd_ctx || !sd_ctx->sd || !params)
          return false;
      StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
@@ -73,7 +73,7 @@
          return false;
      sd_image_t* images = nullptr;
      int count          = 0;
-@@ -785,7 +816,7 @@
+@@ -859,7 +890,7 @@
      if (!result_out || !sd_ctx || !sd_ctx->sd || !params)
          return false;
      StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
@@ -84,7 +84,7 @@
      if (!result)
 --- a/src/pipeline/diffusion_engine.cpp
 +++ b/src/pipeline/diffusion_engine.cpp
-@@ -218,10 +218,31 @@
+@@ -219,10 +219,31 @@
      return candidate.refresh_files(false) && apply_model_update(std::move(candidate));
  }
  
@@ -116,7 +116,7 @@
      if (next_version == VERSION_COUNT) {
          LOG_ERROR("cannot identify updated diffusion model");
          return false;
-@@ -975,6 +996,9 @@
+@@ -978,6 +999,9 @@
          LOG_INFO("Version: %s ", sd_version_name(version));
      }
  

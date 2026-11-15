@@ -18,7 +18,9 @@ static_assert(offsetof(sd_ctx_params_t, tokenizer) == 304, "context ABI changed"
 static_assert(offsetof(sd_ctx_params_t, conditioning_cache_size) == 316, "context ABI changed");
 static_assert(offsetof(sd_ctx_params_t, flash_attn_mode) == 320, "attention mode ABI changed");
 static_assert(offsetof(sd_ctx_params_t, conv_direct_mode) == 328, "convolution mode ABI changed");
-static_assert(sizeof(sd_img_gen_params_t) == 552, "image ABI changed");
+static_assert(sizeof(sd_img_gen_params_t) == 560, "image ABI changed");
+static_assert(offsetof(sd_img_gen_params_t, control_type) == 552, "control type ABI changed");
+static_assert(SD_CONTROL_TYPE_NONE == 0, "control type default changed");
 static_assert(sizeof(sd_vid_gen_params_t) == 592, "video ABI changed");
 static_assert(offsetof(sd_vid_gen_params_t, ref_image_args) == 584, "video ABI changed");
 static_assert(sizeof(sd_image_result_t) == 32 && offsetof(sd_image_result_t, generation_info) == 24,
@@ -54,6 +56,19 @@ int main(int argc, char** argv) {
     CHECK(!params.flash_attn && !params.diffusion_flash_attn);
     CHECK(!params.diffusion_conv_direct && !params.vae_conv_direct);
     CHECK(params.conditioning_cache_size == 4);
+    struct GuardedImageParams {
+        sd_img_gen_params_t params;
+        unsigned char guard[32];
+    } image;
+    std::memset(&image, 0xA5, sizeof(image));
+    sd_img_gen_params_init(&image.params);
+    for (unsigned char value : image.guard) CHECK(value == 0xA5);
+    CHECK(image.params.control_type == SD_CONTROL_TYPE_NONE);
+    CHECK(image.params.width == 512 && image.params.height == 512);
+    // Show the old 552-byte consumer allocation would be overwritten, without
+    // actually invoking undefined behavior or writing beyond this new object.
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&image.params);
+    for (size_t i = 552; i < 556; ++i) CHECK(bytes[i] == 0);
     sd_vid_gen_params_t video;
     sd_vid_gen_params_init(&video);
     CHECK(video.ref_image_args != nullptr && video.ref_image_args[0] == '\0');
