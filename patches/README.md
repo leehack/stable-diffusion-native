@@ -30,3 +30,25 @@ reports.
 
 Patches touching the same source compose in declaration order. Each next
 patch applies to the preceding build-tree copy; the submodule stays pristine.
+
+## Master-1104 candidate selection
+
+The six non-ggml patches above remain applied. LoRA and tiny-decoder insertion
+contexts are rebased without dropping candidate packed-INT4 checks or owner
+policy checks. E4M3 Metal rejection in ggml is only partial FP8 overlap:
+E5M2, all-backend FP8 LoRA, effective-F16 fit and runtime value/layout controls
+remain required. No runtime contract is removed based on the source assertion.
+
+`cmake/AppleAllocatorSelection.cmake` explicitly selects the two ggml
+backports for `a5915eb0`, or reviewed upstream sources for exact `eeda9ec4`.
+The latter also verifies both source-file SHA256 values and is an unqualified
+retirement experiment, not a declaration that either carry is obsolete.
+Unknown revisions or changed source bytes fail closed. Both patch files and
+old-source application/reversal controls remain; Apple/TSAN and Metal
+shared/owned semantics stay intact. No duplicate or no-op patch is applied.
+
+`upstream.patches` in manifests/build info remains the retained inventory;
+per-target `patchApplication.applied` and `appleAllocatorSource` in build info
+record actual compilation selection. See the
+[1104 qualification plan](../docs/upstream_1104_qualification.md) for original
+triggers, per-carry decisions and the missing iOS retirement matrix.
