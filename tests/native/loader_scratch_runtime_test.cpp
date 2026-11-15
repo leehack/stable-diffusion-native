@@ -2,7 +2,7 @@
 // a thread other than the caller's made meanwhile.
 //
 // Usage: loader_scratch_runtime_test devices
-//        loader_scratch_runtime_test run <model> <backend>
+//        loader_scratch_runtime_test run <model> <backend> <output.rgb>
 //
 // upstream's loader reads and converts tensors on its own threads. This
 // program replaces the process's `operator new`, which the library's vectors
@@ -28,6 +28,8 @@ static bool from_library(void* caller) {
     return dladdr(caller, &info) != 0 && info.dli_fname != nullptr &&
            std::strstr(info.dli_fname, "libstable-diffusion") != nullptr;
 }
+
+extern "C" void sd_test_vm_report();
 
 void* operator new(size_t size) {
     size_t seen = largest_worker_new.load();
@@ -62,13 +64,14 @@ int fail(const char* what) {
     return 3;
 }
 
-int run(const char* model, const char* backend) {
+int run(const char* model, const char* backend, const char* output) {
     sd_dart_log_enable();
     sd_ctx_params_t context_params;
     sd_ctx_params_init(&context_params);
     context_params.model_path = model;
     context_params.taesd_path = model;
     context_params.backend    = backend;
+    context_params.n_threads  = 1;  // deterministic VM-region observations
     sd_ctx_t* context         = sd_dart_new_sd_ctx(&context_params);
     if (context == nullptr) {
         return fail("load failed");
@@ -86,6 +89,12 @@ int run(const char* model, const char* backend) {
     int generated                         = 0;
     const bool ok                         = sd_dart_generate_image(context, &params, &images, &generated);
     if (ok) {
+        if (generated != 1) return fail("unexpected image count");
+        FILE* file = std::fopen(output, "wb");
+        const size_t bytes = static_cast<size_t>(images[0].width) * images[0].height * images[0].channel;
+        if (file == nullptr || std::fwrite(images[0].data, 1, bytes, file) != bytes || std::fclose(file) != 0) {
+            return fail("cannot write image");
+        }
         free_sd_images(images, generated);
     }
     sd_dart_exit_free(context);
@@ -93,6 +102,7 @@ int run(const char* model, const char* backend) {
         return fail("generation failed");
     }
     std::printf("WORKER_NEW %zu\n", largest_worker_new.load());
+    sd_test_vm_report();
     return 0;
 }
 
@@ -102,9 +112,9 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "devices") == 0) {
         return list_devices();
     }
-    if (argc == 4 && std::strcmp(argv[1], "run") == 0) {
-        return run(argv[2], argv[3]);
+    if (argc == 5 && std::strcmp(argv[1], "run") == 0) {
+        return run(argv[2], argv[3], argv[4]);
     }
-    std::fprintf(stderr, "usage: %s devices | run <model> <backend>\n", argv[0]);
+    std::fprintf(stderr, "usage: %s devices | run <model> <backend> <output.rgb>\n", argv[0]);
     return 2;
 }

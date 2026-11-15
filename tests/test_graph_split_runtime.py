@@ -114,6 +114,12 @@ class GraphSplitRuntimeTest(unittest.TestCase):
 
     def check_device(self, device: str) -> None:
         runs, images, output = self.generate(device, 0, LOW, 0, LOW, HIGH)
+        self.assertIn("CANCELLED_AND_RECOVERED", output)
+        recovered = (Path(self.directory.name) / "image.recovered.rgb").read_bytes()
+        if device == "CPU":
+            self.assertEqual(images[0], recovered, "cancellation changed subsequent CPU output")
+        else:
+            self.assertLessEqual(mean_difference(images[0], recovered), MAX_GPU_MEAN_DIFFERENCE)
         self.assertIn("DEFAULT 0\n", output, "a host build splits by default")
         self.assertEqual([0, LOW, 0, LOW, HIGH], [getter for getter, _ in runs])
         cuts = [count for _, count in runs]
