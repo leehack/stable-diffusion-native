@@ -105,6 +105,13 @@ jobs:
           - { target: windows-x64, runs_on: windows-2022, smoke: "--expect-device CPU" }
           - { target: windows-x64-vulkan, runs_on: windows-2022, smoke: "--expect-device CPU" }
     steps:
+      - name: Enable long Git paths on the Windows runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # CUTLASS exceeds MAX_PATH during recursive checkout, before CMake's
+        # short build paths apply. System scope survives checkout's temporary
+        # HOME and affects only this disposable hosted runner.
+        run: git config --system core.longpaths true
       - uses: actions/checkout@v4
         with:
           submodules: recursive
