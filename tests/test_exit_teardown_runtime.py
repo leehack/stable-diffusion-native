@@ -20,6 +20,7 @@ Vulkan target does on its first Vulkan device is reported and not failed.
                                     under build/ and test that one instead,
                                     on macOS or Linux
     SD_EXIT_TEARDOWN_RUNS=5         runs per scenario and backend
+    CMAKE_BUILD_PARALLEL_LEVEL=4   maximum workers for the ASan runtime build
     SD_EXIT_TEARDOWN_MODEL=<file>   also run the scenarios on this model
     SD_EXIT_TEARDOWN_MODEL_SIZE=256 the image size that model needs
     SD_EXIT_TEARDOWN_LLAMADART=<libllamadart.dylib>
@@ -95,7 +96,8 @@ def sanitized_library(sanitizer: str, target: build.Target = TARGET) -> Path:
             for arg in build.configure_args(target, work_dir)]
     args += [f"-DCMAKE_C_FLAGS={flags}", f"-DCMAKE_CXX_FLAGS={flags}"]
     build.run(["cmake", "-S", str(REPO_ROOT), "-B", str(work_dir), *args])
-    build.run(["cmake", "--build", str(work_dir), "-j", str(os.cpu_count() or 4)])
+    jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or str(os.cpu_count() or 4)
+    build.run(["cmake", "--build", str(work_dir), "-j", jobs])
     return build.find_library(work_dir, target.library)
 
 

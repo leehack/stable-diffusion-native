@@ -151,6 +151,7 @@ sd_ctx_params_t context_params(const char* model, const char* backend, bool taes
     params.taesd_path = taesd ? model : nullptr;
     params.backend    = std::strcmp(backend, "default") == 0 ? nullptr : backend;
     params.eager_load = true;
+    params.n_threads = 2;  // Bound fixture compute independently of host CPU count.
     return params;
 }
 
