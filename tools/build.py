@@ -273,6 +273,12 @@ def build(target: Target, jobs: int) -> Path:
         "library": target.library,
         "accelerators": list(target.accelerators),
         "upstream": upstream_info(),
+        # upstream.patches is the retained patch inventory, including historical
+        # allocator controls. Record actual target application separately.
+        "patchApplication": {
+            "applied": (work_dir / "sd_native_applied_patches.txt").read_text().splitlines(),
+            "appleAllocatorSource": (work_dir / "sd_native_apple_allocator_selection.txt").read_text().strip(),
+        },
         "cmakeArgs": [a for a in cmake_args if not a.startswith("-DCMAKE_SHARED_LINKER_FLAGS")],
         "exportedSymbols": api_symbols(*HEADERS),
     }

@@ -27,6 +27,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import struct
+import zipfile
+import hashlib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +46,42 @@ PROBE = REPO_ROOT / "tests" / "native" / "loader_scratch_runtime_test.cpp"
 # scratch block without the patch is a 73728-byte convolution weight.
 MAX_WORKER_NEW = 16 * 1024
 WORKER_NEW = re.compile(r"^WORKER_NEW (\d+)$", re.MULTILINE)
+VM_SCRATCH = re.compile(r"^VM_SCRATCH (\d+) (\d+) (\d+) (\d+)$", re.MULTILINE)
+
+
+def write_torch_zip(source: Path, copy: Path) -> None:
+    """Trusted tensor-only pickle, never unpickled; shared-storage offset path.
+
+    Padding makes entry_size != tensor bytes even for a single stored tensor,
+    so ModelLoader::load_tensors must use zip_entry_buffer, not direct reads.
+    """
+    from test_torch_zip_lookup import integer, string
+    header, data = read_safetensors(source)
+    tensors = []
+    with zipfile.ZipFile(copy, "w", compression=zipfile.ZIP_STORED) as archive:
+        def write_entry(name, payload):
+            entry = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_STORED
+            archive.writestr(entry, payload)
+        for index, (name, info) in enumerate(header.items()):
+            if name == "__metadata__":
+                continue
+            assert info["dtype"] == "F32"
+            begin, end = info["data_offsets"]
+            shape = info["shape"]
+            stride, strides = 1, []
+            for dim in reversed(shape):
+                strides.insert(0, stride)
+                stride *= dim
+            def tuple_of(values):
+                return b"(" + b"".join(integer(v) for v in values) + b"t"
+            tensors.append(string(name) + b"ctorch._utils\n_rebuild_tensor_v2\n((" +
+                           string("storage") + b"ctorch\nFloatStorage\n" + string(str(index)) +
+                           string("cpu") + integer(stride + 8) + b"tQ" + integer(8) +
+                           tuple_of(shape) + tuple_of(strides) + b"\x89" +
+                           b"ccollections\nOrderedDict\n)RtR")
+            write_entry(f"archive/data/{index}", bytes(32) + data[begin:end] + bytes(65536))
+        write_entry("archive/data.pkl", b"\x80\x02}(" + b"".join(tensors) + b"u.")
 
 
 def write_bf16_convolutions(source: Path, copy: Path) -> None:
@@ -66,19 +105,25 @@ class LoaderScratchRuntimeTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.skip_reason = ""
         target = build.TARGETS["macos-arm64" if platform.machine() == "arm64" else "macos-x64"]
-        library = build.BIN_ROOT / target.name / "lib" / target.library
+        library = Path(os.environ.get("SD_LOADER_SCRATCH_LIBRARY", "")) if os.environ.get(
+            "SD_LOADER_SCRATCH_LIBRARY") else build.BIN_ROOT / target.name / "lib" / target.library
         if not library.is_file() or COMPILER is None:
             cls.skip_reason = f"no built runtime for {target.name} or no C++ compiler"
             return
         cls.directory = tempfile.TemporaryDirectory()
         work = Path(cls.directory.name)
+        cls.observer = work / "loader_vm_observer.dylib"
+        subprocess.run([COMPILER, "-std=c++17", "-O1", "-shared", "-fPIC",
+                        str(REPO_ROOT / "tests/native/loader_vm_observer.cpp"),
+                        "-o", str(cls.observer)], check=True)
         binaries = {}
         for source in (MODEL_WRITER, PROBE):
             binary = work / source.stem
             subprocess.run(
                 [COMPILER, "-std=c++17", "-O1", "-pthread", f"-I{REPO_ROOT / 'src'}",
                  f"-I{build.HEADER.parent}", str(source), f"-L{library.parent}",
-                 "-lstable-diffusion", f"-Wl,-rpath,{library.parent}", "-o", str(binary)],
+                 "-lstable-diffusion", f"-Wl,-rpath,{library.parent}",
+                 *([str(cls.observer)] if source == PROBE else []), "-o", str(binary)],
                 check=True)
             binaries[source] = binary
         cls.probe = binaries[PROBE]
@@ -88,6 +133,11 @@ class LoaderScratchRuntimeTest(unittest.TestCase):
         cls.models = {"F32": work / "f32.safetensors", "BF16 convolutions": work / "bf16.safetensors"}
         write_weight_copies(source_model, {"F32": cls.models["F32"]})
         write_bf16_convolutions(cls.models["F32"], cls.models["BF16 convolutions"])
+        cls.models["ZIP shared-storage offset"] = work / "offset.pt"
+        write_torch_zip(cls.models["F32"], cls.models["ZIP shared-storage offset"])
+        for name, fixture in cls.models.items():
+            print(f"FIXTURE {name}: sha256={hashlib.sha256(fixture.read_bytes()).hexdigest()} "
+                  f"bytes={fixture.stat().st_size}", flush=True)
         listing = subprocess.run([str(cls.probe), "devices"], check=True, capture_output=True,
                                  text=True, timeout=120).stdout
         cls.devices = [line.split("\t")[0] for line in listing.splitlines() if line.strip()]
@@ -104,18 +154,35 @@ class LoaderScratchRuntimeTest(unittest.TestCase):
             self.skipTest(self.skip_reason)
 
     def check_device(self, device: str) -> None:
+        reference = None
         for name, model in self.models.items():
             with self.subTest(device=device, model=name):
-                result = subprocess.run([str(self.probe), "run", str(model), device],
-                                        capture_output=True, text=True, timeout=600)
+                output = Path(self.directory.name) / "image.rgb"
+                output.unlink(missing_ok=True)
+                result = subprocess.run([str(self.probe), "run", str(model), device, str(output)],
+                                        capture_output=True, text=True, timeout=600,
+                                        env={**os.environ, "DYLD_INSERT_LIBRARIES": str(self.observer)})
                 if result.returncode != 0 and device.startswith("MTL") and \
                         not os.environ.get("SD_REQUIRE_METAL_GENERATION"):
                     self.skipTest(f"{device} cannot generate:\n{result.stderr[-2000:]}")
                 self.assertEqual(0, result.returncode, f"{device}:\n{result.stderr[-4000:]}")
+                image = output.read_bytes()
+                if name == "F32":
+                    reference = image
+                    self.assertGreaterEqual(len(set(image)), 16, "flat output hides corrupted tensor reads")
+                elif name == "ZIP shared-storage offset":
+                    self.assertEqual(reference, image, "ZIP tensor offsets changed the F32 image")
                 requests = WORKER_NEW.findall(result.stdout)
                 self.assertEqual(1, len(requests), result.stdout[-4000:])
                 self.assertLess(int(requests[0]), MAX_WORKER_NEW,
                                 "a loader thread took tensor scratch from the heap")
+                observations = VM_SCRATCH.findall(result.stdout)
+                self.assertEqual(1, len(observations), result.stdout[-4000:])
+                allocated, released, unmapped, live = map(int, observations[0])
+                self.assertGreater(allocated, 0, "no actual worker scratch allocation observed")
+                self.assertEqual(allocated, released, "scratch VM allocations were not freed")
+                self.assertEqual(released, unmapped, "released scratch mapping remained readable")
+                self.assertEqual(0, live, "scratch VM allocations remain live")
 
     def test_cpu_load_takes_no_tensor_scratch_from_the_heap(self) -> None:
         self.check_device("CPU")

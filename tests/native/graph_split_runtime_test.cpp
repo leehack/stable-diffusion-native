@@ -18,6 +18,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 namespace {
 
@@ -53,6 +55,7 @@ int write_image(const sd_image_t& image, const std::string& path) {
 
 int run(const char* model, const char* backend, const std::string& prefix, int count, char** thresholds) {
     sd_dart_log_enable();
+    sd_dart_progress_enable();
     std::printf("DEFAULT %llu\n", static_cast<unsigned long long>(sd_dart_graph_split_threshold()));
     sd_ctx_params_t context_params;
     sd_ctx_params_init(&context_params);
@@ -86,6 +89,48 @@ int run(const char* model, const char* backend, const std::string& prefix, int c
         std::printf("RUN %d %s %llu %llu\n", i, thresholds[i],
                     static_cast<unsigned long long>(sd_dart_graph_split_threshold()),
                     static_cast<unsigned long long>(sd_dart_graph_split_cuts()));
+    }
+    if (status == 0) {
+        sd_dart_graph_split_set_threshold(4096);
+        uint64_t latest = 0;
+        sd_dart_progress_read(0, nullptr, 0, &latest);
+        std::atomic<bool> done{false}, cancelled{false};
+        std::thread canceller([&] {
+            while (!done.load()) {
+                sd_dart_progress_t reports[32];
+                const size_t n = sd_dart_progress_read(latest, reports, 32, nullptr);
+                for (size_t i = 0; i < n; ++i) {
+                    latest = reports[i].sequence;
+                    if (reports[i].steps == 30 && reports[i].step > 0) cancelled.store(true);
+                }
+                if (cancelled.load()) sd_dart_cancel_generation(context, SD_CANCEL_ALL);
+                std::this_thread::yield();
+            }
+        });
+        sd_img_gen_params_t params;
+        sd_img_gen_params_init(&params);
+        params.prompt = "a lighthouse";
+        params.width = params.height = kImageSize;
+        params.seed = 7;
+        params.sample_params.sample_steps = 30;
+        params.sample_params.guidance.txt_cfg = 1.0f;
+        sd_image_t* images = reinterpret_cast<sd_image_t*>(1);
+        int generated = -1;
+        const bool ok = sd_dart_generate_image(context, &params, &images, &generated);
+        done.store(true);
+        canceller.join();
+        if (!cancelled.load() || ok || images != nullptr || generated != 0) {
+            status = fail("split generation did not cancel with cleared outputs");
+        } else {
+            params.sample_params.sample_steps = 2;
+            if (!sd_dart_generate_image(context, &params, &images, &generated) || generated != 1) {
+                status = fail("split context did not recover after cancellation");
+            } else {
+                status = write_image(images[0], prefix + ".recovered.rgb");
+                free_sd_images(images, generated);
+                std::puts("CANCELLED_AND_RECOVERED");
+            }
+        }
     }
     sd_dart_exit_free(context);
     return status;

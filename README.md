@@ -654,22 +654,21 @@ the macOS probe and builds the iOS device and simulator slices.
 
 ## Upstream qualification
 
-Upstream 1017 has its
-[ABI audit, wrapper review, FP8 evidence and outstanding gates](docs/upstream_1017_qualification.md);
-the carry inventory is in the [upstream 982 record](docs/upstream_982_qualification.md).
-It carries six fixes the pin lacks: unbatched CFG in Metal builds (below),
-the [`pickle_line_span.patch`](patches/README.md) for legacy checkpoints above
-2 GiB, the [`fp8_metal_f16_load.patch`](patches/README.md), which loads FP8
-weights as F16 on Metal instead of aborting, so they take twice their file size
-there, and the [`lora_immediate_fallback.patch`](patches/README.md), which
-applies a LoRA at runtime instead of crashing where the `immediately` mode
-cannot merge it: into FP8 weights, and on Metal, which cannot add into the F16
-convolution weights every model has, and the
-[`ggml_apple_vm_allocate.patch`](patches/README.md), which backports
-[llama.cpp#31437](https://github.com/ggml-org/llama.cpp/pull/31437) so iOS
-host buffers go back to the system when freed, and the
-[`loader_scratch_vm_allocate.patch`](patches/README.md), which does the same for
-the loader's tensor scratch buffers.
+The fixed master-1104 source candidate has its
+[migration decisions, ABI proof and pending qualification gates](docs/upstream_1104_qualification.md).
+The [1017 record](docs/upstream_1017_qualification.md) and
+[982 inventory](docs/upstream_982_qualification.md) preserve earlier evidence.
+Six [owned patches](patches/README.md) remain applied: pickle spans, ZIP lookup,
+FP8 load/fit, LoRA fallback, intrinsic tiny-decoder policy and loader scratch.
+The two ggml Apple allocator backports remain historical controls; this exact
+candidate selects upstream's equivalent allocation/free sources experimentally.
+They are not declared retired: original iOS causal qualification is pending.
+Build info records actual patch application separately from the patch inventory.
+
+The image generation struct grows from 552 to 560 bytes: `control_type` is at
+offset 552 and defaults to `SD_CONTROL_TYPE_NONE` (0). The new initializer
+overwrites an old 552-byte consumer allocation. Regenerated bindings and a
+matching qualified artifact are required before consumer adoption.
 Upstream's `generate_image` now returns an owned result with per-image
 generation metadata; `sd_dart_generate_image` keeps returning an image array
 that `free_sd_images` frees and drops that metadata. Since upstream 982 a null
@@ -681,10 +680,10 @@ explicit modes the 982 record maps from the legacy flags.
 contract and component conversion without models or a GPU.
 
 In a Metal build, the Apple targets, `sd_dart_new_sd_ctx` runs CFG unbatched
-whatever `sd_ctx_params_t.batched_cfg` says: ggml-metal's group normalization
-writes only the first batch item
-([leejet/stable-diffusion.cpp#2149](https://github.com/leejet/stable-diffusion.cpp/issues/2149)),
-so a batched CFG step returns a wrong image without an error.
+whatever `sd_ctx_params_t.batched_cfg` says. This guard originated with
+[the batch-2 GROUP_NORM defect](https://github.com/leejet/stable-diffusion.cpp/issues/2149).
+Master-1104 contains an upstream repair, but removing the guard still needs
+independent sentinel and real-image qualification. The source refresh keeps it.
 
 ### VRAM-budget load safety
 

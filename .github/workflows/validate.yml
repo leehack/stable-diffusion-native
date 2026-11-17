@@ -22,6 +22,13 @@ jobs:
         with:
           # The wrapper tests compile against upstream's and ggml's headers.
           submodules: recursive
+      - name: Fetch exact historical source controls
+        # checkout may initialize shallow submodules. These immutable objects
+        # supply the old ABI and per-carry allocator negatives; never fetch
+        # a moving branch or silently skip them when absent.
+        run: |
+          git -C third_party/stable-diffusion.cpp fetch --depth=1 origin be486498eadc29dc3cd234d944c2180ed42b1415
+          git -C third_party/stable-diffusion.cpp/ggml fetch --depth=1 origin a5915eb0e47adef21c3f25b889a008925ea838c2
       - run: python3 -m unittest discover -s tests -v
 
   dart-vm:
@@ -80,6 +87,34 @@ jobs:
           SD_EXIT_TEARDOWN_SANITIZER: ${{ matrix.sanitizer }}
           SD_EXIT_TEARDOWN_RUNS: "3"
 
+  linux-asan-native:
+    name: exit teardown (Linux native address sanitizer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          target: linux-x64
+      - name: Verify the existing GCC floor
+        run: |
+          test "$(g++ -dumpversion | cut -d. -f1)" -ge 13
+          g++ --version
+      - name: Run the native ASan shutdown matrix
+        # The test builds its ASan runtime and generated fixture, then runs
+        # every Linux native scenario. Missing runtime/build/checks fail.
+        # Sanitized Dart and Apple-only tests explicitly skip; ordinary Dart
+        # stays in the separate Linux release-runtime build lane below.
+        run: python3 -B -m unittest discover -s tests -p test_exit_teardown_runtime.py -v
+        env:
+          SD_EXIT_TEARDOWN_TARGET: linux-x64
+          SD_EXIT_TEARDOWN_SANITIZER: address
+          SD_EXIT_TEARDOWN_RUNS: "1"
+          SD_REQUIRE_RUNTIME: "1"
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runs_on }}
@@ -98,6 +133,13 @@ jobs:
           - { target: windows-x64, runs_on: windows-2022, smoke: "--expect-device CPU" }
           - { target: windows-x64-vulkan, runs_on: windows-2022, smoke: "--expect-device CPU" }
     steps:
+      - name: Enable long Git paths on the Windows runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # CUTLASS exceeds MAX_PATH during recursive checkout, before CMake's
+        # short build paths apply. System scope survives checkout's temporary
+        # HOME and affects only this disposable hosted runner.
+        run: git config --system core.longpaths true
       - uses: actions/checkout@v4
         with:
           submodules: recursive

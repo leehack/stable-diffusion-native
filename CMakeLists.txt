@@ -23,6 +23,7 @@ add_subdirectory("${SD_NATIVE_UPSTREAM_DIR}" sd)
 # a patch no longer applies or changes nothing. A patch's sources belong to
 # one target: stable-diffusion unless TARGET names another, such as ggml-base.
 find_package(Git REQUIRED)
+file(WRITE "${CMAKE_BINARY_DIR}/sd_native_applied_patches.txt" "")
 function(sd_native_carry_patch patch)
     cmake_parse_arguments(PARSE_ARGV 1 carry "" "TARGET" "")
     if(NOT carry_TARGET)
@@ -97,6 +98,7 @@ function(sd_native_carry_patch patch)
             PROPERTIES INCLUDE_DIRECTORIES "${upstream_file_dir}")
     endforeach()
     set_property(TARGET ${carry_TARGET} PROPERTY SOURCES ${sources})
+    file(APPEND "${CMAKE_BINARY_DIR}/sd_native_applied_patches.txt" "${patch}\n")
     message(STATUS "Carrying patches/${patch}")
 endfunction()
 
@@ -106,10 +108,21 @@ sd_native_carry_patch(fp8_metal_f16_load.patch src/model_manager.cpp src/core/ba
 sd_native_carry_patch(lora_immediate_fallback.patch src/pipeline/diffusion_engine.cpp)
 sd_native_carry_patch(intrinsic_tiny_decoder_policy.patch src/stable-diffusion.cpp src/pipeline/diffusion_engine.cpp)
 sd_native_carry_patch(loader_scratch_vm_allocate.patch src/model_loader.cpp)
-sd_native_carry_patch(ggml_apple_vm_allocate.patch TARGET ggml-base ggml/src/ggml.c)
-if(TARGET ggml-metal)
-    sd_native_carry_patch(ggml_metal_apple_vm_allocate.patch TARGET ggml-metal ggml/src/ggml-metal/ggml-metal-device.m)
+execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${SD_NATIVE_UPSTREAM_DIR}/ggml" rev-parse HEAD
+    OUTPUT_VARIABLE ggml_commit OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE ggml_revision_result)
+if(NOT ggml_revision_result EQUAL 0)
+    message(FATAL_ERROR "Cannot identify ggml allocator revision")
 endif()
+include(cmake/AppleAllocatorSelection.cmake)
+sd_native_apple_allocator_selection("${ggml_commit}" "${SD_NATIVE_UPSTREAM_DIR}/ggml" allocator_selection)
+if(allocator_selection STREQUAL "backport")
+    sd_native_carry_patch(ggml_apple_vm_allocate.patch TARGET ggml-base ggml/src/ggml.c)
+    if(TARGET ggml-metal)
+        sd_native_carry_patch(ggml_metal_apple_vm_allocate.patch TARGET ggml-metal ggml/src/ggml-metal/ggml-metal-device.m)
+    endif()
+endif()
+file(WRITE "${CMAKE_BINARY_DIR}/sd_native_apple_allocator_selection.txt" "${allocator_selection}\n")
+message(STATUS "Apple allocator source: ${allocator_selection}; iOS qualification/retirement remains pending (#20)")
 
 # Wrapper exports are compiled into the upstream library target, so they share
 # its SD_API export macro and reach upstream without patching it.
