@@ -1,13 +1,16 @@
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import apple_xcframework  # noqa: E402
+import validate_artifacts  # noqa: E402
 from build import HEADERS, TARGETS, WRAPPER_HEADER, wrapper_definition_problems  # noqa: E402
 from package_release import TAG_PATTERN  # noqa: E402
 from sd_api import api_symbols  # noqa: E402
@@ -119,11 +122,14 @@ void *host_buffer(unsigned long n) {
 
 @unittest.skipUnless(sys.platform == "darwin", "reads Mach-O imports with nm")
 class StaticDestructorImportTest(unittest.TestCase):
-    def build(self, directory: str, name: str, source: str, *archs: str) -> Path:
+    def build(self, directory: str, name: str, source: str, *archs: str,
+              install_name: str | None = None) -> Path:
         path = Path(directory) / f"{name}.cpp"
         path.write_text(source)
         library = Path(directory) / f"lib{name}.dylib"
         flags = [flag for arch in archs for flag in ("-arch", arch)]
+        if install_name:
+            flags.extend(["-Wl,-install_name," + install_name])
         subprocess.run([shutil.which("c++"), "-std=c++17", "-shared", *flags, str(path),
                         "-o", str(library)], check=True)
         return library
@@ -147,6 +153,37 @@ class StaticDestructorImportTest(unittest.TestCase):
             new = self.build(tmp, "new", HOST_BUFFER_WITH_VM_ALLOCATE)
             self.assertTrue(imports_symbol(old, IOS_HOST_BUFFER_IMPORT))
             self.assertFalse(imports_symbol(new, IOS_HOST_BUFFER_IMPORT))
+
+    def test_validate_rejects_ios_posix_memalign_and_allows_vm_allocate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            old = self.build(tmp, "old", OWN_REGISTRATION + HOST_BUFFER_WITH_POSIX_MEMALIGN,
+                             install_name="@rpath/libstable-diffusion.dylib")
+            new = self.build(tmp, "new", OWN_REGISTRATION + HOST_BUFFER_WITH_VM_ALLOCATE,
+                             install_name="@rpath/libstable-diffusion.dylib")
+            bin_root = tmp_path / "bin"
+
+            def stage(target_name: str, built: Path) -> None:
+                target_dir = bin_root / target_name
+                lib_path = target_dir / "lib" / TARGETS[target_name].library
+                lib_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(built, lib_path)
+                (target_dir / "build-info.json").write_text(json.dumps({"target": target_name}))
+
+            with patch.object(validate_artifacts, "BIN_ROOT", bin_root), \
+                 patch.object(validate_artifacts, "HEADERS", []), \
+                 patch.object(validate_artifacts, "api_symbols", return_value=[]), \
+                 patch.object(validate_artifacts, "exported_symbols", return_value=set()):
+                stage("ios-arm64", old)
+                problems = validate_artifacts.validate(TARGETS["ios-arm64"])
+                self.assertEqual(len(problems), 1)
+                self.assertIn(IOS_HOST_BUFFER_IMPORT, problems[0])
+
+                stage("ios-arm64", new)
+                self.assertEqual(validate_artifacts.validate(TARGETS["ios-arm64"]), [])
+
+                stage("macos-arm64", old)
+                self.assertEqual(validate_artifacts.validate(TARGETS["macos-arm64"]), [])
 
 
 # `readelf --dyn-syms -W` of GNU binutils and of LLVM: the first appends the

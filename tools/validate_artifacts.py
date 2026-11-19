@@ -192,7 +192,7 @@ def validate(target: Target) -> list[str]:
 
     if target.os == "ios" and imports_symbol(library, IOS_HOST_BUFFER_IMPORT):
         problems.append(
-            f"imports {IOS_HOST_BUFFER_IMPORT}: host buffers outlive their free in the app footprint"
+            f"imports {IOS_HOST_BUFFER_IMPORT}: libmalloc keeps freed host-buffer pages in the app footprint"
         )
 
     if target.os == "linux":
