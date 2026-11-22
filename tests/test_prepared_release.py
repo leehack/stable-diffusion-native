@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import prepared_release as release
-from test_windows_runtime import windows_libraries
+from test_windows_runtime import RUNTIME_IMPORTS, make_pe, windows_libraries, windows_metadata
 
 TAG = "v0.3.0-2"
 SOURCE = "1" * 40
@@ -46,7 +46,8 @@ class DistributionTest(unittest.TestCase):
         self.add_artifact("apple", "xcframework", path)
         self.write_manifest()
 
-    def write_runtime_fixture(self, path, target_name, kind, *, change_libraries=None):
+    def write_runtime_fixture(self, path, target_name, kind, *, change_libraries=None,
+                              change_metadata=None):
         target = release.TARGETS[target_name]
         build_info = {"target": target_name, "upstream": self.manifest["upstream"]}
         libraries = {}
@@ -62,8 +63,12 @@ class DistributionTest(unittest.TestCase):
                 }
                 pe = libraries.get(target.library, b"")
                 libraries[target.library] = pe + bytes(-len(pe) % 4) + payload
+        if target.os == "windows" and kind == "runtime":
+            build_info.update(windows_metadata(libraries))
         if change_libraries:
             change_libraries(libraries)
+        if change_metadata:
+            change_metadata(build_info, libraries)
         with tarfile.open(path, "w:gz") as archive:
             entries = {"build-info.json": json.dumps(build_info).encode()}
             entries.update({f"lib/{name}": payload for name, payload in libraries.items()})
@@ -152,6 +157,33 @@ class DistributionTest(unittest.TestCase):
             self.write_runtime_fixture(path, target, "runtime")
             artifact.update(sha256=release.sha256(path), size=path.stat().st_size)
             self.write_manifest()
+
+    def test_replay_checks_full_toolset_floor_and_pinned_crt_bytes(self):
+        artifact = next(a for a in self.manifest["artifacts"]
+                        if a["target"] == "windows-x64" and a["kind"] == "runtime")
+        path = self.dist / artifact["file"]
+
+        def older_runtime(libraries):
+            for name, symbols in RUNTIME_IMPORTS.items():
+                libraries[name] = make_pe(exports=symbols, file_version=(14, 44, 1, 0))
+
+        def change_signed_bytes(libraries):
+            libraries["msvcp140_codecvt_ids.dll"] += b"changed"
+
+        for mutate, rewrite_receipt, expected in (
+            (older_runtime, True, "older than MSVC toolset 14.44.35207.0"),
+            (change_signed_bytes, False, "signature-checked bytes"),
+        ):
+            with self.subTest(expected=expected):
+                self.write_runtime_fixture(
+                    path, "windows-x64", "runtime", change_libraries=mutate,
+                    change_metadata=lambda info, libs: info.update(windows_metadata(libs))
+                    if rewrite_receipt else None,
+                )
+                artifact.update(sha256=release.sha256(path), size=path.stat().st_size)
+                self.write_manifest()
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.verify()
 
     def test_manifest_runtime_libraries_match_the_archive(self):
         artifact = next(a for a in self.manifest["artifacts"]

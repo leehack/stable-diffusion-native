@@ -317,5 +317,28 @@ class AppleXcframeworkTest(unittest.TestCase):
                          "@rpath/stable_diffusion.framework/Versions/A/stable_diffusion")
 
 
+class BuildMetadataTest(unittest.TestCase):
+    def test_linux_build_info_keeps_its_existing_fields(self):
+        import build
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = TARGETS["linux-x64"]
+            work = root / "build" / target.name
+            work.mkdir(parents=True)
+            (work / "sd_native_applied_patches.txt").write_text("")
+            (work / "sd_native_apple_allocator_selection.txt").write_text("upstream")
+            library = work / target.library
+            library.write_bytes(b"unchanged runtime bytes")
+            with patch.multiple(build, BUILD_ROOT=root / "build", BIN_ROOT=root / "bin", HEADERS=[]), \
+                 patch.object(build, "configure_args", return_value=[]), patch.object(build, "run"), \
+                 patch.object(build, "check_wrapper_definitions"), \
+                 patch.object(build, "strip", side_effect=lambda _, src, dst: shutil.copyfile(src, dst)):
+                output = build.build(target, 1)
+            self.assertEqual(set(json.loads((output / "build-info.json").read_text())), {
+                "target", "os", "library", "accelerators", "upstream",
+                "patchApplication", "cmakeArgs", "exportedSymbols",
+            })
+
 if __name__ == "__main__":
     unittest.main()

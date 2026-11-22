@@ -6,14 +6,19 @@ runtime policy. The PE reader also runs on the macOS packaging runner.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from fnmatch import fnmatch
+import hashlib
+import json
 import mmap
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 
 MACHINES = {0x8664: "x64", 0xAA64: "arm64", 0x014C: "x86"}
 
@@ -52,7 +57,22 @@ OS_PROVIDED_DLLS = frozenset({
     "ws2_32.dll",
 })
 VULKAN_DRIVER_DLL = "vulkan-1.dll"
-OS_PROVIDED_PREFIXES = ("api-ms-win-", "ext-ms-")
+API_SET_PREFIXES = ("api-ms-win-", "ext-ms-")
+# UCRT contracts imported by the current x64 DLLs, available on Windows 10+.
+OS_API_SETS = frozenset({
+    "api-ms-win-crt-convert-l1-1-0.dll",
+    "api-ms-win-crt-environment-l1-1-0.dll",
+    "api-ms-win-crt-filesystem-l1-1-0.dll",
+    "api-ms-win-crt-heap-l1-1-0.dll",
+    "api-ms-win-crt-locale-l1-1-0.dll",
+    "api-ms-win-crt-math-l1-1-0.dll",
+    "api-ms-win-crt-runtime-l1-1-0.dll",
+    "api-ms-win-crt-stdio-l1-1-0.dll",
+    "api-ms-win-crt-string-l1-1-0.dll",
+    "api-ms-win-crt-time-l1-1-0.dll",
+    "api-ms-win-crt-utility-l1-1-0.dll",
+})
+TOOLSET_VERSION = re.compile(r"[0-9]{1,5}(?:[.][0-9]{1,5}){2,3}")
 
 # Visual C++ v14 runtime DLLs. Release bundles ship them app-locally
 # from the build toolset's redistributable folder (VCToolsRedistDir), never
@@ -83,7 +103,7 @@ NON_REDISTRIBUTABLE_PATTERNS = (
 
 def is_os_provided(name: str) -> bool:
     lowered = name.lower()
-    return lowered in OS_PROVIDED_DLLS or lowered.startswith(OS_PROVIDED_PREFIXES)
+    return lowered in OS_PROVIDED_DLLS or lowered in OS_API_SETS
 
 
 def is_vc_runtime(name: str) -> bool:
@@ -120,6 +140,7 @@ class PeImage:
     exports: frozenset[str]
     export_ordinals: frozenset[str]
     file_version: tuple[int, int, int, int] | None
+    crt_sha256: str | None
 
     def all_imports(self) -> dict[str, frozenset[str]]:
         merged = {name: set(symbols) for name, symbols in self.imports.items()}
@@ -271,6 +292,7 @@ def read_pe_bytes(name: str, data) -> PeImage:
             exports=exports,
             export_ordinals=export_ordinals,
             file_version=reader.file_version(),
+            crt_sha256=hashlib.sha256(data).hexdigest() if is_vc_runtime(name) else None,
         )
     except (struct.error, ValueError, RecursionError) as error:
         raise PeError(f"{name}: malformed PE image: {error}") from error
@@ -299,14 +321,15 @@ def external_import(name: str, allow_vulkan: bool) -> bool:
     return is_os_provided(name) or (allow_vulkan and name == VULKAN_DRIVER_DLL)
 
 
-def bundle_errors(images: dict[str, PeImage], arch: str, *, allow_vulkan: bool) -> list[str]:
+def bundle_errors(images: dict[str, PeImage], arch: str, *, allow_vulkan: bool,
+                  msvc_toolset: str | None) -> list[str]:
     """Check whether the Windows bundle resolves imports without an installed VC++ runtime."""
     errors: list[str] = []
     for name, image in sorted(images.items()):
         if image.machine != arch:
             errors.append(f"{name}: {image.machine} image in a {arch} bundle")
-        if is_os_provided(name) or name == VULKAN_DRIVER_DLL:
-            errors.append(f"{name}: Windows or a GPU driver provides this library; the bundle must not ship it")
+        if is_os_provided(name) or name == VULKAN_DRIVER_DLL or name.startswith(API_SET_PREFIXES):
+            errors.append(f"{name}: the bundle must not ship Windows system files, API sets or GPU loaders")
         if is_non_redistributable(name):
             errors.append(f"{name}: a debug runtime or a Visual Studio debug_nonredist file, "
                           "which may not be redistributed")
@@ -318,19 +341,21 @@ def bundle_errors(images: dict[str, PeImage], arch: str, *, allow_vulkan: bool) 
                     errors.append(f"{name}: {dependency} does not export {', '.join(missing[:5])}")
             elif not external_import(dependency, allow_vulkan):
                 errors.append(f"{name}: imports {dependency}, which neither the bundle nor Windows provides")
-    errors.extend(runtime_version_errors(images))
+    errors.extend(runtime_version_errors(images, msvc_toolset))
     return errors
 
 
-def require_bundle(images: dict[str, PeImage], primary: str, *, allow_vulkan: bool) -> None:
+def require_bundle(images: dict[str, PeImage], primary: str, info: dict, *, allow_vulkan: bool) -> None:
     if primary.lower() not in images:
         raise PeError(f"Windows runtime bundle is missing {primary}")
-    errors = bundle_errors(images, "x64", allow_vulkan=allow_vulkan)
+    errors = bundle_errors(images, "x64", allow_vulkan=allow_vulkan,
+                           msvc_toolset=info.get("windowsMsvcToolset"))
+    errors.extend(crt_receipt_errors(images, info))
     if errors:
         raise PeError("Windows runtime bundle is incomplete:\n" + "\n".join(f"- {error}" for error in errors))
 
 
-def runtime_version_errors(images: dict[str, PeImage]) -> list[str]:
+def runtime_version_errors(images: dict[str, PeImage], msvc_toolset: str | None) -> list[str]:
     runtime = {name: image.file_version for name, image in images.items() if is_vc_runtime(name)}
     if not runtime:
         return []
@@ -341,6 +366,14 @@ def runtime_version_errors(images: dict[str, PeImage]) -> list[str]:
         listed = ", ".join(f"{name} {format_version(version)}" for name, version in sorted(runtime.items()))
         return [f"Visual C++ runtime DLLs come from different redistributables: {listed}"]
     version = next(iter(runtime.values()))
+    if not isinstance(msvc_toolset, str) or not TOOLSET_VERSION.fullmatch(msvc_toolset):
+        return ["missing or invalid full MSVC toolset version"]
+    parts = tuple(map(int, msvc_toolset.split(".")))
+    minimum = parts + (0,) * (4 - len(parts))
+    if version < minimum:
+        return [f"bundled Visual C++ runtime {format_version(version)} is older than "
+                f"MSVC toolset {format_version(minimum)}"]
+
     errors = []
     for name, image in sorted(images.items()):
         if not any(is_vc_runtime(dependency) for dependency in image.all_imports()):
@@ -387,7 +420,52 @@ def vc_redist_dir() -> Path:
     return vc_dir / "Redist" / "MSVC" / version
 
 
-def stage_vc_runtime(stage_dir: Path, arch: str, redist_dir: Path, *, allow_vulkan: bool) -> list[str]:
+def crt_digests(images: dict[str, PeImage]) -> dict[str, str]:
+    return {name: image.crt_sha256 for name, image in images.items() if image.crt_sha256 is not None}
+
+
+def crt_receipt_errors(images: dict[str, PeImage], info: dict) -> list[str]:
+    expected = crt_digests(images)
+    if expected and info.get("windowsCrtSha256") != expected:
+        return ["bundled Visual C++ DLLs do not match the Windows build's signature-checked bytes"]
+    return []
+
+
+def microsoft_signature_errors(paths: list[Path]) -> list[str]:
+    if not paths:
+        return []
+    if sys.platform != "win32":
+        return ["Microsoft Authenticode verification requires Windows"]
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$paths = ConvertFrom-Json $env:SD_NATIVE_SIGNATURE_PATHS
+$failed = $false
+foreach ($path in $paths) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $path
+    if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or
+        $signature.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') {
+        [Console]::WriteLine("$([IO.Path]::GetFileName($path)): Microsoft Authenticode verification failed ($($signature.Status), $($signature.SignatureType), $($signature.SignerCertificate.Subject))")
+        $failed = $true
+    }
+}
+if ($failed) { exit 1 }
+"""
+    system_root = Path(os.environ["SystemRoot"])
+    powershell = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+         base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+        env={**os.environ, "SD_NATIVE_SIGNATURE_PATHS": json.dumps([str(path.resolve()) for path in paths])},
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode:
+        return (result.stdout.strip() or result.stderr.strip()
+                or "Microsoft Authenticode verification failed").splitlines()
+    return []
+
+
+def stage_vc_runtime(stage_dir: Path, arch: str, redist_dir: Path, *, allow_vulkan: bool,
+                     msvc_toolset: str) -> list[str]:
     """Stage the VC++ redistributables needed by every DLL in the bundle."""
     staged: list[str] = []
     images = read_bundle(stage_dir)
@@ -407,12 +485,15 @@ def stage_vc_runtime(stage_dir: Path, arch: str, redist_dir: Path, *, allow_vulk
                     f"Windows bundle imports {name}, which is neither bundled, provided by "
                     f"Windows, nor in {redist_dir / arch / VC_RUNTIME_FOLDER}"
                 )
+            signature_errors = microsoft_signature_errors([source])
+            if signature_errors:
+                raise PeError("\n".join(signature_errors))
             shutil.copyfile(source, stage_dir / name)
             images[name] = read_pe(stage_dir / name)
             staged.append(name)
             print(f"Staged Visual C++ runtime {name} {format_version(images[name].file_version or ())}",
                   flush=True)
-    errors = bundle_errors(images, arch, allow_vulkan=allow_vulkan)
+    errors = bundle_errors(images, arch, allow_vulkan=allow_vulkan, msvc_toolset=msvc_toolset)
     if errors:
         raise PeError("Windows runtime bundle is incomplete:\n" + "\n".join(f"- {error}" for error in errors))
     return staged

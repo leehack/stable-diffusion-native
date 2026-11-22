@@ -18,7 +18,7 @@ import package_release
 import validate_artifacts
 from vulkan_tri import GENERATED_MODULE
 import test_prepared_release as prepared_tests
-from test_windows_runtime import windows_libraries
+from test_windows_runtime import TOOLSET, windows_libraries, windows_metadata
 
 FIXTURE = ROOT / 'tests/fixtures/vulkan/tri_f16.spv'
 TARGET = build.TARGETS['windows-x64-vulkan']
@@ -59,7 +59,10 @@ class VulkanEntryPointTest(unittest.TestCase):
         (self.target / 'symbols').mkdir()
         shutil.copy2(self.library, self.target / 'symbols' / TARGET.library)
         self.info = {'target': TARGET.name, 'upstream': {}, 'accelerators': ['cpu', 'vulkan'],
-                     'vulkanTriF16': module_record(FIXTURE.read_bytes())}
+                     'vulkanTriF16': module_record(FIXTURE.read_bytes()), **windows_metadata(self.libraries)}
+        signatures = patch('windows_runtime.microsoft_signature_errors', return_value=[])
+        signatures.start()
+        self.addCleanup(signatures.stop)
         self.write_info()
 
     def write_library(self, shader):
@@ -114,6 +117,7 @@ class VulkanEntryPointTest(unittest.TestCase):
         generated = build_root / TARGET.name / GENERATED_MODULE
         generated.parent.mkdir(parents=True)
         generated.write_bytes(FIXTURE.read_bytes())
+        (build_root / TARGET.name / 'sd_native_msvc_toolset.txt').write_text(TOOLSET)
         (build_root / TARGET.name / 'sd_native_applied_patches.txt').write_text('pickle_line_span.patch\n')
         (build_root / TARGET.name / 'sd_native_apple_allocator_selection.txt').write_text('upstream-experimental\n')
         with patch.object(build, 'BUILD_ROOT', build_root), patch.object(build, 'BIN_ROOT', self.bin), \

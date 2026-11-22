@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -90,6 +92,7 @@ RUNTIME_IMPORTS = {
     "vcruntime140_1.dll": ["__CxxFrameHandler4"],
 }
 VERSION = (14, 44, 35211, 0)
+TOOLSET = "14.44.35207"
 
 
 def windows_libraries(*, vulkan=False):
@@ -109,6 +112,16 @@ def windows_libraries(*, vulkan=False):
     }
 
 
+def windows_metadata(libraries):
+    return {
+        "windowsMsvcToolset": TOOLSET,
+        "windowsCrtSha256": {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in libraries.items() if windows_runtime.is_vc_runtime(name)
+        },
+    }
+
+
 class WindowsRuntimeTest(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -118,9 +131,17 @@ class WindowsRuntimeTest(unittest.TestCase):
         root = self.bin / self.target.name
         self.lib = root / "lib"
         self.lib.mkdir(parents=True)
-        (root / "build-info.json").write_text(json.dumps({"target": self.target.name}))
         self.libraries = windows_libraries()
+        self.write_info(self.libraries)
+        self.signature_mock = patch.object(windows_runtime, "microsoft_signature_errors", return_value=[])
+        self.signature_mock.start()
+        self.addCleanup(self.signature_mock.stop)
         (self.lib / self.target.library).write_bytes(self.libraries[self.target.library])
+
+    def write_info(self, libraries):
+        (self.lib.parent / "build-info.json").write_text(json.dumps({
+            "target": self.target.name, "accelerators": ["cpu"], **windows_metadata(libraries),
+        }))
 
     def validate(self):
         with patch.multiple(validate_artifacts, BIN_ROOT=self.bin, HEADERS=[]):
@@ -135,7 +156,7 @@ class WindowsRuntimeTest(unittest.TestCase):
             (self.lib / name).write_bytes(payload)
         self.assertEqual(self.validate(), [])
         (self.lib / "msvcp140_codecvt_ids.dll").unlink()
-        self.assertEqual(len(self.validate()), 1)
+        self.assertTrue(any("imports msvcp140_codecvt_ids.dll" in error for error in self.validate()))
 
 
     def test_stage_follows_transitive_imports_from_the_desktop_redist(self):
@@ -148,8 +169,9 @@ class WindowsRuntimeTest(unittest.TestCase):
             (desktop / name).write_bytes(make_pe(imports=imports, exports=symbols, file_version=VERSION))
         with patch.dict("os.environ", {"VCToolsRedistDir": str(redist)}):
             self.assertEqual(windows_runtime.vc_redist_dir(), redist)
-        staged = windows_runtime.stage_vc_runtime(self.lib, "x64", redist, allow_vulkan=False)
+        staged = windows_runtime.stage_vc_runtime(self.lib, "x64", redist, allow_vulkan=False, msvc_toolset=TOOLSET)
         self.assertEqual(staged, ["msvcp140.dll", "vcruntime140.dll"])
+        self.write_info({name: (self.lib / name).read_bytes() for name in staged})
         self.assertEqual(self.validate(), [])
 
     def test_staging_has_no_onecore_or_debug_fallback(self):
@@ -159,13 +181,12 @@ class WindowsRuntimeTest(unittest.TestCase):
             directory.mkdir(parents=True)
             (directory / "msvcp140.dll").write_bytes(self.libraries["msvcp140.dll"])
         with self.assertRaisesRegex(RuntimeError, "imports msvcp140.dll"):
-            windows_runtime.stage_vc_runtime(self.lib, "x64", redist, allow_vulkan=False)
+            windows_runtime.stage_vc_runtime(self.lib, "x64", redist, allow_vulkan=False, msvc_toolset=TOOLSET)
         self.assertFalse((self.lib / "msvcp140.dll").exists())
 
     def test_archive_packaging_checks_closure_and_lists_runtime_libraries(self):
         dist = self.bin / "dist"
         root = self.lib.parent
-        (root / "build-info.json").write_text(json.dumps({"accelerators": ["cpu"]}))
         (root / "symbols").mkdir()
         (root / "symbols" / self.target.library).write_bytes(self.libraries[self.target.library])
         with patch.multiple(package_release, BIN_ROOT=self.bin, HEADERS=[]), patch.object(
@@ -198,7 +219,7 @@ class WindowsRuntimeTest(unittest.TestCase):
             (self.lib / name).write_bytes(payload)
         self.assertIn("imports vulkan-1.dll", self.validate()[0])
         images = windows_runtime.read_bundle(self.lib)
-        self.assertEqual(windows_runtime.bundle_errors(images, "x64", allow_vulkan=True), [])
+        self.assertEqual(windows_runtime.bundle_errors(images, "x64", allow_vulkan=True, msvc_toolset=TOOLSET), [])
 
     def test_rejects_mismatched_arch_exports_and_runtime_version(self):
         for name, payload in self.libraries.items():
@@ -210,7 +231,7 @@ class WindowsRuntimeTest(unittest.TestCase):
             self.assertTrue(any(expected in problem for problem in problems), problems)
         vcruntime.write_bytes(self.libraries["vcruntime140.dll"])
         (self.lib / self.target.library).write_bytes(make_pe(linker=(14, 51), imports=RUNTIME_IMPORTS))
-        self.assertIn("linked by MSVC 14.51, newer than", self.validate()[0])
+        self.assertTrue(any("linked by MSVC 14.51, newer than" in error for error in self.validate()))
 
     def test_delay_loads_are_checked(self):
         (self.lib / self.target.library).write_bytes(make_pe(
@@ -220,3 +241,72 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(image.imports, {})
         self.assertEqual(image.delay_imports, {"msvcp140_codecvt_ids.dll": frozenset({"codecvt_id"})})
         self.assertIn("imports msvcp140_codecvt_ids.dll", self.validate()[0])
+
+    def test_staging_and_validation_reject_unsigned_runtime(self):
+        redist = self.bin / "redist"
+        desktop = redist / "x64/Microsoft.VC144.CRT"
+        desktop.mkdir(parents=True)
+        for name in RUNTIME_IMPORTS:
+            (desktop / name).write_bytes(self.libraries[name])
+        error = "msvcp140.dll: Microsoft Authenticode verification failed (NotSigned)"
+        with patch.object(windows_runtime, "microsoft_signature_errors", return_value=[error]) as signatures:
+            with self.assertRaisesRegex(windows_runtime.PeError, "NotSigned"):
+                windows_runtime.stage_vc_runtime(
+                    self.lib, "x64", redist, allow_vulkan=False, msvc_toolset=TOOLSET
+                )
+            self.assertFalse((self.lib / "msvcp140.dll").exists())
+            self.assertEqual(signatures.call_args.args[0], [desktop / "msvcp140.dll"])
+            for name, payload in self.libraries.items():
+                (self.lib / name).write_bytes(payload)
+            self.assertIn(error, self.validate())
+            self.assertEqual(set(signatures.call_args.args[0]), {self.lib / name for name in RUNTIME_IMPORTS})
+
+    def test_unknown_api_set_is_rejected_as_a_regular_or_delayed_import(self):
+        for table in ("imports", "delay_imports"):
+            for name in ("api-ms-win-crt-made-up-l1-1-0.dll", "ext-ms-win-made-up-l1-1-0.dll"):
+                with self.subTest(table=table, name=name):
+                    imports = {name: ["probe"], "api-ms-win-crt-heap-l1-1-0.dll": ["free"]}
+                    (self.lib / self.target.library).write_bytes(make_pe(**{table: imports}))
+                    self.assertTrue(any(f"imports {name}," in error for error in self.validate()))
+
+    def test_same_minor_crt_build_must_cover_the_msvc_toolset(self):
+        (self.lib.parent / "build-info.json").write_text(json.dumps({
+            "target": self.target.name, "windowsMsvcToolset": "14.44.35207",
+        }))
+        for name, symbols in RUNTIME_IMPORTS.items():
+            (self.lib / name).write_bytes(make_pe(exports=symbols, file_version=(14, 44, 1, 0)))
+        self.assertTrue(any("14.44.35207.0" in error for error in self.validate()))
+
+
+    def test_known_api_set_can_be_a_delay_load(self):
+        (self.lib / self.target.library).write_bytes(make_pe(
+            delay_imports={"api-ms-win-crt-heap-l1-1-0.dll": ["free"]}
+        ))
+        self.assertEqual(self.validate(), [])
+
+    @unittest.skipUnless(sys.platform == "win32" and os.environ.get("SD_NATIVE_UNSIGNED_PE"),
+                         "requires an unsigned Windows build")
+    def test_windows_rejects_unsigned_and_modified_pe_files(self):
+        self.signature_mock.stop()
+        primary = Path(os.environ["SD_NATIVE_UNSIGNED_PE"])
+        signed = primary.with_name("msvcp140.dll")
+        self.assertEqual(windows_runtime.microsoft_signature_errors([signed]), [])
+        changed = self.bin / signed.name
+        data = bytearray(signed.read_bytes())
+        data[0x40] ^= 1  # A DOS stub byte is covered by the signature.
+        changed.write_bytes(data)
+        self.assertTrue(windows_runtime.microsoft_signature_errors([changed]))
+        redist = self.bin / "redist"
+        desktop = redist / "x64/Microsoft.VC144.CRT"
+        desktop.mkdir(parents=True)
+        for name in RUNTIME_IMPORTS:
+            (desktop / name).write_bytes(primary.read_bytes())
+            (self.lib / name).write_bytes(primary.read_bytes())
+        problems = self.validate()
+        for name in RUNTIME_IMPORTS:
+            self.assertTrue(any(name in error and "NotSigned" in error for error in problems), problems)
+            (self.lib / name).unlink()
+        with self.assertRaisesRegex(windows_runtime.PeError, "NotSigned"):
+            windows_runtime.stage_vc_runtime(
+                self.lib, "x64", redist, allow_vulkan=False, msvc_toolset=TOOLSET
+            )

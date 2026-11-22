@@ -146,8 +146,14 @@ def validate(target: Target, *, dumpbin: str | None = None) -> list[str]:
         images = windows_runtime.read_bundle(library.parent)
         exported = images[target.library.lower()].exports
         problems.extend(windows_runtime.bundle_errors(
-            images, "x64", allow_vulkan="vulkan" in target.accelerators
+            images, "x64", allow_vulkan="vulkan" in target.accelerators,
+            msvc_toolset=info.get("windowsMsvcToolset"),
         ))
+        problems.extend(windows_runtime.crt_receipt_errors(images, info))
+        problems.extend(windows_runtime.microsoft_signature_errors([
+            path for path in sorted(library.parent.iterdir())
+            if path.is_file() and windows_runtime.is_vc_runtime(path.name)
+        ]))
         if dumpbin:
             problems.extend(windows_runtime.dumpbin_errors(dumpbin, library.parent, images))
     else:

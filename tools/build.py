@@ -254,15 +254,22 @@ def build(target: Target, jobs: int) -> Path:
     built = find_library(work_dir, target.library)
     shutil.copy2(built, out_dir / "symbols" / target.library)
     strip(target, built, out_dir / "lib" / target.library)
-    libraries = [target.library]
+    windows_info = {}
     if target.os == "windows":
         import_lib = next(work_dir.rglob("stable-diffusion.lib"), None)
         if import_lib:
             shutil.copy2(import_lib, out_dir / "lib" / import_lib.name)
-        from windows_runtime import stage_vc_runtime, vc_redist_dir
-        libraries.extend(sorted(stage_vc_runtime(
-            out_dir / "lib", "x64", vc_redist_dir(), allow_vulkan="vulkan" in target.accelerators
-        )))
+        from windows_runtime import crt_digests, read_bundle, stage_vc_runtime, vc_redist_dir
+        toolset = (work_dir / "sd_native_msvc_toolset.txt").read_text().strip()
+        staged = stage_vc_runtime(
+            out_dir / "lib", "x64", vc_redist_dir(), allow_vulkan="vulkan" in target.accelerators,
+            msvc_toolset=toolset,
+        )
+        windows_info = {
+            "libraries": [target.library, *sorted(staged)],
+            "windowsMsvcToolset": toolset,
+            "windowsCrtSha256": crt_digests(read_bundle(out_dir / "lib")),
+        }
     for header in HEADERS:
         shutil.copy2(header, out_dir / "include" / header.name)
 
@@ -276,7 +283,7 @@ def build(target: Target, jobs: int) -> Path:
         "target": target.name,
         "os": target.os,
         "library": target.library,
-        "libraries": libraries,
+        **windows_info,
         "accelerators": list(target.accelerators),
         "upstream": upstream_info(),
         # upstream.patches is the retained patch inventory, including historical

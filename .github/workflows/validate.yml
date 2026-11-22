@@ -164,6 +164,11 @@ jobs:
           python tools/validate_artifacts.py ${{ matrix.target }} "${args[@]}"
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - name: Check that unsigned Visual C++ fixtures are rejected
+        if: matrix.target == 'windows-x64'
+        run: python -m unittest discover -s tests -p test_windows_runtime.py -v
+        env:
+          SD_NATIVE_UNSIGNED_PE: bin/windows-x64/lib/stable-diffusion.dll
       - name: Load the app-local Visual C++ runtime
         if: runner.os == 'Windows'
         shell: pwsh

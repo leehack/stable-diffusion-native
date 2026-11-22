@@ -28,9 +28,10 @@ The build copies the required DLLs from
 Studio environment, it locates the default x64 toolset using `vswhere.exe`.
 The distributable files are listed in Visual Studio's `redist.txt`
 ([Microsoft redistribution terms](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)).
-The lookup is limited to the desktop redistributable directory. The build
-refreshes these files each release because Windows Update does not service
-app-local copies.
+The lookup is limited to the desktop redistributable directory. Before
+staging, Windows must report a valid embedded Authenticode signature from
+Microsoft Corporation for each file. The build refreshes these files each
+release because Windows Update does not service app-local copies.
 
 A Windows process reuses a runtime DLL of the same name if it is already
 loaded. If an application also ships those DLLs, deploy copies at least as
@@ -39,10 +40,18 @@ new as the version staged by the build.
 ## Validation
 
 The build, artifact validator, release packager, and prepared-release replay
-check the regular and delay-load imports of every bundled DLL. They check PE
-architecture, the symbols provided by bundled dependencies, and the bundled
-runtime versions. Windows CI cross-checks the import names with
-`dumpbin /dependents`. It also runs a statically linked host that calls
+check regular and delay-load imports against the same allowlist of Windows
+libraries and known API sets. They check PE architecture and the symbols
+provided by bundled dependencies. Windows build metadata records the full
+MSVC toolset version selected by CMake and the hashes of the staged CRT files.
+The CRT file version must meet that toolset version, including the build and
+revision components.
+
+Run Windows artifact validation on Windows. It checks Authenticode again on
+the staged DLLs and Windows CI compares the import names with
+`dumpbin /dependents`. Packaging and replay on other hosts check the CRT
+hashes against the Windows build metadata from the verified workflow
+artifacts. CI also runs a statically linked host that calls
 `sd_version` and `sd_commit` and checks that all four VC++ DLLs loaded from the
 bundle directory. A stock Windows Server 2022 load check verifies the same
 behavior without a machine-wide Redistributable.

@@ -84,7 +84,7 @@ def main() -> None:
         lib_dir = root / "lib"
         if target.os == "windows":
             from windows_runtime import read_bundle, require_bundle
-            require_bundle(read_bundle(lib_dir), target.library, allow_vulkan="vulkan" in target.accelerators)
+            require_bundle(read_bundle(lib_dir), target.library, info, allow_vulkan="vulkan" in target.accelerators)
         runtime = args.dist / f"{PACKAGE}-runtime-{name}-{args.tag}.tar.gz"
         entries = {
             f"lib/{p.name}": p for p in sorted(lib_dir.iterdir())
@@ -109,7 +109,7 @@ def main() -> None:
                 **({"libraries": sorted(
                     p.name for p in lib_dir.iterdir() if p.is_file()
                     and p.suffix.lower() in (".dll", ".so", ".dylib")
-                )} if kind == "runtime" else {}),
+                )} if kind == "runtime" and target.os == "windows" else {}),
                 "accelerators": info["accelerators"],
             })
 

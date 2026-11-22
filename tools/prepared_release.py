@@ -164,7 +164,7 @@ def verify_dist(dist: Path, tag: str, source: str, digest: str, upstream: str) -
                     from windows_runtime import read_pe_bytes, require_bundle
                     images = {name.lower(): read_pe_bytes(name, archive.extractfile(member).read())
                               for name, member in libraries.items() if name.lower().endswith(".dll")}
-                    require_bundle(images, target.library, allow_vulkan="vulkan" in target.accelerators)
+                    require_bundle(images, target.library, info, allow_vulkan="vulkan" in target.accelerators)
                 if 'vulkan' in target.accelerators:
                     from vulkan_tri import validate_artifact_bytes
                     library = libraries.get(target.library)
