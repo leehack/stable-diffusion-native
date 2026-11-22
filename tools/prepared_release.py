@@ -152,17 +152,28 @@ def verify_dist(dist: Path, tag: str, source: str, digest: str, upstream: str) -
                 require(info["target"] == key[0] and info["upstream"] == manifest["upstream"],
                         "archive build source mismatch")
                 target = TARGETS[key[0]]
+                libraries = {name.removeprefix("lib/"): member for name, member in members.items()
+                             if name.startswith("lib/") and name.count("/") == 1 and member.isfile()
+                             and name.lower().endswith((".dll", ".so", ".dylib"))}
+                if "libraries" in artifact:
+                    declared = artifact["libraries"]
+                    require(isinstance(declared, list) and all(isinstance(name, str) for name in declared)
+                            and len(declared) == len(libraries) and set(declared) == libraries.keys()
+                            and target.library in declared, "manifest runtime library inventory mismatch")
+                if target.os == "windows":
+                    from windows_runtime import read_pe_bytes, require_bundle
+                    images = {name.lower(): read_pe_bytes(name, archive.extractfile(member).read())
+                              for name, member in libraries.items() if name.lower().endswith(".dll")}
+                    require_bundle(images, target.library, allow_vulkan="vulkan" in target.accelerators)
                 if 'vulkan' in target.accelerators:
                     from vulkan_tri import validate_artifact_bytes
-                    libraries = [e for name, e in members.items()
-                                 if name == f'lib/{target.library}']
-                    require(len(libraries) == 1 and libraries[0].isfile(),
-                            'missing or ambiguous Vulkan runtime library')
+                    library = libraries.get(target.library)
+                    require(library is not None, 'missing or ambiguous Vulkan runtime library')
                     # Legacy build-info lacks the auxiliary captured-module
                     # field. Its actual bytes pass the identical layout/flow
                     # proof; a present but malformed field is never legacy.
                     allow_legacy = 'vulkanTriF16' not in info
-                    validate_artifact_bytes(archive.extractfile(libraries[0]).read(),
+                    validate_artifact_bytes(archive.extractfile(library).read(),
                                             info.get('vulkanTriF16'),
                                             allow_legacy=allow_legacy)
     require(seen == set(expected), "manifest is missing release targets")

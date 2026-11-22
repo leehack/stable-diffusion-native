@@ -81,9 +81,13 @@ def main() -> None:
         if 'vulkan' in target.accelerators:
             from vulkan_tri import validate_artifact
             validate_artifact(root / 'lib' / target.library, info.get('vulkanTriF16'))
+        lib_dir = root / "lib"
+        if target.os == "windows":
+            from windows_runtime import read_bundle, require_bundle
+            require_bundle(read_bundle(lib_dir), target.library, allow_vulkan="vulkan" in target.accelerators)
         runtime = args.dist / f"{PACKAGE}-runtime-{name}-{args.tag}.tar.gz"
         entries = {
-            f"lib/{p.name}": p for p in sorted((root / "lib").iterdir())
+            f"lib/{p.name}": p for p in sorted(lib_dir.iterdir())
         }
         for header in HEADERS:
             entries[f"include/{header.name}"] = root / "include" / header.name
@@ -102,6 +106,10 @@ def main() -> None:
                 "sha256": sha256(path),
                 "size": path.stat().st_size,
                 "library": target.library,
+                **({"libraries": sorted(
+                    p.name for p in lib_dir.iterdir() if p.is_file()
+                    and p.suffix.lower() in (".dll", ".so", ".dylib")
+                )} if kind == "runtime" else {}),
                 "accelerators": info["accelerators"],
             })
 
