@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import prepared_release as release
+from test_windows_runtime import RUNTIME_IMPORTS, make_pe, windows_libraries, windows_metadata
 
 TAG = "v0.3.0-2"
 SOURCE = "1" * 40
@@ -37,27 +38,44 @@ class DistributionTest(unittest.TestCase):
             for kind in ("runtime", "symbols"):
                 name = f"{release.PACKAGE}-{kind}-{target}-{TAG}.tar.gz"
                 path = self.dist / name
-                with tarfile.open(path, "w:gz") as archive:
-                    build_info = {"target": target, "upstream": self.manifest["upstream"]}
-                    if kind == 'runtime' and 'vulkan' in release.TARGETS[target].accelerators:
-                        module = Path(__file__).parent / 'fixtures/vulkan/tri_f16.spv'
-                        payload = module.read_bytes()
-                        build_info['vulkanTriF16'] = {'schemaVersion': 1,
-                            'sha256': hashlib.sha256(payload).hexdigest(),
-                            'spirv_hex': payload.hex()}
-                        library = tarfile.TarInfo('lib/' + release.TARGETS[target].library)
-                        library.size = len(payload)
-                        archive.addfile(library, io.BytesIO(payload))
-                    info = json.dumps(build_info).encode()
-                    entry = tarfile.TarInfo("build-info.json")
-                    entry.size = len(info)
-                    archive.addfile(entry, io.BytesIO(info))
+                self.write_runtime_fixture(path, target, kind)
                 self.add_artifact(target, kind, path)
         path = self.dist / f"{release.PACKAGE}-apple-xcframework-{TAG}.zip"
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("example", b"xcframework")
         self.add_artifact("apple", "xcframework", path)
         self.write_manifest()
+
+    def write_runtime_fixture(self, path, target_name, kind, *, change_libraries=None,
+                              change_metadata=None):
+        target = release.TARGETS[target_name]
+        build_info = {"target": target_name, "upstream": self.manifest["upstream"]}
+        libraries = {}
+        vulkan = "vulkan" in target.accelerators
+        if kind == "runtime":
+            if target.os == "windows":
+                libraries = windows_libraries(vulkan=vulkan)
+            if vulkan:
+                payload = (Path(__file__).parent / "fixtures/vulkan/tri_f16.spv").read_bytes()
+                build_info["vulkanTriF16"] = {
+                    "schemaVersion": 1, "sha256": hashlib.sha256(payload).hexdigest(),
+                    "spirv_hex": payload.hex(),
+                }
+                pe = libraries.get(target.library, b"")
+                libraries[target.library] = pe + bytes(-len(pe) % 4) + payload
+        if target.os == "windows" and kind == "runtime":
+            build_info.update(windows_metadata(libraries))
+        if change_libraries:
+            change_libraries(libraries)
+        if change_metadata:
+            change_metadata(build_info, libraries)
+        with tarfile.open(path, "w:gz") as archive:
+            entries = {"build-info.json": json.dumps(build_info).encode()}
+            entries.update({f"lib/{name}": payload for name, payload in libraries.items()})
+            for name, payload in entries.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(payload)
+                archive.addfile(entry, io.BytesIO(payload))
 
     def add_artifact(self, target, kind, path):
         self.manifest["artifacts"].append({"target": target, "kind": kind,
@@ -113,6 +131,69 @@ class DistributionTest(unittest.TestCase):
         artifact.update(sha256=release.sha256(path), size=path.stat().st_size)
         self.write_manifest()
         with self.assertRaisesRegex(ValueError, "build source"):
+            self.verify()
+
+    def test_windows_runtime_imports_checked_even_with_updated_hashes(self):
+        for target in ("windows-x64", "windows-x64-vulkan"):
+            artifact = next(a for a in self.manifest["artifacts"]
+                            if a["target"] == target and a["kind"] == "runtime")
+            path = self.dist / artifact["file"]
+            for unexpected, missing, error in (
+                (None, "msvcp140_codecvt_ids.dll", "imports msvcp140_codecvt_ids"),
+                ("vcruntime140d.dll", None, "may not be redistributed"),
+            ):
+                with self.subTest(target=target, unexpected=unexpected, missing=missing):
+                    def mutate(libraries):
+                        if missing:
+                            del libraries[missing]
+                        if unexpected:
+                            libraries[unexpected] = libraries["vcruntime140.dll"]
+
+                    self.write_runtime_fixture(path, target, "runtime", change_libraries=mutate)
+                    artifact.update(sha256=release.sha256(path), size=path.stat().st_size)
+                    self.write_manifest()
+                    with self.assertRaisesRegex(ValueError, error):
+                        self.verify()
+            self.write_runtime_fixture(path, target, "runtime")
+            artifact.update(sha256=release.sha256(path), size=path.stat().st_size)
+            self.write_manifest()
+
+    def test_replay_checks_full_toolset_floor_and_pinned_crt_bytes(self):
+        artifact = next(a for a in self.manifest["artifacts"]
+                        if a["target"] == "windows-x64" and a["kind"] == "runtime")
+        path = self.dist / artifact["file"]
+
+        def older_runtime(libraries):
+            for name, symbols in RUNTIME_IMPORTS.items():
+                libraries[name] = make_pe(exports=symbols, file_version=(14, 44, 1, 0))
+
+        def change_signed_bytes(libraries):
+            libraries["msvcp140_codecvt_ids.dll"] += b"changed"
+
+        for mutate, rewrite_receipt, expected in (
+            (older_runtime, True, "older than MSVC toolset 14.44.35207.0"),
+            (change_signed_bytes, False, "signature-checked bytes"),
+        ):
+            with self.subTest(expected=expected):
+                self.write_runtime_fixture(
+                    path, "windows-x64", "runtime", change_libraries=mutate,
+                    change_metadata=lambda info, libs: info.update(windows_metadata(libs))
+                    if rewrite_receipt else None,
+                )
+                artifact.update(sha256=release.sha256(path), size=path.stat().st_size)
+                self.write_manifest()
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.verify()
+
+    def test_manifest_runtime_libraries_match_the_archive(self):
+        artifact = next(a for a in self.manifest["artifacts"]
+                        if a["target"] == "windows-x64" and a["kind"] == "runtime")
+        artifact["libraries"] = sorted(windows_libraries())
+        self.write_manifest()
+        self.verify()
+        artifact["libraries"].remove("msvcp140_codecvt_ids.dll")
+        self.write_manifest()
+        with self.assertRaisesRegex(ValueError, "manifest runtime library inventory mismatch"):
             self.verify()
 
     def test_download_envelope_rejects_unsafe_members(self):

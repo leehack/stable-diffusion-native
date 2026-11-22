@@ -146,6 +146,11 @@ jobs:
       - uses: ./.github/actions/setup-toolchain
         with:
           target: ${{ matrix.target }}
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4.1.0
+        with:
+          arch: x64
       - name: Build
         shell: bash
         run: python tools/build.py build --target ${{ matrix.target }}
@@ -153,9 +158,26 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
       - name: Validate exports and dependencies
         shell: bash
-        run: python tools/validate_artifacts.py ${{ matrix.target }}
+        run: |
+          args=()
+          if [[ "$RUNNER_OS" == Windows ]]; then args+=(--dumpbin dumpbin); fi
+          python tools/validate_artifacts.py ${{ matrix.target }} "${args[@]}"
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - name: Check that unsigned Visual C++ fixtures are rejected
+        if: matrix.target == 'windows-x64'
+        run: python -m unittest discover -s tests -p test_windows_runtime.py -v
+        env:
+          SD_NATIVE_UNSIGNED_PE: bin/windows-x64/lib/stable-diffusion.dll
+      - name: Load the app-local Visual C++ runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP "windows_load_smoke.exe"
+          cl /nologo /MT /W4 tools/windows_load_smoke.c /Fe:$smoke
+          if ($LASTEXITCODE) { throw "Failed to build the Windows load smoke" }
+          & $smoke "bin/${{ matrix.target }}/lib" stable-diffusion.dll
+          if ($LASTEXITCODE) { throw "Windows bundle did not load its own runtime" }
       - name: Load and list devices
         # Linux Vulkan runs on Mesa lavapipe (software): functional check only.
         if: matrix.smoke
@@ -164,6 +186,20 @@ jobs:
         env:
           # ggml skips CPU-type Vulkan devices such as lavapipe unless listed.
           GGML_VK_VISIBLE_DEVICES: "0"
+      - name: Stage the Windows load check artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item "windows-load-check" -ItemType Directory
+          Copy-Item "bin/${{ matrix.target }}/lib/*.dll" "windows-load-check"
+          Copy-Item "$env:RUNNER_TEMP/windows_load_smoke.exe" "windows-load-check"
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: smoke-${{ matrix.target }}
+          path: windows-load-check/
+          if-no-files-found: error
+          retention-days: 7
       - name: Check the context defaults and conversion ABI
         if: runner.os != 'Windows' && matrix.smoke
         run: python3 -m unittest discover -s tests -p test_runtime_api.py -v

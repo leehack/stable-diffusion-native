@@ -73,10 +73,19 @@ class ReleaseWorkflowTest(unittest.TestCase):
         owners = (ROOT / '.github/CODEOWNERS').read_text().splitlines()
         for path in ('tools/build.py', 'tools/validate_artifacts.py',
                      'tools/package_release.py', 'tools/prepared_release.py',
-                     'tools/vulkan_tri.py', 'tools/runtime_archive.py'):
+                     'tools/vulkan_tri.py', 'tools/runtime_archive.py',
+                     'tools/windows_runtime.py', 'tools/windows_load_smoke.c'):
             with self.subTest(path=path):
                 self.assertTrue((ROOT / path).is_file())
                 self.assertIn('/' + path + ' @leehack', owners)
+
+    def test_windows_builds_check_app_local_runtime(self):
+        for name in ("validate.yml", "native_release.yml"):
+            with self.subTest(workflow=name):
+                workflow = (ROOT / ".github/workflows" / name).read_text()
+                self.assertIn("TheMrMilchmann/setup-msvc-dev@", workflow)
+                self.assertIn("--dumpbin dumpbin", workflow)
+                self.assertIn("cl /nologo /MT /W4 tools/windows_load_smoke.c", workflow)
 
     def test_publication_requires_explicit_opt_in(self):
         workflow = (ROOT / ".github/workflows/native_release.yml").read_text()

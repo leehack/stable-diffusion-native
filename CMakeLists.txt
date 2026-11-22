@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.18)
 project(stable_diffusion_native LANGUAGES C CXX)
 
+if(WIN32 AND MSVC)
+    # The PE linker version has only major and minor fields.
+    file(TO_CMAKE_PATH "${CMAKE_CXX_COMPILER}" sd_msvc_compiler)
+    if(NOT sd_msvc_compiler MATCHES "/VC/Tools/MSVC/([0-9]+[.][0-9]+[.][0-9]+([.][0-9]+)?)/bin/")
+        message(FATAL_ERROR "Cannot determine the MSVC toolset version from ${CMAKE_CXX_COMPILER}")
+    endif()
+    file(WRITE "${CMAKE_BINARY_DIR}/sd_native_msvc_toolset.txt" "${CMAKE_MATCH_1}\n")
+endif()
+
 set(SD_NATIVE_UPSTREAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stable-diffusion.cpp")
 if(NOT EXISTS "${SD_NATIVE_UPSTREAM_DIR}/CMakeLists.txt")
     message(FATAL_ERROR

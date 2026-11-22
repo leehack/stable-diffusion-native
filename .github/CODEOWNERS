@@ -8,3 +8,7 @@
 /tests/test_vulkan_tri*.py @leehack
 /tests/fixtures/vulkan/ @leehack
 /docs/vulkan_tri_guard.md @leehack
+/tools/windows_runtime.py @leehack
+/tools/windows_load_smoke.c @leehack
+/tests/test_windows_runtime.py @leehack
+/docs/windows_vc_runtime.md @leehack

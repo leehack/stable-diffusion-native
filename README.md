@@ -49,6 +49,10 @@ Vulkan variants link the Vulkan loader (`libvulkan.so.1`, `vulkan-1.dll`) and
 fail to load without it; consumers fall back to the CPU variant. CI checks them
 on Mesa lavapipe only, so GPU performance still needs hardware runs.
 
+Windows archives ship the [app-local Visual C++ runtime](docs/windows_vc_runtime.md)
+beside `stable-diffusion.dll`. Keep the bundled DLLs together when deploying.
+The original v0.4.0 archives still require the x64 Visual C++ Redistributable.
+
 Affected GLSL compilers can compile `tri_f16`'s integer zero constructor to
 NaN. Vulkan builds, packaging and prepared-artifact replay fail unless the
 actual embedded triangle module has a recognized layout and its rejected
@@ -612,7 +616,8 @@ supports.
 
 Outputs:
 
-- `bin/<target>/lib/`: stripped runtime library.
+- `bin/<target>/lib/`: stripped runtime library and, on Windows, the app-local
+  Visual C++ DLLs.
 - `bin/<target>/symbols/`: unstripped library for crash symbolication.
 - `bin/<target>/include/`: `stable-diffusion.h` and `sd_dart_wrapper.h`.
 - `bin/<target>/build-info.json`.
