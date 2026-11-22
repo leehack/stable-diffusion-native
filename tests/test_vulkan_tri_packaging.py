@@ -18,6 +18,7 @@ import package_release
 import validate_artifacts
 from vulkan_tri import GENERATED_MODULE
 import test_prepared_release as prepared_tests
+from test_windows_runtime import windows_libraries
 
 FIXTURE = ROOT / 'tests/fixtures/vulkan/tri_f16.spv'
 TARGET = build.TARGETS['windows-x64-vulkan']
@@ -33,6 +34,10 @@ def bad_module():
     return bytes(data)
 
 
+def dll_with_shader(shader, primary):
+    return primary + bytes(-len(primary) % 4) + shader
+
+
 class VulkanEntryPointTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -42,12 +47,23 @@ class VulkanEntryPointTest(unittest.TestCase):
         self.target = self.bin / TARGET.name
         (self.target / 'lib').mkdir(parents=True)
         self.library = self.target / 'lib' / TARGET.library
-        self.library.write_bytes(FIXTURE.read_bytes())
+        self.libraries = windows_libraries(vulkan=True)
+        self.redist = self.root / 'redist'
+        desktop = self.redist / 'x64/Microsoft.VC144.CRT'
+        desktop.mkdir(parents=True)
+        for name, payload in self.libraries.items():
+            if name != TARGET.library:
+                (self.library.parent / name).write_bytes(payload)
+                (desktop / name).write_bytes(payload)
+        self.write_library(FIXTURE.read_bytes())
         (self.target / 'symbols').mkdir()
         shutil.copy2(self.library, self.target / 'symbols' / TARGET.library)
         self.info = {'target': TARGET.name, 'upstream': {}, 'accelerators': ['cpu', 'vulkan'],
                      'vulkanTriF16': module_record(FIXTURE.read_bytes())}
         self.write_info()
+
+    def write_library(self, shader):
+        self.library.write_bytes(dll_with_shader(shader, self.libraries[TARGET.library]))
 
     def write_info(self):
         (self.target / 'build-info.json').write_text(json.dumps(self.info))
@@ -69,7 +85,7 @@ class VulkanEntryPointTest(unittest.TestCase):
             self.package()
         self.info['vulkanTriF16'] = module_record(FIXTURE.read_bytes())
         self.write_info()
-        self.library.write_bytes(bad_module())
+        self.write_library(bad_module())
         with self.assertRaisesRegex(ValueError, 'positive zero'):
             self.package()
 
@@ -82,13 +98,11 @@ class VulkanEntryPointTest(unittest.TestCase):
 
     def test_artifact_validator_requires_metadata_and_correct_actual_bytes(self):
         with patch.object(validate_artifacts, 'BIN_ROOT', self.bin), \
-             patch.object(validate_artifacts, 'HEADERS', []), \
-             patch.object(validate_artifacts, 'api_symbols', return_value=[]), \
-             patch.object(validate_artifacts, 'exported_symbols', return_value=set()):
+             patch.object(validate_artifacts, 'HEADERS', []):
             self.assertEqual(validate_artifacts.validate(TARGET), [])
-            self.library.write_bytes(bad_module())
+            self.write_library(bad_module())
             self.assertTrue(any('positive zero' in e for e in validate_artifacts.validate(TARGET)))
-            self.library.write_bytes(FIXTURE.read_bytes())
+            self.write_library(FIXTURE.read_bytes())
             del self.info['vulkanTriF16']
             self.write_info()
             self.assertTrue(any('provenance' in e for e in validate_artifacts.validate(TARGET)))
@@ -96,7 +110,7 @@ class VulkanEntryPointTest(unittest.TestCase):
     def test_real_build_rejects_bad_generated_module(self):
         build_root = self.root / 'build'
         source = self.root / 'source.dll'
-        source.write_bytes(FIXTURE.read_bytes())
+        shutil.copy2(self.library, source)
         generated = build_root / TARGET.name / GENERATED_MODULE
         generated.parent.mkdir(parents=True)
         generated.write_bytes(FIXTURE.read_bytes())
@@ -107,6 +121,7 @@ class VulkanEntryPointTest(unittest.TestCase):
              patch.object(build, 'configure_args', return_value=[]), patch.object(build, 'run'), \
              patch.object(build, 'check_wrapper_definitions'), patch.object(build, 'find_library', return_value=source), \
              patch.object(build, 'strip', side_effect=lambda t, s, d: shutil.copy2(s, d)), \
+             patch.dict('os.environ', {'VCToolsRedistDir': str(self.redist)}), \
              patch.object(build, 'upstream_info', return_value={}):
             build.build(TARGET, 1)
             generated.write_bytes(bad_module())
@@ -116,6 +131,7 @@ class VulkanEntryPointTest(unittest.TestCase):
 
 class VulkanReplayTest(unittest.TestCase):
     setUp = prepared_tests.DistributionTest.setUp
+    write_runtime_fixture = prepared_tests.DistributionTest.write_runtime_fixture
     add_artifact = prepared_tests.DistributionTest.add_artifact
     write_manifest = prepared_tests.DistributionTest.write_manifest
     verify = prepared_tests.DistributionTest.verify
@@ -140,7 +156,8 @@ class VulkanReplayTest(unittest.TestCase):
     def test_legacy_auxiliary_absence_proves_same_actual_module(self):
         self.rewrite(lambda info, contents: info.pop('vulkanTriF16'))
         self.verify()
-        self.rewrite(lambda info, contents: contents.update({'lib/' + TARGET.library: bad_module()}))
+        bad_dll = dll_with_shader(bad_module(), windows_libraries(vulkan=True)[TARGET.library])
+        self.rewrite(lambda info, contents: contents.update({'lib/' + TARGET.library: bad_dll}))
         with self.assertRaisesRegex(ValueError, 'positive zero'):
             self.verify()
 
@@ -229,7 +246,8 @@ class VulkanReplayTest(unittest.TestCase):
         for payload in [b'none', bad_module(), FIXTURE.read_bytes() * 2,
                         FIXTURE.read_bytes() + bad_module()]:
             with self.subTest(size=len(payload)):
-                self.rewrite(lambda info, contents, payload=payload:
-                             contents.update({'lib/' + TARGET.library: payload}))
+                dll = dll_with_shader(payload, windows_libraries(vulkan=True)[TARGET.library])
+                self.rewrite(lambda info, contents, dll=dll:
+                             contents.update({'lib/' + TARGET.library: dll}))
                 with self.assertRaises(ValueError):
                     self.verify()
