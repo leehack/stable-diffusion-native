@@ -452,10 +452,14 @@ if ($failed) { exit 1 }
 """
     system_root = Path(os.environ["SystemRoot"])
     powershell = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    env = os.environ.copy()
+    # A pwsh parent can pass down PowerShell 7 modules that Windows PowerShell cannot load.
+    env.pop("PSMODULEPATH", None)
+    env["SD_NATIVE_SIGNATURE_PATHS"] = json.dumps([str(path.resolve()) for path in paths])
     result = subprocess.run(
-        [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        [str(powershell), "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand",
          base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
-        env={**os.environ, "SD_NATIVE_SIGNATURE_PATHS": json.dumps([str(path.resolve()) for path in paths])},
+        env=env,
         capture_output=True, text=True, timeout=120,
     )
     if result.returncode:

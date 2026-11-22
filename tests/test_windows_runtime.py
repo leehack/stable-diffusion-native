@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -284,6 +285,24 @@ class WindowsRuntimeTest(unittest.TestCase):
         ))
         self.assertEqual(self.validate(), [])
 
+    def test_powershell_failure_returns_text_errors_and_uses_the_default_module_path(self):
+        self.signature_mock.stop()
+        fixture = self.lib / "msvcp140.dll"
+        failure = subprocess.CompletedProcess([], 1, "", "Get-AuthenticodeSignature: file not found\n")
+        with (
+            patch.object(windows_runtime.sys, "platform", "win32"),
+            patch.dict(os.environ, {"SystemRoot": "C:\\Windows", "PSMODULEPATH": "PowerShell 7 modules"}),
+            patch.object(windows_runtime.subprocess, "run", return_value=failure) as run,
+        ):
+            self.assertEqual(
+                windows_runtime.microsoft_signature_errors([fixture]),
+                ["Get-AuthenticodeSignature: file not found"],
+            )
+        command = run.call_args.args[0]
+        self.assertIn("-OutputFormat", command)
+        self.assertEqual(command[command.index("-OutputFormat") + 1], "Text")
+        self.assertNotIn("PSMODULEPATH", run.call_args.kwargs["env"])
+
     @unittest.skipUnless(sys.platform == "win32" and os.environ.get("SD_NATIVE_UNSIGNED_PE"),
                          "requires an unsigned Windows build")
     def test_windows_rejects_unsigned_and_modified_pe_files(self):
@@ -295,7 +314,13 @@ class WindowsRuntimeTest(unittest.TestCase):
         data = bytearray(signed.read_bytes())
         data[0x40] ^= 1  # A DOS stub byte is covered by the signature.
         changed.write_bytes(data)
-        self.assertTrue(windows_runtime.microsoft_signature_errors([changed]))
+        problems = windows_runtime.microsoft_signature_errors([changed])
+        self.assertTrue(any(f"{changed.name}: Microsoft Authenticode verification failed" in error
+                            for error in problems), problems)
+        missing = self.bin / "missing.dll"
+        problems = "\n".join(windows_runtime.microsoft_signature_errors([missing]))
+        self.assertIn(missing.name, problems)
+        self.assertNotIn("#< CLIXML", problems)
         redist = self.bin / "redist"
         desktop = redist / "x64/Microsoft.VC144.CRT"
         desktop.mkdir(parents=True)
