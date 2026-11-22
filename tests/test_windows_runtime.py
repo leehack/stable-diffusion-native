@@ -1,6 +1,8 @@
+import base64
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -302,6 +304,72 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertIn("-OutputFormat", command)
         self.assertEqual(command[command.index("-OutputFormat") + 1], "Text")
         self.assertNotIn("PSMODULEPATH", run.call_args.kwargs["env"])
+
+    @unittest.skipUnless(sys.platform == "win32" or shutil.which("pwsh"),
+                         "requires PowerShell to format X.500 subjects")
+    def test_signer_organization_uses_encoded_x500_attribute(self):
+        self.signature_mock.stop()
+        fixture = self.lib / "msvcp140.dll"
+        run = subprocess.run
+        local_pwsh = shutil.which("pwsh") if sys.platform != "win32" else None
+        # Replace only the trust result so the test needs no trusted signing key.
+        prelude = """
+function Get-AuthenticodeSignature {
+    param([string] $LiteralPath)
+    $name = [System.Security.Cryptography.X509Certificates.X500DistinguishedName]::new($env:SD_TEST_SUBJECT)
+    [pscustomobject]@{
+        Status = 'Valid'
+        SignatureType = 'Authenticode'
+        SignerCertificate = [pscustomobject]@{ Subject = $name.Name; SubjectName = $name }
+    }
+}
+"""
+
+        def run_with_subject(command, **kwargs):
+            script = base64.b64decode(command[-1]).decode("utf-16-le")
+            command[-1] = base64.b64encode((prelude + script).encode("utf-16-le")).decode("ascii")
+            if local_pwsh:
+                command[0] = local_pwsh
+            return run(command, **kwargs)
+
+        cases = (
+            ("Microsoft", "O=Microsoft Corporation, CN=Signing Test", True),
+            ("text inside OU", 'OU="unit 1, O=Microsoft Corporation, region 2", O=Example A', False),
+            ("missing O", "CN=Signing Test", False),
+            ("different case", "O=MICROSOFT CORPORATION", False),
+            ("conflicting O", "O=Microsoft Corporation, O=Example A", False),
+            ("Microsoft last", "O=Example A, O=Microsoft Corporation", False),
+            ("conflicting O in one RDN", "O=Microsoft Corporation + O=Example A", False),
+            ("same O twice", "O=Microsoft Corporation, O=Microsoft Corporation", True),
+        )
+        for case, subject, expected in cases:
+            with (
+                self.subTest(case=case),
+                patch.object(windows_runtime.sys, "platform", "win32"),
+                patch.dict(os.environ, {"SD_TEST_SUBJECT": subject,
+                                        "SystemRoot": os.environ.get("SystemRoot", "/unused")}),
+                patch.object(windows_runtime.subprocess, "run", side_effect=run_with_subject),
+            ):
+                errors = windows_runtime.microsoft_signature_errors([fixture])
+                if expected:
+                    self.assertEqual(errors, [])
+                else:
+                    self.assertTrue(any(f"{fixture.name}: Microsoft Authenticode verification failed" in error
+                                        for error in errors), errors)
+
+    def test_invalid_encoded_signer_subject_fails_closed(self):
+        self.signature_mock.stop()
+        fixture = self.lib / "msvcp140.dll"
+        for stdout, reason in (("", "missing or unexpected signer subjects"),
+                               ("MAMxCg==\n", "invalid signer subject")):
+            with (
+                self.subTest(reason=reason),
+                patch.object(windows_runtime.sys, "platform", "win32"),
+                patch.dict(os.environ, {"SystemRoot": "C:\\Windows"}),
+                patch.object(windows_runtime.subprocess, "run",
+                             return_value=subprocess.CompletedProcess([], 0, stdout, "")),
+            ):
+                self.assertIn(reason, " ".join(windows_runtime.microsoft_signature_errors([fixture])))
 
     @unittest.skipUnless(sys.platform == "win32" and os.environ.get("SD_NATIVE_UNSIGNED_PE"),
                          "requires an unsigned Windows build")

@@ -10,6 +10,7 @@ import base64
 from dataclasses import dataclass
 from fnmatch import fnmatch
 import hashlib
+from io import BytesIO
 import json
 import mmap
 import os
@@ -431,6 +432,60 @@ def crt_receipt_errors(images: dict[str, PeImage], info: dict) -> list[str]:
     return []
 
 
+def _read_der_value(stream: BytesIO, expected_tag: int | None = None) -> tuple[int, bytes]:
+    header = stream.read(2)
+    if len(header) != 2:
+        raise ValueError("truncated DER header")
+    tag, size = header
+    if tag & 0x1F == 0x1F or (expected_tag is not None and tag != expected_tag):
+        raise ValueError("unexpected DER tag")
+    if size & 0x80:
+        length_size = size & 0x7F
+        length = stream.read(length_size)
+        if not length or len(length) != length_size or length[0] == 0:
+            raise ValueError("invalid DER length")
+        size = int.from_bytes(length, "big")
+        if size < 128:
+            raise ValueError("nonminimal DER length")
+    if size > stream.getbuffer().nbytes - stream.tell():
+        raise ValueError("truncated DER value")
+    return tag, stream.read(size)
+
+
+def _microsoft_organization(subject: bytes) -> bool:
+    encoded = BytesIO(subject)
+    _, name = _read_der_value(encoded, 0x30)
+    if encoded.read(1):
+        raise ValueError("trailing data after X.500 name")
+
+    # DirectoryString encodings. The expected organization uses only ASCII
+    # characters shared by TeletexString and PrintableString.
+    encodings = {0x0C: "utf-8", 0x13: "ascii", 0x14: "ascii", 0x1C: "utf-32-be", 0x1E: "utf-16-be"}
+    organizations = set()
+    rdns = BytesIO(name)
+    while rdns.tell() < len(name):
+        _, rdn = _read_der_value(rdns, 0x31)
+        if not rdn:
+            raise ValueError("empty relative distinguished name")
+        attributes = BytesIO(rdn)
+        while attributes.tell() < len(rdn):
+            _, attribute = _read_der_value(attributes, 0x30)
+            fields = BytesIO(attribute)
+            _, oid = _read_der_value(fields, 0x06)
+            if (not oid or oid[-1] & 0x80
+                    or any(previous < 0x80 and current == 0x80
+                           for previous, current in zip(b"\0" + oid, oid))):
+                raise ValueError("invalid X.500 attribute OID")
+            tag, value = _read_der_value(fields)
+            if fields.read(1):
+                raise ValueError("trailing data after X.500 attribute")
+            if oid == b"\x55\x04\x0a":  # 2.5.4.10 (organizationName)
+                if tag not in encodings:
+                    raise ValueError("unsupported organization string encoding")
+                organizations.add(value.decode(encodings[tag]))
+    return organizations == {"Microsoft Corporation"}
+
+
 def microsoft_signature_errors(paths: list[Path]) -> list[str]:
     if not paths:
         return []
@@ -441,6 +496,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $paths = ConvertFrom-Json $env:SD_NATIVE_SIGNATURE_PATHS
 $failed = $false
+$subjects = @()
 foreach ($path in $paths) {
     try {
         $signature = Get-AuthenticodeSignature -LiteralPath $path
@@ -450,12 +506,15 @@ foreach ($path in $paths) {
         continue
     }
     if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or
-        $signature.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') {
+        $null -eq $signature.SignerCertificate) {
         [Console]::WriteLine("$([IO.Path]::GetFileName($path)): Microsoft Authenticode verification failed ($($signature.Status), $($signature.SignatureType), $($signature.SignerCertificate.Subject))")
         $failed = $true
+        continue
     }
+    $subjects += [Convert]::ToBase64String($signature.SignerCertificate.SubjectName.RawData)
 }
 if ($failed) { exit 1 }
+foreach ($subject in $subjects) { [Console]::WriteLine($subject) }
 """
     system_root = Path(os.environ["SystemRoot"])
     powershell = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
@@ -472,7 +531,19 @@ if ($failed) { exit 1 }
     if result.returncode:
         return (result.stdout.strip() or result.stderr.strip()
                 or "Microsoft Authenticode verification failed").splitlines()
-    return []
+    subjects = result.stdout.splitlines()
+    if len(subjects) != len(paths):
+        return ["Microsoft Authenticode verification failed (missing or unexpected signer subjects)"]
+    errors = []
+    for path, subject in zip(paths, subjects):
+        try:
+            matches = _microsoft_organization(base64.b64decode(subject, validate=True))
+        except ValueError:
+            errors.append(f"{path.name}: Microsoft Authenticode verification failed (invalid signer subject)")
+            continue
+        if not matches:
+            errors.append(f"{path.name}: Microsoft Authenticode verification failed (unexpected signer organization)")
+    return errors
 
 
 def stage_vc_runtime(stage_dir: Path, arch: str, redist_dir: Path, *, allow_vulkan: bool,
