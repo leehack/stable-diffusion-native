@@ -438,10 +438,17 @@ def microsoft_signature_errors(paths: list[Path]) -> list[str]:
         return ["Microsoft Authenticode verification requires Windows"]
     script = r"""
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $paths = ConvertFrom-Json $env:SD_NATIVE_SIGNATURE_PATHS
 $failed = $false
 foreach ($path in $paths) {
-    $signature = Get-AuthenticodeSignature -LiteralPath $path
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $path
+    } catch {
+        [Console]::WriteLine("$([IO.Path]::GetFileName($path)): Microsoft Authenticode verification failed ($($_.Exception.Message))")
+        $failed = $true
+        continue
+    }
     if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or
         $signature.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') {
         [Console]::WriteLine("$([IO.Path]::GetFileName($path)): Microsoft Authenticode verification failed ($($signature.Status), $($signature.SignatureType), $($signature.SignerCertificate.Subject))")
