@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import plistlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -340,11 +341,19 @@ class WorkflowTests(unittest.TestCase):
     def test_pull_requests_run_the_mach_o_tests_and_the_audit_on_macos(self) -> None:
         workflow = (ROOT / ".github/workflows/validate.yml").read_text()
 
-        self.assertIn("os: [ubuntu-latest, macos-latest]", workflow)
+        self.assertRegex(workflow, r"(?m)^  pull_request:$")
+        tools = re.search(r"(?ms)^  macos-tools:\n(.*?)(?=^  [\w-]+:|\Z)", workflow)
+        self.assertIsNotNone(tools, "PR validation needs a macOS tools suite")
+        self.assertIn("runs-on: macos-latest", tools[1])
+        self.assertIn("python3 -m unittest discover -s tests -v", tools[1])
+
+        xcframework = re.search(r"(?ms)^  apple-xcframework:\n(.*?)(?=^  [\w-]+:|\Z)", workflow)
+        self.assertIsNotNone(xcframework, "PR validation needs an XCFramework audit")
+        self.assertIn("runs-on: macos-latest", xcframework[1])
         self.assertTrue(
             -1
-            < workflow.find("python3 tools/apple_xcframework.py build")
-            < workflow.find(self.AUDIT)
+            < xcframework[1].find("python3 tools/apple_xcframework.py build")
+            < xcframework[1].find(self.AUDIT)
         )
 
 
