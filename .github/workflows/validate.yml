@@ -5,18 +5,17 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
   tools:
-    name: tools (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # macOS runs the Mach-O import audit tests that other hosts skip.
-        os: [ubuntu-latest, macos-latest]
+    name: tools (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,12 +31,8 @@ jobs:
       - run: python3 -m unittest discover -s tests -v
 
   dart-vm:
-    name: dart vm (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: dart vm (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,6 +42,35 @@ jobs:
           # Pinned: the harness expects this VM's aborts in its controls.
           sdk: 3.13.5
       - name: Report progress while the Dart VM shuts down
+        run: python3 -m unittest discover -s tests -p test_progress_stress.py -v
+        env:
+          SD_REQUIRE_DART: "1"
+          SD_PROGRESS_STRESS_RUNS: "25"
+
+  macos-tools:
+    # macOS runs the Mach-O import audit tests that other hosts skip.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The wrapper tests compile against upstream's and ggml's headers.
+          submodules: recursive
+      - name: Fetch exact historical source controls
+        # checkout may initialize shallow submodules. These immutable objects
+        # supply the old ABI and per-carry allocator negatives; never fetch
+        # a moving branch or silently skip them when absent.
+        run: |
+          git -C third_party/stable-diffusion.cpp fetch --depth=1 origin be486498eadc29dc3cd234d944c2180ed42b1415
+          git -C third_party/stable-diffusion.cpp/ggml fetch --depth=1 origin a5915eb0e47adef21c3f25b889a008925ea838c2
+      - run: python3 -m unittest discover -s tests -v
+      - uses: dart-lang/setup-dart@v1
+        if: ${{ !cancelled() }}
+        id: dart
+        with:
+          # Pinned: the harness expects this VM's aborts in its controls.
+          sdk: 3.13.5
+      - name: Report progress while the Dart VM shuts down
+        if: ${{ !cancelled() && steps.dart.outcome == 'success' }}
         run: python3 -m unittest discover -s tests -p test_progress_stress.py -v
         env:
           SD_REQUIRE_DART: "1"
@@ -122,11 +146,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: macos-arm64, runs_on: macos-latest, smoke: "--expect-device CPU" }
-          - { target: macos-x64, runs_on: macos-latest }
-          - { target: ios-arm64, runs_on: macos-latest }
-          - { target: ios-arm64-sim, runs_on: macos-latest }
-          - { target: ios-x64-sim, runs_on: macos-latest }
           - { target: android-arm64, runs_on: ubuntu-latest }
           - { target: linux-x64, runs_on: ubuntu-24.04, smoke: "--expect-device CPU" }
           - { target: linux-x64-vulkan, runs_on: ubuntu-24.04, smoke: "--expect-device Vulkan" }
@@ -222,12 +241,6 @@ jobs:
           SD_GRAPH_SPLIT_TARGET: ${{ matrix.target }}
           SD_REQUIRE_RUNTIME: "1"
           GGML_VK_VISIBLE_DEVICES: "0"
-      - name: Check loader scratch memory
-        # Metal needs a Mac: GitHub's macOS runners list no Metal device.
-        if: runner.os == 'macOS' && matrix.smoke
-        run: python3 -m unittest discover -s tests -p test_loader_scratch_runtime.py -v
-        env:
-          SD_REQUIRE_RUNTIME: "1"
       - uses: dart-lang/setup-dart@v1
         if: runner.os == 'Linux' && matrix.smoke
       - name: Verify cooperative host shutdown
@@ -241,15 +254,87 @@ jobs:
           SD_REQUIRE_RUNTIME: "1"
           SD_REQUIRE_DART: "1"
           GGML_VK_VISIBLE_DEVICES: "0"
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'macOS'
+
+  build-apple:
+    name: build (${{ matrix.family }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { family: macOS, first: macos-arm64, second: macos-x64 }
+          - { family: iOS, first: ios-arm64, second: ios-arm64-sim, third: ios-x64-sim }
+    steps:
+      - uses: actions/checkout@v4
         with:
-          name: bin-${{ matrix.target }}
-          path: bin/${{ matrix.target }}
+          # The wrapper tests compile against upstream's and ggml's headers.
+          submodules: recursive
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          target: ${{ matrix.first }}
+      - name: Build and validate Apple targets
+        shell: bash
+        env:
+          FIRST_TARGET: ${{ matrix.first }}
+          SECOND_TARGET: ${{ matrix.second }}
+          THIRD_TARGET: ${{ matrix.third }}
+        run: |
+          for target in "$FIRST_TARGET" "$SECOND_TARGET" "$THIRD_TARGET"; do
+            [ -n "$target" ] || continue
+            python tools/build.py build --target "$target"
+            python tools/validate_artifacts.py "$target"
+          done
+      - name: Load and list devices
+        if: matrix.first == 'macos-arm64'
+        shell: bash
+        run: python tools/smoke_test.py macos-arm64 --expect-device CPU
+      - name: Check the context defaults and conversion ABI
+        if: matrix.first == 'macos-arm64'
+        run: python3 -m unittest discover -s tests -p test_runtime_api.py -v
+        env:
+          SD_RUNTIME_API_TARGET: macos-arm64
+          SD_REQUIRE_RUNTIME: "1"
+      - name: Generate from FP8 weights
+        # Metal needs a Mac: GitHub's macOS runners list no Metal device.
+        if: matrix.first == 'macos-arm64'
+        run: python3 -m unittest discover -s tests -p test_fp8_runtime.py -v
+        env:
+          SD_FP8_TARGET: macos-arm64
+          SD_REQUIRE_RUNTIME: "1"
+          GGML_VK_VISIBLE_DEVICES: "0"
+      - name: Split graph evaluation
+        # Metal needs a Mac: GitHub's macOS runners list no Metal device.
+        if: matrix.first == 'macos-arm64'
+        run: python3 -m unittest discover -s tests -p test_graph_split_runtime.py -v
+        env:
+          SD_GRAPH_SPLIT_TARGET: macos-arm64
+          SD_REQUIRE_RUNTIME: "1"
+          GGML_VK_VISIBLE_DEVICES: "0"
+      - name: Check loader scratch memory
+        # Metal needs a Mac: GitHub's macOS runners list no Metal device.
+        if: matrix.first == 'macos-arm64'
+        run: python3 -m unittest discover -s tests -p test_loader_scratch_runtime.py -v
+        env:
+          SD_REQUIRE_RUNTIME: "1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.first }}
+          path: bin/${{ matrix.first }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.second }}
+          path: bin/${{ matrix.second }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.third
+        with:
+          name: bin-${{ matrix.third }}
+          path: bin/${{ matrix.third }}
           if-no-files-found: error
 
   apple-xcframework:
-    needs: build
+    needs: [build, build-apple]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
